@@ -69,6 +69,28 @@ jobs:
               "$SDKMGR" --sdk_root="$SDK_DIR" --install "${d//\//;}"
           done
 
+      - name: 缓存 sherpa-onnx AAR
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/echomind-libs
+          key: sherpa-onnx-static-link-1.13.8-b22c3fc1
+
+      - name: 取回并校验 sherpa-onnx AAR
+        run: |
+          set -euo pipefail
+          # 38.7 MB 的二进制依赖不入库（.gitignore 排掉 app/libs/），CI 每次按钉住的 URL+哈希取回。
+          # 哈希不匹配就直接失败，别把来路不明的文件喂进构建（AGENTS.md §5）。
+          AAR=sherpa-onnx-static-link-onnxruntime-1.13.8.aar
+          CACHE_DIR="$HOME/.cache/echomind-libs"
+          if [ ! -f "$CACHE_DIR/$AAR" ]; then
+            mkdir -p "$CACHE_DIR"
+            curl -sSL --retry 3 -o "$CACHE_DIR/$AAR" \
+              "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/$AAR"
+          fi
+          echo "b22c3fc1b6a45666d28892bb2f7694beeb77a8362d7ebd77c1a5431ec9435471  $CACHE_DIR/$AAR" | sha256sum -c -
+          mkdir -p app/libs
+          cp "$CACHE_DIR/$AAR" app/libs/
+
       - name: 准备 Gradle（缓存 wrapper 与依赖）
         uses: gradle/actions/setup-gradle@v6
 

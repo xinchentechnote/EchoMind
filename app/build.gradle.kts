@@ -19,10 +19,11 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // 首版优先 arm64-v8a 真机；x86_64 只为模拟器/仪器化测试保留。
-        // sherpa-onnx 的 ABI 覆盖情况确认后可能要收窄（见 docs/asr-design.md）。
+        // 只打 arm64-v8a：真机与本机模拟器 `emulator-5554` 的 ro.product.cpu.abi 实测都是 arm64-v8a，
+        // 而 sherpa-onnx 的 x86_64 那份 so 未压缩就有 27.4 MB，留着只是白白让调试包翻倍。
+        // （早期还没接 AAR 时这里带 x86_64 是给 x86 模拟器兜底，本机 AVD 是 arm64，从来用不上。）
         ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")
+            abiFilters += listOf("arm64-v8a")
         }
     }
 
@@ -106,7 +107,29 @@ configurations.matching { it.name.contains("AndroidTest") }.all {
     resolutionStrategy.force(*serializationForce)
 }
 
+/**
+ * sherpa-onnx 的官方 Android AAR 是二进制依赖，不进仓库（`.gitignore` 排掉了 `app/libs/`）。
+ * 缺失时直接给出确切 URL、期望大小和本机钉住的 SHA-256，不许让人对着一条 unresolved reference 猜（AGENTS.md §5）。
+ * 静态链接版（`sherpa-onnx-static-link-onnxruntime-…`）把 ONNX Runtime 烧进 `libsherpa-onnx-jni.so`，
+ * arm64 只有一个 so（24,169,352 B），不用再自己 exclude 用不到的 c/cxx API 库。
+ */
+val sherpaAar = file("libs/sherpa-onnx-static-link-onnxruntime-1.13.8.aar")
+if (!sherpaAar.exists()) {
+    throw GradleException(
+        """
+        |缺少 sherpa-onnx AAR：$sherpaAar
+        |  URL     : https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/sherpa-onnx-static-link-onnxruntime-1.13.8.aar
+        |  期望大小: 38,691,998 B
+        |  SHA-256 : b22c3fc1b6a45666d28892bb2f7694beeb77a8362d7ebd77c1a5431ec9435471
+        |            （官方 release 未发布校验值，这是本机首次下载钉住的哈希，见 docs/asr-design.md §2.1）
+        |  取回：mkdir -p app/libs && curl -sSL -o <上面的路径> <上面的 URL>
+        """.trimMargin()
+    )
+}
+
 dependencies {
+    implementation(files(sherpaAar))
+
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.lifecycle.runtime.ktx)
