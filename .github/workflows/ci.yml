@@ -21,17 +21,19 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      JAVA_VERSION: "17"
+      # runner 镜像实测已自带这两项（见 docs/environment.md §8），所以正常路径只需要校验，不需要 sdkmanager
+      REQUIRED_PLATFORM: platforms/android-37.0
+      REQUIRED_BUILD_TOOLS: build-tools/37.0.0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 准备 JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
-          java-version: ${{ env.JAVA_VERSION }}
+          java-version: "17"
 
-      - name: 定位 Android SDK
+      - name: 校验 Android SDK（compileSdk 37 与 build-tools 37.0.0）
         run: |
           set -euo pipefail
           SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
@@ -40,42 +42,42 @@ jobs:
             exit 1
           fi
           echo "ANDROID_HOME=$SDK_DIR" >> "$GITHUB_ENV"
-          # 仓库里不含 local.properties（已 gitignore），AGP 需要它或 ANDROID_HOME 才能定位 SDK
+          # 仓库里不含 local.properties（已 gitignore），显式写一份给 AGP 定位 SDK
           echo "sdk.dir=$SDK_DIR" > local.properties
           echo "sdk.dir=$SDK_DIR"
-          command -v sdkmanager || {
-            echo "找不到 sdkmanager（期望在 $SDK_DIR/cmdline-tools/latest/bin）" >&2
-            ls -1 "$SDK_DIR" >&2
-            exit 1
-          }
 
-      - name: 安装 compileSdk 37 平台与 build-tools 37.0.0
-        run: |
-          set -euo pipefail
-          # 包名斜杠/分号两种格式取决于 cmdline-tools 版本，本机实测只有斜杠能用（docs/environment.md），
-          # runner 上的版本可能是旧的，所以两种都试一次。
-          for pkg in "platforms/android-37.0" "build-tools/37.0.0"; do
-            if yes | sdkmanager --sdk_root="$ANDROID_HOME" --install "$pkg" 2>/dev/null ||
-               yes | sdkmanager --sdk_root="$ANDROID_HOME" --install "${pkg//\//;}"; then
-              echo "已安装 $pkg"
-            else
-              echo "安装 $pkg 失败" >&2
-              sdkmanager --sdk_root="$ANDROID_HOME" --list_installed >&2 || true
-              exit 1
-            fi
+          missing=""
+          for d in "$REQUIRED_PLATFORM" "$REQUIRED_BUILD_TOOLS"; do
+            [ -d "$SDK_DIR/$d" ] || missing="$missing $d"
+          done
+          if [ -z "$missing" ]; then
+            echo "所需组件齐备"
+            exit 0
+          fi
+
+          echo "缺少：$missing，尝试用 sdkmanager 补装" >&2
+          SDKMGR="$(ls "$SDK_DIR"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1)"
+          if [ -z "$SDKMGR" ]; then
+            echo "既没有预装组件也找不到 sdkmanager，无法继续" >&2
+            ls -1 "$SDK_DIR" "$SDK_DIR/cmdline-tools" >&2 || true
+            exit 1
+          fi
+          # 包名斜杠/分号两种格式取决于 cmdline-tools 版本（本机只有斜杠能用，见 docs/environment.md §5）
+          yes | "$SDKMGR" --sdk_root="$SDK_DIR" --licenses >/dev/null 2>&1 || true
+          for d in $missing; do
+            "$SDKMGR" --sdk_root="$SDK_DIR" --install "$d" ||
+              "$SDKMGR" --sdk_root="$SDK_DIR" --install "${d//\//;}"
           done
 
       - name: 准备 Gradle（缓存 wrapper 与依赖）
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+        uses: gradle/actions/setup-gradle@v6
 
       - name: 构建调试包并跑 JVM 单元测试
         run: ./gradlew --stacktrace :app:assembleDebug :app:testDebugUnitTest
 
       - name: 上传单元测试报告
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: unit-test-report
           path: |
@@ -85,7 +87,7 @@ jobs:
 
       - name: 上传调试 APK
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: app-debug
           path: app/build/outputs/apk/debug/app-debug.apk
