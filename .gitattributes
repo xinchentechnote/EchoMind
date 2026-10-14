@@ -1,0 +1,12 @@
+# 统一换行符：仓库里存 LF，gradlew.bat 是 Windows 批处理，必须保留 CRLF
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制
+*.aar binary
+*.jar binary
+*.onnx binary
+*.png binary
+*.jpg binary
+*.mp3 binary

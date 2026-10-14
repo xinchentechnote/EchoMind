@@ -1,0 +1,24 @@
+# Build artifacts
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+.gradle/
+build/
+app/build/
+local.properties
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+captures/
+
+# Kotlin
+.kotlin/
+
+# 模型与大文件不放仓库
+app/src/main/assets/models/
+*.onnx
+
+# sherpa-onnx 等二进制依赖（手工取回，不入库）
+app/libs/

@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">EchoMind</string>
+    <string name="notification_channel_playback">播放控制</string>
+</resources>
