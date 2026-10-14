@@ -130,6 +130,28 @@ class SincResamplerTest {
     }
 
     @Test
+    fun `生产调用形状：每块都非 final，末尾再空喂一次 final`() {
+        // 上面那条把「最后一块」标成 isFinal，但 PcmDecoder 做不到：它不知道哪个输出缓冲是最后一个
+        // （EOS 标志可能挂在空缓冲上），所以真实形状是「所有数据块都 isFinal=false」+ 结尾一次空输入 final。
+        // 这条就是钉住那个形状，否则解码器与一次性整段读的结果会差尾巴 T 个样本
+        val input = FloatArray(4_410) { cos(it * 0.021f) }
+        val oneShot = SincResampler(44_100, 16_000).resample(input, isFinal = true)
+
+        val streaming = SincResampler(44_100, 16_000)
+        val collected = mutableListOf<Float>()
+        var offset = 0
+        while (offset < input.size) {
+            val size = minOf(1_000, input.size - offset)
+            collected += streaming.resample(input.copyOfRange(offset, offset + size), isFinal = false).toList()
+            offset += size
+        }
+        collected += streaming.resample(FloatArray(0), isFinal = true).toList()
+
+        assertEquals("先非 final 分块再空喂 final，产出数必须和一次性相同", oneShot.size, collected.size)
+        assertEquals(oneShot.toList(), collected)
+    }
+
+    @Test
     fun `reset 之后重新开始不受上一段尾巴影响`() {
         val a = constant(1_000, 0.5f)
         val resampler = SincResampler(44_100, 16_000)

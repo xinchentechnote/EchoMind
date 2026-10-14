@@ -50,12 +50,14 @@ app/src/main/java/com/xinchen/echomind/
 │   ├── Media3PlaybackController.kt// ✅ 实现 + Player.Listener + 统计事件翻译 + 串行落库通道
 │   ├── PlayerHolder.kt            // ✅ 单例 ExoPlayer 持有（同进程共享给 Service；不提供 release()）
 │   └── EchoMindMediaService.kt    // ✅ MediaSessionService + addSession + 前台通知 + onTaskRemoved
-├── asr/                           // 模型准备侧 ✅（推理侧仍未开始，Phase 6 后续项）
+├── asr/                           // 模型准备侧 ✅ + 解码侧 ✅（推理侧仍未开始，Phase 6 后续项）
 │   ├── ModelCatalog.kt            // ✅ 清单唯一出处：URL/字节数/SHA-256 全部实测，无官方校验值标 null 并本机钉住
 │   ├── ModelVerifier.kt           // ✅ 存在 → 大小 → SHA-256 三步核对 + 流式哈希（纯 JVM，可单测）
 │   ├── ModelFetcher.kt            // ✅ `fun interface ModelFetcher`（测试接缝）+ `HttpFetcher`（HttpURLConnection，手工跟 Location）
 │   ├── ModelManager.kt            // ✅ statuses/download/delete/refresh：`.part` → 校验 → 改名 → 记来源，多源回退、文件级跳过、250ms 进度限流
-│   └── SherpaOnnxEngine / PcmDecoder / PcmResampler / VadSegmenter / TranscriptCoordinator — **Phase 6，代码里还没有**
+│   ├── PcmDecoder.kt              // ✅ MediaExtractor+MediaCodec 同步模式流式解码 → 16k 单声道定长块；4 条仪器化在真 MP3 上跑过（尚无业务调用方）
+│   └── SherpaOnnxEngine / VadSegmenter / TranscriptCoordinator — **Phase 6，代码里还没有**
+│       （`PcmResampler` 这个名字不再需要：采样率转换落在 `domain/asr/SincResampler`）
 ├── work/                          // TranscriptWorker / FolderRescanWorker — Phase 6
 │   └──（当前无 WorkManager：重扫是 appScope 里的 `Dispatchers.IO` 协程）
 └── ui/
@@ -203,8 +205,9 @@ EchoMindMediaService(MediaSessionService) ── addSession(MediaSession.Builder
 ```
 TranscriptRepository.enqueue ─► WorkManager(前台类型 mediaPlayback? 见下) 
   ─► TranscriptCoordinator:
-       PcmDecoder(MediaExtractor+MediaCodec, 流式) ─► PcmResampler(16k mono)
-       ─► PcmChunkPlanner(定长块 + 重叠窗口, 记录绝对起点)
+       PcmDecoder ✅(MediaExtractor+MediaCodec 同步流式 → PcmConversion 均值下混 → SincResampler 到 16k → 定长块回调)
+       ─► VadSegmenter(代码里还没有：silero VAD，float 块 → SpeechSpan 绝对样本区间)
+       ─► AsrChunkPlanner ✅(>20s 段均分成 ≤20s 块，用全局样本下标算绝对 startMs/endMs)
        ─► AsrEngine.segmentsOf ─► tokens(+时间) 
        ─► SentenceSplitter(标点切句 + 时间清洗) 
        ─► Room 事务：删旧字幕 + 插新字幕 + job=SUCCESS + audio.transcriptionState=READY
@@ -245,8 +248,11 @@ controller.state.map { it.positionMs }        // 500ms tick，即 PlaybackPolicy
 - 可测试性设计：`TimeSource`、`PlaybackPolicy`、`SessionTracker`、`SubtitleSynchronizer`、`TestSubtitleParser` 全是纯 Kotlin，无 Android import，可在 JVM 里跑。
   `asr/ModelCatalog`、`ModelVerifier`、`ModelFetcher`、`ModelManager` 同理（只用 `java.io.File` / `java.net` / `MessageDigest`），35 条 JVM 单测就是这么来的；
   它们的**接缝在依赖上**（注入假 `ModelFetcher` + `FakeTimeSource` + `TemporaryFolder`），不是靠给 `ModelManager` 套接口。
-  `domain/asr/PcmConversion`、`SincResampler`、`AsrChunkPlanner` 也是同一类接缝（合成信号 + 手搓字节，36 条 JVM 单测），它们**不需要设备**：
-  没有 Android 类型，靠单频探针就能验出「滤波器有没有在工作」。`text/SentenceSplitter` **目前代码里还没有**（Phase 6 第 5 项）。
+  `domain/asr/PcmConversion`、`SincResampler`、`AsrChunkPlanner` 也是同一类接缝（合成信号 + 手搓字节，37 条 JVM 单测），它们**不需要设备**：
+  没有 Android 类型，靠单频探针就能验出「滤波器有没有在工作」。反过来 `asr/PcmDecoder` 是**必须上设备**的那一层：
+  它吃 `Context`/`Uri`，只能测「这台机器的解码器实际给什么」——4 条仪器化用例（真 MP3 时长对账、块连续性、幅度、取消、非音频），
+  接缝是 `fun interface PcmChunkSink`：解码逻辑与「拿到块以后干什么」在测试里被分开。
+  `text/SentenceSplitter` **目前代码里还没有**（Phase 6 第 5 项）。
 
 ## 8. 错误处理与降级
 
@@ -301,3 +307,4 @@ controller.state.map { it.positionMs }        // 500ms tick，即 PlaybackPolicy
 | D25 | 下载这条路径**必须**留一条打真实 URL 的仪器化用例，哪怕它不在 CI 门禁里、且会因上游不可达变红 | 实测理由：`AndroidManifest` 漏了 `INTERNET` 权限时，**35 条 JVM 单测一条都不红**——假 fetcher 与 host 上的临时 `HttpServer` 都不过 Android 的权限检查；而且设备栈帧里是 `com.android.okhttp.internal.huc.HttpsURLConnectionImpl`，Android 的 `HttpURLConnection` 底层是 Framework 自带的 OkHttp 移植，与 host JDK 那份不是同一套实现（TLS、重定向、HTTP 版本行为都可能不同）。代价：这条用例依赖外网可达，CI 没有模拟器 → 它是**本机一次性凭据**而不是持续回归网；所以 GitHub 连不上时选择**移除**那条用例并如实记录（`silero_vad.onnx` 至今没从设备取回过），而不是留一条红色的假警报 |
 | D26 | 采样率转换**自己写**（`domain/asr/SincResampler`：窗口 sinc / Blackman、每侧 16 抽头、按 `j*L/M` 的整数相位查系数表、每相位归一到直流增益 1），而不是线性插值、也不是引第三方重采样库 | 三个选项都实测过：① Media3 1.11.1 **没有**现成实现——`media3-common-1.11.1.aar` 的 `classes.jar` 里类路径含 `resampl` 的条目 **0 条**（`AudioResamplingAudioProcessor` 已不在该产物中），`media3-decoder-1.11.1.aar` 只剩 `Buffer/Decoder/SimpleDecoder` 一族（没有 `MediaDecoder`）；② 线性插值等于**不做低通**，44.1/48 kHz 书解里 8 kHz 以上的成分会整块折进 0–8 kHz，模型吃的是它没见过的噪声，而字幕上只会表现为「偶尔识别得差」，几乎无法归因；③ 引 libsamplerate/SoX 之类违背 AGENTS.md §3「不引未实测的大框架」，而这件事只需要一个有理数比的 FIR。实测（1 秒单频正弦 + 相干 DFT）：1/3.5/5 kHz 平坦（≤ −0.09 dB），7 kHz −2.2 ~ −2.4 dB，会折进输出 4 kHz 的 12 kHz 压到 **−69 ~ −78 dB**，20 kHz −91 dB；代价是 33 抽头在通带末端那 2 dB 跌落（要抹平得翻倍抽头，转录时间换边际收益，不做）与头尾各 ~1 ms 的边缘样本不准（常数 0.25 输入实测首样本 0.170、末样本 0.267）。另两条设计约束来自踩坑：产出判据只认「中心样本还在数据里」（否则同采样率下的恒等性质被末尾几个零填充样本破坏），以及系数表按**约分后的有理数**建（44.1k→16k 只有 160 个相位，不是每样本重算一次） |
 | D27 | 分块与绝对时间偏移放在 `domain/asr/AsrChunkPlanner`（纯 Kotlin），`PcmChunkPlan` 带 `startSample/startMs/endMs`，**不在编排层用「累计时长」推时间** | FR-505 要求第 N 段的句时间戳落在绝对位置上。用「上一段末尾 + 本段时长」推 offsets 会把每段几毫秒的取整误差一路累加，180 段（1 小时）就是几百毫秒的漂移；改成一律 `startSample * 1000 / 16000`，单测用 180 段连续音频断言 `endMs == 3_600_000`（零漂移）钉住。>20s 的段**均分**成 `ceil(N/max)` 块（不是切满 20s 留一个尾巴块），避免最后剩个几百毫秒的小块——那既是一整次推理的固定开销，也最容易出空结果 |
+| D28 | `PcmDecoder` 用 `MediaCodec` **同步模式 + 贪心喂入**（一次把能塞的输入都塞进去，本轮有产出就用 0 超时非阻塞继续取，两头都不动才等 10 ms），不用异步回调 API，也不逐「一进一出」 | 实测代价与收益：一进一出时解码器经常没活干，每轮都在 `dequeueOutputBuffer` 的超时上干等——148 s 真素材 27,974 ms（RTF 0.189）；改贪心后 24,557 ms（RTF 0.166），**产出字节序列逐样本相同**（`outSamples 2,378,188`、581 块、`peak/rms` 一致），所以这是调度而非算法改动。不选异步回调（`setCallback` + `MediaCodec.Callback`）：回调跑在专用线程上，要自己做「回调线程 ↔ 调用方取消」的同步与缓冲生命周期管理，而转录本来就在 `Dispatchers.IO` 协程里跑，同步模式 + 协程取消位（`PcmChunkSink` 返回 false）已经够用且状态全在一条栈上看得清。兜底：连续 3,000 轮（≈30 s）两头不动就抛 `PcmDecodeException`，不让任务无限挂住 |

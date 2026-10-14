@@ -38,13 +38,15 @@ source ~/android-dev/env.sh     # 否则 GRADLE_USER_HOME 退回 ~/.gradle，且
 - SAF 选目录与文件在这台模拟器上的可点位置：`DocumentsUI` 底部确认键是 `android:id/button1`，文本 **「USE THIS FOLDER」**，bounds `[37,2148][1043,2274]` → 点 (540,2210)；随后的授权确认弹窗 ALLOW 也是 `button1`，`[790,1298][968,1424]` → 点 (879,1361)。网格视图里点文件的 `title` 节点**没有反应**，要点 `item_root` 的中心（实测 783,1758）。
 - `dumpsys media.session` 在服务名上是 `media_session`（下划线）；`media.session` 会返回 `Can't find service`。队列里正在播哪一首看 `metadata: … description=<标题>` 与 `state=… position=…`。
 - 播放页 dump 出来的 `0:08 / -0:36` 这类读数要拿去和 `audio_book.duration_ms` 对账：两者相加就是当前这一首的时长。Phase 5 有一次「字幕没刷新」的疑似 bug 就是这样破的——实际是短曲播完自动切到了下一首（那一首确实没字幕）。
+- **仪器化测试的方法名不能带空格**（Phase 6 实测）：`minSdk = 26` 时 D8 出的是 dex 039，`Space characters in SimpleName '…' are not allowed prior to DEX version 040` 直接把 `dexBuilderDebugAndroidTest` 打停。JVM 单测不经过 dex，所以 `app/src/test/` 里那批带空格的中文名字一直是合法的——只有写进 `androidTest` 才会炸。
+- **测音频内容必须自己数零字节**（Phase 6 实测）：书架那批「《三体》」素材帧体 99% 是 `0x00`，也就是静音。它能通过所有「长度类」断言（时长、进度、切歌、样本数），所以只要断言里出现 `peak`/`rms`，就必须同时准备**一份真音频**和**一份静音对照**。素材放 `getExternalFilesDir("asr-fixtures")`：读写自己的 external 目录不需要运行时权限，`adb push` 就能放。
 
 ## 3. 测试分层策略
 
 | 层 | 位置 | 覆盖内容 |
 | --- | --- | --- |
-| 纯 JVM 单测 | `app/src/test/` | **已有（83 项）**：`AudioTreeWalker`（8）、`AudioImportPlanner`（9）、`TitleDeriver`（7）、`Format`（5）、`ShelfViewModel`（2）、**`SessionTracker`（22：有效次边界、倍速只放大消耗量、墙钟跳变、缓冲/暂停不计时、拖到末尾不完播、切歌先结算上一场）**、**`PlayerViewModel`（10：按记忆位置起播、已在播不重开、听完从头播、自动切歌换页头、收藏作用于正在播的那本、书不在书架不起播、字幕窗口跟随位置、切歌后换成另一套字幕、导入写进正在播的那本、同一句内部推进不重发窗口）**、**`SubtitleSynchronizer`（11：首句/中间/末句、空表、位置在首句之前、gap 迟滞、5000 句二分）**、**`TestSubtitleParser`（9：SRT/VTT/TSV、缺小时与一位小数毫秒、乱序重排、`end ≤ start` 拒绝、空文件失败）**。**待补**：`SentenceSplitter`（标点/无标点/异常时间戳）、`PcmChunkPlanner`（分段时间偏移）——两者属 Phase 6 |
-| 仪器化测试 | `app/src/androidTest/` | **已有（48 项）**：Room DAO 读写与唯一索引（11）、`AudioRepositoryImpl` 的导入编排（9）、`PlaybackRepository`（21：会话行生命周期、flush 覆盖写不累加、结算的事务性、增量==重算、重算能修正被写坏的缓存、崩溃恢复标 `CRASHED`/幂等/短会话不计次、删书保留历史、倍速只落自己那一列、时长未知不覆盖已知）、**`Migration_1_2_Test`（3：v1→v2 结构对导出 JSON、历史保留、FK 与索引存在）**、**`SubtitleRepositoryTest`（4：索引连续、整本替换、摘要分辨来源、删书连带删字幕但留历史）**。**待补**：SAF 真实 URI 扫描、转录结果入库 |
+| 纯 JVM 单测 | `app/src/test/` | **已有（155 项）**：`AudioTreeWalker`（8）、`AudioImportPlanner`（9）、`TitleDeriver`（7）、`Format`（5）、`ShelfViewModel`（2）、**`SessionTracker`（22：有效次边界、倍速只放大消耗量、墙钟跳变、缓冲/暂停不计时、拖到末尾不完播、切歌先结算上一场）**、**`PlayerViewModel`（10：按记忆位置起播、已在播不重开、听完从头播、自动切歌换页头、收藏作用于正在播的那本、书不在书架不起播、字幕窗口跟随位置、切歌后换成另一套字幕、导入写进正在播的那本、同一句内部推进不重发窗口）**、**`SubtitleSynchronizer`（11：首句/中间/末句、空表、位置在首句之前、gap 迟滞、5000 句二分）**、**`TestSubtitleParser`（9：SRT/VTT/TSV、缺小时与一位小数毫秒、乱序重排、`end ≤ start` 拒绝、空文件失败）**、**`ModelCatalog`/`ModelVerifier`/`ModelManager`（10 + 9 + 16：清单合法性、SHA-256 测试向量、下载与断点状态机）**、**`PcmConversion`（11）/`SincResampler`（12：恒等、常数增益、通带与阻带实测频响、分块==一次性、生产调用形状、`reset()`、长度 `ceil(N·out/in)`）/`AsrChunkPlanner`（14）**。**待补**：`SentenceSplitter`（标点/无标点/异常时间戳）——属 Phase 6 第 5 项 |
+| 仪器化测试 | `app/src/androidTest/` | **已有（56 项）**：Room DAO 读写与唯一索引（11）、`AudioRepositoryImpl` 的导入编排（9）、`PlaybackRepository`（21：会话行生命周期、flush 覆盖写不累加、结算的事务性、增量==重算、重算能修正被写坏的缓存、崩溃恢复标 `CRASHED`/幂等/短会话不计次、删书保留历史、倍速只落自己那一列、时长未知不覆盖已知）、**`Migration_1_2_Test`（3：v1→v2 结构对导出 JSON、历史保留、FK 与索引存在）**、**`SubtitleRepositoryTest`（4：索引连续、整本替换、摘要分辨来源、删书连带删字幕但留历史）**、**`ModelManagerNetworkTest`（4：真 URL 下载、重定向、404 不落地、校验失败）**、**`PcmDecoderTest`（4：真 MP3 解码 148s 素材、时长对账 0.22%、块连续与 ±1 幅度、静音对照、取消、非音频报错）**。**待补**：SAF 真实 URI 扫描、转录结果入库 |
 | 手工设备验证 | 见 §6 | 耳机拔出、低内存、真实模型推理、飞行模式；焦点抢占与后台播放已在模拟器实测（§4 Phase 4），七句窗口与点句跳转已实测（§4 Phase 5） |
 
 约束：`domain` 包不得 import `android.*`（这是「能在 JVM 里测」的前提）；`TimeSource` 注入假时钟，因此时长类断言不依赖真实时间流逝。实测这条约束确实成立——`SessionTrackerTest` 全程没有 Robolectric、没有设备。
@@ -349,7 +351,7 @@ FR-707（只在当前句变化时更新）用**设备 + 单测两头**取证：�
 - `HttpFetcher` 不做 HTTP Range 续传：断线后同一个文件从头重下，这是取舍不是遗漏（见 `docs/architecture.md` D24）。
 - 设备用例依赖外网可达，本机与 CI 都**没有**把它们放进门禁（CI 只跑 `assembleDebug` + `testDebugUnitTest`）。所以它们是本机一次性凭据，不是每次提交都守得住的回归网。
 
-## Phase 6 第 3 项（前半）：PCM 转换 / 抗混叠重采样 / ≤20s 分块（2026-10-15 05:40 ~ 06:05）
+### Phase 6 第 3 项（前半）：PCM 转换 / 抗混叠重采样 / ≤20s 分块（2026-10-15 05:40 ~ 06:05）
 
 `domain/asr/PcmConversion.kt`、`domain/asr/SincResampler.kt`、`domain/asr/AsrChunkPlanner.kt` + `domain/model/AsrModels.kt`，
 共 36 条 JVM 单测（`SincResamplerTest` 11、`PcmConversionTest` 11、`AsrChunkPlannerTest` 14）。**全部是纯 Kotlin**：
@@ -380,6 +382,37 @@ FR-707（只在当前句变化时更新）用**设备 + 单测两头**取证：�
 - 通带 7 kHz 处 −2.2 dB 的跌落是 33 抽头的物理限制，本轮**不**打算用更长的滤波器去修（理由见 `docs/architecture.md` D26）。
 - `SpeechSpan` 目前没有生产者：VAD 段落 → `SpeechSpan` 的转换属 `VadSegmenter`（下一项），而且 `SpeechSegment.start` 的单位（样本还是毫秒）**仍未在设备上验证**。
 
+### Phase 6 第 3 项（后半）：PcmDecoder 真解码 + 设备实测（2026-10-15 06:08 ~ 06:25）
+
+`asr/PcmDecoder.kt`（框架 `MediaExtractor` + `MediaCodec` 同步模式，串起 `PcmConversion` 与 `SincResampler`）
++ 仪器化 `asr/PcmDecoderTest.kt` 4 条 + `SincResamplerTest` 补 1 条生产调用形状。**这是本项目第一批真实音频字节**：
+上一轮的 36 条单测吃的全是合成信号与手搓字节。
+
+| 动作 | 结果 | 凭据 |
+| --- | --- | --- |
+| 首次编译 | 2 个 `Unresolved reference 'ENCODING_PCM_16BIT'`：那个常量不在 `MediaCodec` 上，在 `android.media.AudioFormat`。同时把私有的 `"pcm-encoding"` 字面量换成 `MediaFormat.KEY_PCM_ENCODING` | `javap -classpath android-37.0/android.jar` 里两个符号都在（`AudioFormat.ENCODING_PCM_16BIT`、`MediaFormat.KEY_PCM_ENCODING`），不靠记忆 |
+| 补一条 JVM 用例：生产调用形状 | 既有分块用例把**最后一块**标成 `isFinal=true`，而 `PcmDecoder` 做不到（EOS 标志可能挂在空缓冲上），真实形状是「每个数据块都 `isFinal=false` + 结尾一次**空输入** `isFinal=true`」。补这条后先跑：**155 tests / 0 failures** —— 流式实现本来就自洽，但这句话此前没有测试撑着 | `SincResamplerTest.生产调用形状…` |
+| 仪器化 APK 打不过 dex | `dexBuilderDebugAndroidTest FAILED`：`Space characters in SimpleName '取消：sink 拒绝一个块之后立刻停…' are not allowed prior to DEX version 040`。`minSdk = 26` → D8 出 039 dex，**方法名里的空格非法**（JVM 单测不经过 dex，所以 118 → 154 那批带空格的中文名字一直没暴露这条）。仓库里现存仪器化名字恰好都没有空格，改名为 `回调返回false就立刻停手已交付样本数仍然自洽` 后即通过 | 完整报错文本；改名前后两次 `assembleDebugAndroidTest` |
+| 素材放哪儿 | App 没有存储权限（走 SAF），所以 `Uri.fromFile("/sdcard/Music/…")` 读不到。改成放进 **App 自有 external files 目录**（`getExternalFilesDir("asr-fixtures")`，读写自己那份不需要任何运行时权限，比为了测试给 App 加 `READ_MEDIA_AUDIO` 干净）：`adb shell mkdir -p` + `adb push`。缺素材时**直接 fail 并打印放文件的命令**，不用 `assumeTrue` 静默跳过 | 4 条用例的 `PcmDecoderTest` 日志 |
+| **首轮设备实测：4 条里 2 条红，`peak=0.0`** | 块连续性、时长对账、样本数全过，**只有幅度是零**。宿主机逐字节数 0x00 占比：`01 - 三体.mp3` 与 `5.MP3` 的帧体 **99.0% 是 0x00**，md5（`8952509d…`/`362b35cb…`）跟 `/Users/xinchen/Documents/music` 里 21 首都对不上 → **Phase 3~5 用的这批「书解」素材本身就是静音占位 MP3** | Python 统计帧体零字节占比 + md5 比对 |
+| 这件事的后果（如实说） | 书架、时长读取、进度恢复、倍速、切歌、字幕窗口的结论**不受影响**——它们只看长度与状态，静音音频是完全合法的输入。但**音频内容从未在设备上被验证过**，转录精度更不能拿静音去测。`PcmDecoder` 的 `peak > 0.05` 断言正是为这种「读得到文件却解出全零」的假成功写的，它第一次跑就抓到了 | 本表上一行 |
+| 换真素材 + 留静音做反向对照 | 真素材用用户自己的 `那些花儿.mp3`（2,381,693 B，帧体仅 **1.4%** 是 0x00）；静音那份保留成一条**对照用例**：它必须解出「长度对得上但逐样本全零」，用来证明 `peak=0` 来自文件而不是解码链路把数据洗平了 | `PcmDecoderTest.静音素材解出全零但长度照样对得上` |
+| 真解码实测（4 条全绿） | `mime=audio/mpeg`、解码器上报 `srcRate=44100`、真素材 `ch=2`（**均值下混第一次跑在真实立体声上**）、`peak=0.6585692`、`rms=0.08412`；容器 148,303 ms vs 解出样本换算 148,636 ms → **偏差 0.22%**；`outSamples=2,378,188`、581 块（前 580 块都是满块 4096）；`maxCodecBufferBytes=4,608` = 文件的 **0.002 倍** → 「峰值内存与音频总长无关」（NFR-05/07）这句话第一次有数字 | `adb logcat -s PcmDecoderTest` 全行 |
+| 取消路径 | `blockSize=1024`、第 4 块返回 `false` → `cancelled=true`、`outputSamples=3072`（正好 3 块）、绝对起始样本仍然首尾相接、80 ms 就停手 | 同上 |
+| 非音频输入 | 写一个 `.txt` 喂进去 → `PcmDecodeException("打不开音频容器（file:///…txt）：IOException Failed to instantiate extractor.")`，错误里带 URI 和底层异常类名，不静默产出 0 样本 | 同上 |
+| RTF 与一次纯调度改进 | 先前「一进一出 + 每轮 10 ms 超时」是**等待 bound** 的：真素材首轮 27,974 ms（RTF 0.1886）。改成「贪心喂入 + 本轮有进展就非阻塞轮询输出」→ 24,557 ms（RTF 0.1656）；静音那份 5,458 → 3,680 ms（0.1824 → 0.1230）。**产出完全没变**（`outSamples 2,378,188`、`blocks 581`、`peak/rms` 逐项相同）才敢说它是调度而不是算法改动。兜底 stall 上限 20,000 → 3,000 轮（≈30 s 毫无进展就放弃，不再可能挂 200 s） | 两轮 logcat 的 `wallMs/rtf` 对比 |
+| 本轮最终构建 | `assembleDebug` **BUILD SUCCESSFUL**，APK 40,873,192 → **40,919,888 B**；JVM `testDebugUnitTest --rerun` **155 / 0 / 0**；仪器化整套件 `am instrument -w` **OK (56 tests)**（48 Room/Repository + 4 网络 + 4 解码），耗时 39.6 s | 测试 XML + `ls -l` + instrument 输出 |
+
+**这一轮没做 / 做不了**：
+
+- **`PcmDecoder` 还没有生产调用方**：只有测试在调它。`VadSegmenter`、`SherpaOnnxEngine`、`TranscriptCoordinator` 都没代码，
+  所以「解码 → VAD → 逐段识别 → 字幕」这条链目前只到第二环。
+- **只验过 MP3**：`audio/mp4a-latm`（m4a）、`audio/flac` 这些容器一份都没测；`readFormat` 里「非 16-bit 输出编码就抛」那条分支
+  是防御性代码，在这台模拟器上从未触发（MP3 解码器给的就是 16-bit）。
+- **RTF ≈ 0.17 只是模拟器数字**：10 小时的书光解码就要 ~1.7 小时。真机数字未知，而 ASR 推理本身才是主成本，目前**一个推理耗时都没测到**。
+- **缺真语音素材**（本轮新暴露的阻塞）：转录精度需要一段 3~10 分钟中文书解，机器上现在只有静音占位与歌曲。要么用户提供，要么等模型跑通后现场录一段。
+- `SpeechSegment.start` 与 `timestamps` 的单位**仍未验证**——这条从上一轮原样带过来，要等 `SherpaOnnxEngine` 落地才能钉死。
+
 ## 5. 待补的自动化测试清单（按阶段）
 
 | Phase | 用例 |
@@ -387,7 +420,7 @@ FR-707（只在当前句变化时更新）用**设备 + 单测两头**取证：�
 | 3 | **已覆盖**：递归 3 层子目录 + 扩展名白名单 + 深度/数量截断；连续扫描不产生新记录；同一 URI 重复出现只算一次；size/mtime 变化 → CHANGED 且字幕标 EXPIRED、手改标题不被覆盖；文件消失 → MISSING 且不删记录；文件原样回来 → MISSING 翻回 PRESENT；跨文件夹重复文件留在原文件夹；授权无法持久化 → 导入失败不写库；重扫跳过授权失效文件夹但继续其他文件夹；时长读取失败 → `duration_read_failed`；书架 tab/搜索状态与查询同源。**待补（依赖 Phase 4 的会话表）**：消失文件的收听历史仍然保留 |
 | 4 | **已覆盖**：4.9s 不计次 / 5.0s 计次；缓冲+暂停+焦点丢失不计时；2x 播 10min → `listened_ms=600000`、`consumed_audio_ms=1200000`；拖到末尾不完播；1.5x 听完 → 完播；两次听完 → 完播 2；崩溃恢复不重复累计（含幂等与「不结算之后的新会话」）；重算与增量一致；重算能修正被写坏的缓存；切歌结束旧会话；删书保留 `listening_session`；统计只算已结算行；倍速只落自己那一列；时长未知不覆盖已知时长。**待补（最大的一块）**：`Media3PlaybackController` 零测试——需要 Media3 `SimpleBasePlayer` 当 `Player` 替身才测得动，而「自动切歌不换倍速」这个真 bug 正是因为没有这层测试才只能在设备上撞见。另待补：消失文件的收听历史仍然保留 |
 | 5 | **已覆盖**：首句/中间/末句窗口与不补位；空字幕表与「位置还在首句之前」（`currentIndex=-1`）；gap 内不跳动、越过 `start-250ms` 才切；seek 后窗口更新；5000 句二分正确性；换曲后重挂字幕流；导入解析（SRT/VTT/TSV、缺小时格式、一位小数毫秒、乱序重排、`end ≤ start` 整份拒绝、空文件失败）；单事务整本替换；删书连带删字幕且历史留着。**待补**：真实 ASR 产出的时间重叠/倒退（要 Phase 6 的模型输出）、长句换行的高亮目视（fixture 每句都短）|
-| 6 | **已覆盖（2026-10-15，纯逻辑层）**：分段绝对偏移（第 N 段不从 0 开始、180 段零漂移、块间不重叠不留缝）；>20s 段均分且各块长度最多差 1 样本；空段/负起点段跳过；`msOf`/`samplesOf` 换算与取整；16-bit LE 字节序与 ±1 缩放；多声道均值下混（反相 → ≈0、单侧 → 减半）与尾字节如实报出；重采样恒等性/常数增益/通带与阻带频响/分块==一次性/`reset()`/输出长度 `ceil(N·out/in)`。**待补**：真 MP3 解码出的样本数与时长对账（`PcmDecoder`，下一项，需设备）、无标点长文本切句、异常时间戳清洗、取消/重试状态机、重转替换的原子性、`FakeAsrEngine` 端到端入库 |
+| 6 | **已覆盖（2026-10-15，纯逻辑层 + 解码层）**：分段绝对偏移（第 N 段不从 0 开始、180 段零漂移、块间不重叠不留缝）；>20s 段均分且各块长度最多差 1 样本；空段/负起点段跳过；`msOf`/`samplesOf` 换算与取整；16-bit LE 字节序与 ±1 缩放；多声道均值下混（反相 → ≈0、单侧 → 减半）与尾字节如实报出；重采样恒等性/常数增益/通带与阻带频响/分块==一次性/生产调用形状/`reset()`/输出长度 `ceil(N·out/in)`；**设备上真 MP3 解码**（148s 立体声素材：样本数对账偏差 0.22%、581 块首尾相接、幅度落在 ±1、`peak=0.659`、单缓冲上界 4,608 B 与文件长度无关、取消只交付 3 块、非音频文件给人话异常、静音素材解出全零）。**待补**：`VadSegmenter` 与 `SherpaOnnxEngine`（含 `timestamps`/`SpeechSegment.start` 单位验证、推理 RTF）、无标点长文本切句、异常时间戳清洗、取消/重试状态机、重转替换的原子性、`FakeAsrEngine` 端到端入库、m4a/FLAC 容器 |
 | 迁移 | **已覆盖 MIGRATION_1_2**：`MigrationTestHelper` 对导出 `2.json` 校验（`recreateTableOnMigrationError=false`）、已有书籍与收听历史保留、FK 与索引存在。规则不变：每条新 Migration 都要有对应测试，`fallbackToDestructiveMigration` 保持不出现 |
 
 ## 6. 只能人工/真机验证的项（尚未执行，勿声称完成）
