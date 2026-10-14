@@ -97,7 +97,11 @@ CI **不覆盖**：仪器化测试（没有模拟器）、真机验证、ASR 端
 1. ~~sherpa-onnx AAR 取回与 ABI 收敛~~ → **已完成（2026-10-15）**：静态链接版 AAR（38,691,998 B，官方 `digest` 已核对）放进 `app/libs/`（不入库），
    `app/build.gradle.kts` 缺文件时抛异常打印 URL/大小/SHA-256，CI 按同一份哈希取回；`abiFilters` 收窄为只有 `arm64-v8a`，
    实测 `assembleDebug` 通过、APK 40,794,372 B、包内只有一份 `libsherpa-onnx-jni.so`。**注意：只做到「链接进包」，一次推理都没跑过。**
-2. `ModelManager`：下载/导入、SHA-256 校验、删除；`ModelCatalog` 每个值都要有来源 URL，无官方校验值的要标注并本机钉首次哈希。
+2. ~~`ModelManager`：下载/导入、SHA-256 校验、删除；`ModelCatalog` 每个值都要有来源 URL，无官方校验值的要标注并本机钉首次哈希~~ →
+   **PARTIAL（2026-10-15）**：**下载 + 校验 + 删除已完成并在设备上打到真实 URL**——`asr/` 四个文件（`ModelCatalog` / `ModelVerifier` / `ModelFetcher`+`HttpFetcher` / `ModelManager`）
+   挂进 `AppGraph`（`modelsRoot = filesDir/models`），35 条 JVM 单测 + 4 条仪器化用例（`ModelManagerNetworkTest` 用清单里真实的 hf-mirror URL 取回 `tokens.txt` 并独立复算 sha256）；
+   清单三个文件的字节数与 SHA-256 全部实测过、`tokens.txt` 标了「无官方校验值 + 本机钉住」；顺带补上被漏掉的 `INTERNET` 权限（漏它时 35 条单测一条都不红）。
+   **仍缺三块**：① 本地导入（SAF 选目录）未实现；② 243 MB 的 int8 与 GitHub 单源的 VAD 都没从设备取回过（`github.com:443` 本机与模拟器同时超时，实测记录见 `docs/testing.md` §4）；③ 没有任何 UI 消费 `ModelManager.statuses`，所以「点一下就能下模型」还没交付 —— 归本清单第 6 项。
 3. `PcmDecoder`（Media3 `MediaDecoder`/`ExoPlayer` 抽 PCM）→ `VadSegmenter` → `SherpaOnnxEngine`（单段 ≤20s、不在主线程、`release()` 成对）。
 4. `transcript_job` 表（v2→v3，顺带给 `subtitle_segment.job_id` 补 FK）+ `TranscriptCoordinator` + WorkManager 任务与重启恢复。
 5. FR-602/603 的切句与时间戳清洗（这次才是真需要 `SentenceSplitter` 的地方）。

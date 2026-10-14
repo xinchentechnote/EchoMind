@@ -9,11 +9,11 @@ Android 原生（Kotlin + Jetpack Compose + Media3 + Room）听书应用。导�
 | 能力 | 状态 |
 | --- | --- |
 | 工程骨架 / Compose 导航 / 构建产物 | **DONE**：`assembleDebug` 通过，已在 API 36 arm64 设备实测启动 |
-| CI | **PARTIAL**：GitHub Actions（私有库 `xinchentechnote/EchoMind`）每次 push/PR 跑 `assembleDebug` + 83 项 JVM 单测并上传 APK，已跑绿（run 38632644725，`BUILD SUCCESSFUL in 5m36s`）；**仪器化测试不在 CI 里**（没有模拟器，原因与代价见 `docs/environment.md` §8） |
+| CI | **PARTIAL**：GitHub Actions（私有库 `xinchentechnote/EchoMind`）每次 push/PR 跑 `assembleDebug` + 全部 JVM 单测并上传 APK，已跑绿（run 38632644725，那一次是 83 项，`BUILD SUCCESSFUL in 5m36s`）；本机现在是 **118 项 JVM 单测 + 52 项仪器化测试**，新增部分要等下一次 push 才由 CI 复验。**仪器化测试不在 CI 里**（没有模拟器，原因与代价见 `docs/environment.md` §8；设备侧真实 URL 下载那 4 项同样只能本机跑） |
 | 文件夹导入、书架 | **PARTIAL**：SAF 授权持久化、递归扫描、去重/变更/消失/复活、时长提取、标题可改、搜索、收藏、继续上次收听卡片，均已在模拟器用真实 mp3 实测。**缺**：文件夹管理/重新授权页、扫描取消与进度、行内改名 → 见 `docs/roadmap.md`「Phase 3 遗留」 |
 | 播放、后台播放、播放记忆与统计 | **PARTIAL**：Media3 ExoPlayer + `MediaSessionService` 后台播放、±15s、每首独立倍速、上一首/下一首、焦点处理；按记忆位置起播、有效次数（≥5s）、累计收听时长（倍速不放大）、完播判定、会话历史、崩溃恢复与重算对账，均已在模拟器实测（59→83 项 JVM 单测 + 48 项仪器化测试）。**缺**：耳机拔出（需真机）、设置页「重算统计」入口、前台长时间播放 → 见「Phase 4 遗留」 |
 | 七句字幕窗口 | **PARTIAL**：v2 表 + 显式 `MIGRATION_1_2`（`MigrationTestHelper` 设备验证）、`SubtitleSynchronizer` 二分定位、3+1+3 窗口、点句跳转、切歌换字幕。**字幕内容 100% 来自手工导入的测试文件（`MANUAL_TEST`），不是 ASR 产物** → 见「Phase 5 遗留」 |
-| 本地 ASR（sherpa-onnx + Paraformer） | **TODO**：**ASR 端到端未完成**。`asr/`、`work/` 包里还没有代码；依赖形态、模型选型、时间戳可行性已实测确证（`docs/asr-design.md`） |
+| 本地 ASR（sherpa-onnx + Paraformer） | **PARTIAL**：**ASR 端到端仍未完成，一次推理都没跑过**。已完成的是模型准备这一层：`asr/ModelCatalog`（清单，三个文件的字节数与 SHA-256 全部实测、`tokens.txt` 如实标「无官方校验值 + 本机钉住」）、`ModelVerifier`、`ModelManager` + `HttpFetcher`（`.part` → 比大小 → 整份 SHA-256 → 改名 → 记来源，多源回退、文件级跳过、删除），已挂进 `AppGraph` 并在模拟器上用**真实 hf-mirror URL** 跑通过一次下载。**缺**：`PcmDecoder`/`VadSegmenter`/`SherpaOnnxEngine`/`TranscriptCoordinator` 与 `work/` 全空、`transcript_job` 表未建、本地导入未实现、模型管理还没有 UI 入口 → 见 `docs/roadmap.md` Phase 6 |
 | 端到端验收 | **TODO**：未开始 |
 
 详见 [docs/roadmap.md](docs/roadmap.md)。
@@ -49,7 +49,9 @@ mkdir -p app/libs && curl -sSL -o app/libs/sherpa-onnx-static-link-onnxruntime-1
   https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/sherpa-onnx-static-link-onnxruntime-1.13.8.aar
 ```
 
-转录功能还需要中文 Paraformer + Silero VAD 模型（App 内下载或本地导入，校验值见 `docs/asr-design.md` §3）。**在拿到模型之前，App 的播放功能不受影响，字幕功能如实提示不可用。**
+转录功能还需要中文 Paraformer + Silero VAD 模型（校验值与来源 URL 见 `docs/asr-design.md` §3）。
+**取回模型目前只有代码路径（`asr/ModelManager`）没有界面**：设置页要到 Phase 6 第 6 项才落地，本地导入路径也还没实现，所以现在是「能下载、但点不到」。
+**在拿到模型之前，App 的播放功能不受影响，字幕功能如实提示不可用。**
 
 ## 文档
 

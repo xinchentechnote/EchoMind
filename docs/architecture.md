@@ -47,9 +47,12 @@ app/src/main/java/com/xinchen/echomind/
 │   ├── Media3PlaybackController.kt// ✅ 实现 + Player.Listener + 统计事件翻译 + 串行落库通道
 │   ├── PlayerHolder.kt            // ✅ 单例 ExoPlayer 持有（同进程共享给 Service；不提供 release()）
 │   └── EchoMindMediaService.kt    // ✅ MediaSessionService + addSession + 前台通知 + onTaskRemoved
-├── asr/                           // AsrEngine / SherpaOnnxEngine / ModelManager / PcmDecoder /
-│   │                              //   PcmResampler / TranscriptCoordinator — Phase 6
-│   └──（当前一个文件都没有，接口只在文档里）
+├── asr/                           // 模型准备侧 ✅（推理侧仍未开始，Phase 6 后续项）
+│   ├── ModelCatalog.kt            // ✅ 清单唯一出处：URL/字节数/SHA-256 全部实测，无官方校验值标 null 并本机钉住
+│   ├── ModelVerifier.kt           // ✅ 存在 → 大小 → SHA-256 三步核对 + 流式哈希（纯 JVM，可单测）
+│   ├── ModelFetcher.kt            // ✅ `fun interface ModelFetcher`（测试接缝）+ `HttpFetcher`（HttpURLConnection，手工跟 Location）
+│   ├── ModelManager.kt            // ✅ statuses/download/delete/refresh：`.part` → 校验 → 改名 → 记来源，多源回退、文件级跳过、250ms 进度限流
+│   └── SherpaOnnxEngine / PcmDecoder / PcmResampler / VadSegmenter / TranscriptCoordinator — **Phase 6，代码里还没有**
 ├── work/                          // TranscriptWorker / FolderRescanWorker — Phase 6
 │   └──（当前无 WorkManager：重扫是 appScope 里的 `Dispatchers.IO` 协程）
 └── ui/
@@ -133,7 +136,14 @@ interface AsrEngine {                                  // 推理侧唯一抽象
     fun release(handle: EngineHandle)
 }
 
-interface ModelManager { val state: Flow<ModelLocalState>; suspend fun importFrom(uri: Uri); suspend fun verify(): VerifyResult; suspend fun delete() }
+class ModelManager(modelsRoot: File, timeSource: TimeSource, specs: List<ModelSpec>, fetcher: ModelFetcher, ioDispatcher: CoroutineDispatcher) {
+    val statuses: StateFlow<List<ModelStatus>>        // UI 只读这一个：verification / isDownloading / download / error
+    suspend fun refresh(): List<ModelStatus>          // 核对本机文件，不做任何网络调用
+    suspend fun download(spec: ModelSpec): ModelVerification   // 失败抛 ModelDownloadException，原因同时写进 statuses 的 error
+    suspend fun delete(spec: ModelSpec): ModelVerification     // 只动 filesDir/models/<id>/，字幕与收听历史不碰
+}
+// 取舍：`ModelManager` 是类不是接口。它的测试接缝放在**依赖**上——`fun interface ModelFetcher` 用假实现注入，
+// 于是「下载状态机」在 JVM 单测里可测，不需要再给 ModelManager 套一层接口。本地导入（`importFrom(uri)`）还没实现，等它落地时再谈签名。
 interface TranscriptRepository { fun jobs(): Flow<List<TranscriptJobRow>>; suspend fun enqueue(audioId: String); suspend fun cancel(jobId: Long); suspend fun retry(jobId: Long) }
 interface SubtitleRepository {                         // ✅ Phase 5 实现（data/repo/SubtitleRepository.kt）
     fun observeSegments(audioId: String): Flow<List<SubtitleSegment>>   // 整本按 segment_index 升序
@@ -225,7 +235,10 @@ controller.state.map { it.positionMs }        // 500ms tick，即 PlaybackPolicy
 
 - **手工 DI**（`AppGraph` 一个对象 + ViewModelFactory）。理由：Hilt/KAPT 在本机是新增依赖面 + 注解处理器，AGP 9 内置 Kotlin 下的兼容性未实测；项目规模不需要图管理。若后续模块拆分导致装配复杂，再评估。
 - Room 走 **KSP**，实测版本 `com.google.devtools.ksp:2.3.12`（`libs.versions.toml`）。注意 KSP 的 2.3.x 是它自己的编号，**不存在对应的 Kotlin 2.3.12**，不要为了「对齐 KGP」去改它。`kapt` 被 AGP 9 判定与 built-in Kotlin 不兼容（硬错误），所以没有 kapt 退路；真要出问题就换 KSP 版本，不改注解处理器路线。
-- 可测试性设计：`TimeSource`、`PlaybackPolicy`、`SessionTracker`、`SubtitleSynchronizer`、`TestSubtitleParser` 全是纯 Kotlin，无 Android import，可在 JVM 里跑。`SentenceSplitter`、`PcmChunkPlanner` 是 Phase 6 计划的同类接缝，**目前代码里还没有**。
+- 可测试性设计：`TimeSource`、`PlaybackPolicy`、`SessionTracker`、`SubtitleSynchronizer`、`TestSubtitleParser` 全是纯 Kotlin，无 Android import，可在 JVM 里跑。
+  `asr/ModelCatalog`、`ModelVerifier`、`ModelFetcher`、`ModelManager` 同理（只用 `java.io.File` / `java.net` / `MessageDigest`），35 条 JVM 单测就是这么来的；
+  它们的**接缝在依赖上**（注入假 `ModelFetcher` + `FakeTimeSource` + `TemporaryFolder`），不是靠给 `ModelManager` 套接口。
+  `SentenceSplitter`、`PcmChunkPlanner` 是 Phase 6 计划的同类接缝，**目前代码里还没有**。
 
 ## 8. 错误处理与降级
 
@@ -276,3 +289,5 @@ controller.state.map { it.positionMs }        // 500ms tick，即 PlaybackPolicy
 | D21 | 书架那一格只描述**转录任务**状态（`transcription_state`），NONE 渲染成「未转录」而不是「无字幕」 | 手工导入的测试字幕故意不动 `transcription_state`（那列归 Phase 6 任务管线），于是一本有测试字幕的书在书架上仍是「未转录」——这句话是真的，而「无字幕」是假的。代价：想显示「有字幕」得让书架查询 JOIN 一次 `subtitle_segment`，为了一个 debug 通道不值得 |
 | D22 | Maven 仓库顺序按 `GITHUB_ACTIONS` 环境变量分岔：本机阿里云镜像优先，CI 只用官方源 | 实测两头的网络结论相反——本机 `repo1.maven.org` DNS 超时只能用镜像；runner 打 `maven.aliyun.com/repository/{gradle-plugin,public}` 对 KSP marker 回 **502**，而 Gradle 把 5xx 当致命错、不再试下一个仓库，最后报成「plugin not found」（run 38631763968 的状态码矩阵）。代价：`settings.gradle.kts` 有一处环境分支，且**本机无法复现 CI 的解析路径**（本机 `repo.maven.apache.org` 对 HEAD 回 403），只能靠远端实测把关。用 `GITHUB_ACTIONS` 而不是自建变量名，是为了让「在 CI 上」这件事不需要第二份配置 |
 | D23 | 38.7 MB 的 sherpa-onnx AAR 不进仓库，改由 **CI 按钉住的 SHA-256 从官方 release 取回**（配 `actions/cache`），本机缺失时 `app/build.gradle.kts` 在配置阶段抛异常打印 URL/大小/哈希 | 二进制入库会让每次 clone 都背 38 MB 且无法复核来源；静默自动下载又违背「不许偷偷拉几百 MB」（AGENTS.md §5）。让 CI 显式下载 + `sha256sum -c`，构建机与本机用同一份钉住值，取不到就红。代价：CI 依赖 GitHub release 的可用性（实测 runner 直连 13 MB/s，比本机还快），且 `app/build.gradle.kts` 多了一段人类可读的报错 |
+| D24 | 模型取回用 `HttpURLConnection`（`HttpFetcher`）而不是再引一个 HTTP 库；**先写 `<file>.part` → 比大小 → 算整份 SHA-256 → 才 `renameTo` 正式文件**，失败删 `.part`；续传只做**文件级**（已合格的文件跳过，半截的重下） | 项目里已有 Media3 与 WorkManager，为「下一个 243 MB 的文件」再引 OkHttp 不划算，`HttpURLConnection` 够用但要自己跟 `Location`（实测 hf-mirror 会重定向到 `/api/resolve-cache/…`，GitHub 更是 302 到对象存储）。「改名前必须整份校验」是为了让磁盘上永远不存在「名字对但内容坏」的模型——那种文件下一步就是被 `AsrEngine` 加载。不做 HTTP Range 续传的取舍：清单里每个文件的哈希是**整份**的，半截文件既不能部分校验也不能假装可用，加 Range 只会把「重下」这条唯一的正确路径变复杂；代价是弱网下 243 MB 要重来（`docs/asr-design.md` §7）。进度按**单调时钟**限流 250 ms 推一次，因为 `StateFlow` 是合并式的，回调密度再高 UI 也只能看到最后一个值 |
+| D25 | 下载这条路径**必须**留一条打真实 URL 的仪器化用例，哪怕它不在 CI 门禁里、且会因上游不可达变红 | 实测理由：`AndroidManifest` 漏了 `INTERNET` 权限时，**35 条 JVM 单测一条都不红**——假 fetcher 与 host 上的临时 `HttpServer` 都不过 Android 的权限检查；而且设备栈帧里是 `com.android.okhttp.internal.huc.HttpsURLConnectionImpl`，Android 的 `HttpURLConnection` 底层是 Framework 自带的 OkHttp 移植，与 host JDK 那份不是同一套实现（TLS、重定向、HTTP 版本行为都可能不同）。代价：这条用例依赖外网可达，CI 没有模拟器 → 它是**本机一次性凭据**而不是持续回归网；所以 GitHub 连不上时选择**移除**那条用例并如实记录（`silero_vad.onnx` 至今没从设备取回过），而不是留一条红色的假警报 |

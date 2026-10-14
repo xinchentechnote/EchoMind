@@ -95,7 +95,7 @@
 
 | ID | 需求 | 验收标准 | 状态 |
 | --- | --- | --- | --- |
-| FR-501 | 只用本地模型，不调在线 ASR API | 网络权限层面：转录路径无任何 HTTP 客户端 | |
+| FR-501 | 只用本地模型，不调在线 ASR API | 网络权限层面：转录路径无任何 HTTP 客户端 | PARTIAL：`INTERNET` 权限只服务「把模型取回本机」这一件事（`asr/HttpFetcher`），转录路径仍然没有任何网络调用（引擎本身还没实现，Phase 6 后续项落地时不许往里加）。边界要说清：**模型准备需要网络，准备完之后飞行模式可用**（需求「离线可用」的前提是「首次准备」） |
 | FR-502 | 通过 `AsrEngine` 接口封装加载与推理；sherpa-onnx 实现与测试替身实现并列 | 单测跑替身引擎，无需模型 | |
 | FR-503 | 中文书解优先验证 Paraformer 中文离线模型；时间戳能力按 `asr-design.md` 的确证结论落地（若模型不给可靠句级时间戳，用其确证的替代路线并记录误差） | 设计文档有真实来源 URL，不虚构 | |
 | FR-504 | 转录流水线：MP3 解码 → 16kHz 单声道 PCM → 分段（不整本载入内存，峰值受控）→ 逐段识别 → 结果合并 → 切句 | 单测：分段边界与偏移；集成测试：真实 MP3 | |
@@ -104,8 +104,8 @@
 | FR-507 | 任务支持排队/取消/重试/进度显示；前台服务 + 通知；应用重启后未完成任务可恢复（不自动重跑已完成部分则记录为设计取舍） | 集成测试：取消后状态 CANCELLED，重试回到 QUEUED | |
 | FR-508 | 模型不可用/文件损坏/内存不足 → 明确错误文案与可执行动作（重新准备模型/重试），App 不崩溃且仍可播放 | 设备验证 | |
 | FR-509 | 转录与播放互不阻塞（不同线程/不同资源；模型加载不在主线程） | 设备验证：播放中启动转录不卡顿 | |
-| FR-510 | App 本体与模型分离：首次使用时下载**或**本地文件导入模型包；校验通过后入库；模型信息（名称/版本/文件清单/大小/SHA-256/来源）集中在一个清单里 | 清单里没有虚构值；来源标注清楚 | |
-| FR-511 | 不把模型塞进 APK（体积已评估，见 `asr-design.md`） | `assets/` 无模型 | |
+| FR-510 | App 本体与模型分离：首次使用时下载**或**本地文件导入模型包；校验通过后入库；模型信息（名称/版本/文件清单/大小/SHA-256/来源）集中在一个清单里 | 清单里没有虚构值；来源标注清楚 | PARTIAL：清单在 `asr/ModelCatalog.kt`（数值由 `ModelCatalogTest` 钉住，`tokens.txt` 标 `officialSha256=null`）；在线下载路径 `ModelManager.download` 已实现「`.part` → 比大小 → 整份 SHA-256 → 改名」并写 `download-provenance.properties`，删除走 `ModelManager.delete`；真实 hf-mirror URL 已在设备上由 App 自己的代码取回并核对（`androidTest/asr/ModelManagerNetworkTest`，只到 75 KB 的 `tokens.txt`，243 MB 那份与 GitHub 单源的 VAD 仍未在设备取回过）；**本地导入（SAF 选目录）未实现**；没有 UI 入口用它（`docs/testing.md` §4） |
+| FR-511 | 不把模型塞进 APK（体积已评估，见 `asr-design.md`） | `assets/` 无模型 | DONE（`unzip -l app-debug.apk` 里没有任何 `assets/` 条目与 `.onnx`；模型只在运行时落到 `filesDir/models/`） |
 
 ## 6. 字幕切句与时间戳
 
@@ -137,7 +137,7 @@
 
 | ID | 需求 | 验收标准 | 状态 |
 | --- | --- | --- | --- |
-| FR-901 | 模型状态与版本、准备/更新/删除模型、本地导入模型包 | 设置页可见真实状态；删除后播放仍正常 | TODO（Phase 6，`asr/` 与 `ModelManager` 一个文件都还没有） |
+| FR-901 | 模型状态与版本、准备/更新/删除模型、本地导入模型包 | 设置页可见真实状态；删除后播放仍正常 | TODO（设置页一行代码都还没有；底下的 `asr/ModelManager.statuses` / `download` / `delete` 与 `ModelCatalog` 已实现并有单测，UI 只许读它们，不许再算一遍大小或哈希——见 FR-510） |
 | FR-902 | 默认播放倍速、字幕字号 | 修改后新音频生效 | TODO（Phase 7；`settings` 表也未建。当前每首独立倍速已实现并可持久化，但没有「默认值」来源） |
 | FR-903 | 播放次数统计规则说明（文案与实际 `PlaybackPolicy` 一致，由常量渲染而非另写死字符串） | 代码审查：文案来自同一常量源 | **DONE**：统计页三行说明全部由 `PlaybackPolicy.MIN_VALID_SESSION_LISTENED_MS` / `END_TOLERANCE_MS` / `COMPLETED_CONSUMED_RATIO` 插值渲染，页面上没有第二处写死的阈值字符串 |
 | FR-904 | 文件夹授权状态列表 + 重新授权入口 + 重扫 | 设备验证 | PARTIAL（Phase 3 遗留：只有全局重扫与文件夹级 `REVOKED` 状态，没有列表和按文件夹的重新授权入口 → Phase 7） |

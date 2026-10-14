@@ -1,0 +1,124 @@
+package com.xinchen.echomind.asr
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * 清单的「诚实性」底线测试（AGENTS.md §5、FR-510）：
+ * 这里钉住的是**本机逐字节复核过**的数值，谁改了就必须同时改文档并重新实测，
+ * 否则这条测试会红。
+ */
+class ModelCatalogTest {
+
+    @Test
+    fun `全部下载地址都是 https`() {
+        ModelCatalog.all.flatMap { it.files }.forEach { fileSpec ->
+            fileSpec.candidateUrls.forEach { url ->
+                assertTrue("明文 http 不可接受：$url", url.startsWith("https://"))
+            }
+        }
+    }
+
+    @Test
+    fun `校验值是 64 位小写十六进制`() {
+        ModelCatalog.all.flatMap { it.files }.forEach { fileSpec ->
+            listOfNotNull(fileSpec.officialSha256, fileSpec.pinnedSha256).forEach { sha ->
+                assertTrue("$fileSpec 的校验值不像 sha256：$sha", HEX_64.matches(sha))
+            }
+        }
+    }
+
+    @Test
+    fun `大小都是正数`() {
+        ModelCatalog.all.flatMap { it.files }.forEach {
+            assertTrue("${it.fileName} 大小非法：${it.expectedBytes}", it.expectedBytes > 0L)
+        }
+    }
+
+    @Test
+    fun `paraformer 的两个文件钉在本机实测值上`() {
+        val model = ModelCatalog.paraformer.files[0]
+        assertEquals("model.int8.onnx", model.fileName)
+        assertEquals(243_371_218L, model.expectedBytes)
+        assertEquals(
+            "f36a0433bcf096bd6d6f11b80a3ac8bed110bdca632fe0d731df8d1a84475945",
+            model.expectedSha256,
+        )
+        assertEquals(
+            "https://hf-mirror.com/csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14/resolve/main/model.int8.onnx",
+            model.url,
+        )
+
+        val tokens = ModelCatalog.paraformer.files[1]
+        assertEquals("tokens.txt", tokens.fileName)
+        assertEquals(75_756L, tokens.expectedBytes)
+        assertEquals(
+            "59aba8873a2ed1e122c25fee421e25f283b63290efbde85c1f01a853d83cb6e6",
+            tokens.expectedSha256,
+        )
+    }
+
+    @Test
+    fun `silero vad 钉在官方 release 的 digest 上`() {
+        val vad = ModelCatalog.sileroVad.files.single()
+        assertEquals("silero_vad.onnx", vad.fileName)
+        assertEquals(643_854L, vad.expectedBytes)
+        assertEquals(
+            "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6",
+            vad.expectedSha256,
+        )
+        assertTrue(vad.hasOfficialChecksum)
+    }
+
+    /**
+     * `tokens.txt` 官方没发校验值（HF API 的 sha256 字段为空，`docs/asr-design.md` §3），
+     * 所以它必须是清单里唯一 `hasOfficialChecksum == false` 的文件，UI 才能如实标注。
+     */
+    @Test
+    fun `只有 tokens txt 没有官方校验值`() {
+        val withoutOfficial = ModelCatalog.all.flatMap { it.files }.filterNot { it.hasOfficialChecksum }
+        assertEquals(listOf("tokens.txt"), withoutOfficial.map { it.fileName })
+        val tokens = ModelCatalog.paraformer.files[1]
+        assertNull(tokens.officialSha256)
+        assertEquals(tokens.pinnedSha256, tokens.expectedSha256)
+    }
+
+    @Test
+    fun `识别模型只有支持时间戳的那一个型号`() {
+        val recognizers = ModelCatalog.all.filter { it.role == ModelRole.Recognizer }
+        assertEquals(1, recognizers.size)
+        assertEquals(ModelCatalog.paraformer, recognizers.single())
+        // 型号名必须落在 zh-2023-09-14 上：官方只有它带时间戳（docs/asr-design.md §1-A4），
+        // 换型号等于放弃句级时间，所以清单里换型号要连这条测试一起改。
+        assertEquals("paraformer-zh-2023-09-14-int8", ModelCatalog.PARAFORMER_ID)
+        ModelCatalog.paraformer.files.forEach {
+            assertTrue("${it.url} 不是 zh-2023-09-14 的仓库", it.url.contains("sherpa-onnx-paraformer-zh-2023-09-14"))
+        }
+    }
+
+    @Test
+    fun `id 唯一且 byId 能取回同一个包`() {
+        val ids = ModelCatalog.all.map { it.id }
+        assertEquals(ids.size, ids.toSet().size)
+        assertEquals(ModelCatalog.sileroVad, ModelCatalog.byId(ModelCatalog.SILERO_VAD_ID))
+        assertEquals(listOf(ModelCatalog.paraformer, ModelCatalog.sileroVad), ModelCatalog.all)
+    }
+
+    @Test
+    fun `byId 对未知 id 直接抛错而不是返回 null`() {
+        assertThrows(IllegalArgumentException::class.java) { ModelCatalog.byId("whisper-tiny") }
+    }
+
+    @Test
+    fun `总大小是各文件之和`() {
+        assertEquals(243_371_218L + 75_756L, ModelCatalog.paraformer.totalBytes)
+        assertEquals(643_854L, ModelCatalog.sileroVad.totalBytes)
+    }
+
+    private companion object {
+        val HEX_64 = Regex("^[0-9a-f]{64}$")
+    }
+}

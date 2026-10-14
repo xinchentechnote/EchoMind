@@ -313,6 +313,42 @@ FR-707（只在当前句变化时更新）用**设备 + 单测两头**取证：�
 - CI 没有模拟器 → `assembleDebugAndroidTest` 之后那 48 项仪器化测试不在 CI 门禁里。
 - CI 的仓库顺序按 `GITHUB_ACTIONS` 分岔，因此**本机跑不到 CI 那条解析路径**：本机模拟 `GITHUB_ACTIONS=true` 时 `repo.maven.apache.org` 对 HEAD 回 **403**（Gradle 正好先发 HEAD），这是本机特有的拦截，runner 上是 200。结论只能靠远端实测拿，别拿本机 curl 的 200 反驳它。
 
+### Phase 6 第 2 项：模型清单 + 下载校验（2026-10-15 04:50 ~ 05:25）
+
+`asr/ModelCatalog.kt`、`asr/ModelVerifier.kt`、`asr/ModelFetcher.kt`（`HttpFetcher`）、`asr/ModelManager.kt` 四个文件 + 35 条 JVM 单测，`ModelManager` 已挂进 `AppGraph`。
+收尾时补了 `AndroidManifest` 的 `INTERNET` 权限与 4 条**打到真实 URL** 的仪器化用例（`androidTest/asr/ModelManagerNetworkTest.kt`）。
+
+| 动作 | 结果 | 凭据 |
+| --- | --- | --- |
+| 第 1 次构建 | **失败**（编译期）：`encodeHex` 在当前 stdlib 上不存在；`lastPublishAtMs` 是可空局部变量、被闭包改写 → SMARTCAST_IMPOSSIBLE | `compileDebugKotlin` 输出 |
+| 哈希实现改法 | 自写 `ModelVerifier.toHex`（查表），**不用** `String.format("%02x")`（受默认 Locale 影响，可能算出对不上的校验值）、**不用** `java.util.HexFormat`（Android 要 API 34） | `ModelVerifier.kt` |
+| 第 2 次构建 | 主源码过了，测试源码编译失败 4 类（`specOf` 形参顺序、`HttpServer.port` 不存在、`RecordingFetcher` 缺省值、`assertTrue` 参数顺序） | `compileDebugUnitTestKotlin` 输出 |
+| 第 3 次运行 | **118 tests / 4 failed**（从 `app/build/test-results/**/*.xml` 汇总，不看绿字） | 同上 |
+| 失败 1（真问题） | `ModelCatalog.byId` 对未知 id 抛的是 `NoSuchElementException`（`List.first` 的默认行为），测试期望 `IllegalArgumentException` → 改成 `firstOrNull ?: throw IllegalArgumentException("模型清单里没有 id=…")`，让日志能直接说出是哪个 id | 测试 + 代码 |
+| 失败 2（真问题） | `delete()` 成功后 `ModelStatus.error` 挂着「model.onnx 不存在」——删除本来就该让文件消失，把核对结论塞进 `error` 等于自造一条假错误 → `applyVerifications` 只在操作失败时写 `error`，缺失情况一律由 `ModelVerification.failures` 表达 | 测试 + 代码 |
+| 失败 3、4（**测试写错了，不是代码错了**） | 断言「进度按 4/8/12/16 依次推给状态流」拿到空列表。原因是 `StateFlow` 是**合并式**的：假 fetcher 里那几次回调之间没有任何挂起点，收集器只能在下载结束后看到最后一个值。改成**在回调内部就地读 `statuses.value`**，才真正测到限流逻辑（`[4, 4, 12, 16]`：8 被 250ms 限流压掉、尾包必发） | `ModelManagerTest` 两条进度用例 |
+| 最终本机构建 | `assembleDebug` **BUILD SUCCESSFUL**，APK 40,794,372 → **40,854,051 B**（新增 4 个 asr 类）；`testDebugUnitTest` **118 tests / 0 failures** | `ls -l` + 测试 XML |
+| 清单二次复核 | `tokens.txt` 重新取回 75,756 B、sha256 `59aba8873a…cb6e6` **与清单一致**；这次 hf-mirror 返回 200 但 `url_effective` 落在 `/api/resolve-cache/…` → **它自己会重定向**，正是 `HttpFetcher` 手工处理 `Location` 的实测依据 | `curl -w %{url_effective}` + `shasum -a 256` |
+| VAD 源复核 | **没做成**：05:10 起 `github.com:443` 本机连接超时（两次各 75 s），与 04:20 取 AAR 时 13 MB/s 相比是网络抖动。探测的两个 hf-mirror 备选路径都 **404**，所以**没有**写进清单（AGENTS.md §5 不许虚构地址）；清单里 VAD 仍是 GitHub 单源 | 命令输出 |
+| 设备冒烟 | 覆盖安装 → `am start .MainActivity` → `mCurrentFocus` 是本 App、`uiautomator dump` 拿到书架文本（`搜索标题`/`继续上次收听`/`未转录`…）、`logcat` 无 `FATAL EXCEPTION`；`run-as ls files` 只有 `profileInstalled`，**没有** `models/` → `ModelManager` 构造确实不做任何 IO | `emulator-5554`，截图 `/tmp/echomind-p6a-launch.png` |
+| **设备上的第一个真问题** | 写 FR-501 注记时翻 `AndroidManifest.xml`，发现**根本没有 `android.permission.INTERNET`** —— 前面所有下载代码在设备上必然失败，而 35 条单测一条都发现不了（它们不信权限，也不碰真实 socket）。补权限，并把「必须在设备上跑一次真 URL」写成本轮的验收动作 | `grep INTERNET` 无结果 → manifest 现列出该权限 |
+| 权限真的生效 | `dumpsys package com.xinchen.echomind` 的 `requested permissions` 现在含 `android.permission.INTERNET`（与 `POST_NOTIFICATIONS`、`FOREGROUND_SERVICE*` 并列） | 覆盖安装后设备输出 |
+| 设备真实下载 | `asr/ModelManagerNetworkTest` **4 tests / OK（`Time: 2.258`）**：拿清单里 `tokens.txt` 的**真实 hf-mirror URL**、用与 `AppGraph` 同一条代码路径（`ModelManager` + `HttpFetcher` + `AndroidTimeSource`）落到 `filesDir/instrumented-models/paraformer-zh-2023-09-14-int8/`。断言分两路：① 长度 == 75,756 B、② 测试里**再独立算一次** `ModelVerifier.sha256` == 清单值（不复用 `download()` 内部的比对结果）；`download-provenance.properties` 含 `.url/.bytes/.sha256/.checksum=pinned-by-first-download`；第二次 `download()` 不重取（`lastModified` 不变）；不存在的远端文件 → `ModelDownloadException` 且消息含 `HTTP 404`，目录里既不留文件也不留 `.part`；空目录 `refresh()` 给出 `Missing` 而不是崩 | `am instrument -w -e class com.xinchen.echomind.asr.ModelManagerNetworkTest` |
+| Android 的 `HttpURLConnection` 是谁 | 失败堆栈里是 `com.android.okhttp.internal.huc.HttpsURLConnectionImpl` → **设备上的 `HttpURLConnection` 底层是 OkHttp**，与 host JDK 那份实现不是同一套代码。这就是「JVM 单测全绿 ≠ 设备能下载」的机制性原因，也是这 4 条仪器化用例存在的理由 | instrument 输出堆栈 |
+| VAD 的设备用例 | **本轮移除，并且不声称验证过**：`github.com:443` 从设备侧同样连不上 —— `SocketTimeoutException: failed to connect to github.com/20.205.243.166 (port 443) from /10.0.2.15 (port 54514) after 15000ms`，与宿主机 05:10 起的现象一致。留着它只会因上游不可达把套件变红（首轮确实是 5 tests / 1 failed，失败原因就是这个超时）。VAD 在设备上的真实取回**仍未验证**，它依旧是 GitHub 单源风险（§3） | 首次 instrument 完整输出 |
+| 换权限后数据存活 | `adb install -r`（带新权限）之后：`run-as ls databases` 仍有 `echomind.db`(+`-shm`/`-wal`)，书架 UI 显示 `deep - 深层`、`已播到 1:29 / 1:29`、`37 分钟前`、`未转录`，`logcat -b crash` 为空 → 权限变更不是破坏性升级，收听历史与 SAF 授权没被清掉。顺手删掉仪器化测试留在 `filesDir` 的 `profileInstalled` 与 Phase 5a 遗留的 `migrate_v1_to_v2.db.lck` | 截图 `/tmp/echomind-p6a-internet.png`、`/tmp/ui-p6a.xml` |
+| 仪器化全套 | 完整 `am instrument`（不带 `-e class`）**OK (52 tests)，`Time: 5.095`** —— 48 项旧用例 + 这 4 项新用例，覆盖安装 `install -r -t` 之后跑的，SAF 授权与既有数据库都没清 | instrument 输出 |
+| 收口复跑 | `:app:testDebugUnitTest --rerun` → **118 tests / 0 failures / 0 skipped**（仍从 `app/build/test-results/**/*.xml` 汇总）；APK 40,854,051 B | 本机命令输出 |
+
+**这一轮没做 / 做不了**：
+
+- **243 MB 那份模型没在设备上取回过**。设备上跑通的是 75 KB 的 `tokens.txt`——权限、TLS、重定向、`filesDir` 写入与改名、`.part` 清理这些**机制**都验证到了，但整份 int8 的下载时长、内存占用（流式 SHA-256 在低内存设备上的表现）与进度限流的实际观感仍属空白。它属于「设置页里点下载」那次交付（Phase 6 第 6 项 / Phase 7），届时要有 `adb` 侧的字节数与耗时凭据。
+- **`silero_vad.onnx` 从设备上一次都没取回过**（GitHub 不可达，见上表）。清单值仍是 04:20 宿主机 curl + 官方 `digest` 比对的结果。
+- **本地导入路径未实现**（§7 第 2 条），完全离线的首次准备现在没有可用通道。
+- 没有任何 UI 入口消费 `ModelManager.statuses`，`AppGraph.modelManager` 暂时只有构造它的代码与仪器化测试用到。
+- `HttpFetcher` 不做 HTTP Range 续传：断线后同一个文件从头重下，这是取舍不是遗漏（见 `docs/architecture.md` D24）。
+- 设备用例依赖外网可达，本机与 CI 都**没有**把它们放进门禁（CI 只跑 `assembleDebug` + `testDebugUnitTest`）。所以它们是本机一次性凭据，不是每次提交都守得住的回归网。
+
 ## 5. 待补的自动化测试清单（按阶段）
 
 | Phase | 用例 |

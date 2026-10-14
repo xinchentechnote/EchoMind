@@ -72,6 +72,16 @@
   → 243,371,218 B / **6.2s / 39.2 MB/s**，`shasum -a 256` 得 `f36a0433bcf096bd6d6f11b80a3ac8bed110bdca632fe0d731df8d1a84475945`，**与 HF LFS `oid` 逐字符相同**；
   `tokens.txt` 75,756 B 同时落到 `app/libs/models/sherpa-onnx-paraformer-zh-2023-09-14/`（gitignore 内，不入库）。
 - 下载首选 **hf-mirror.com**（本轮实测 39.2 MB/s；A10 那次是 5.86 MB/s，速度同样会漂）；`huggingface.co` 本机超时，只作为备用源写在清单里。
+- **2026-10-15 05:10 二次复核（接完 `ModelManager` 之后）**：重新取 `tokens.txt` → 75,756 B、`59aba8873a…cb6e6`，**与清单逐字符相同**，
+  且 hf-mirror 这次返回 200 但 `url_effective` 落到了 `/api/resolve-cache/...`（**它自己会重定向**，这就是 `HttpFetcher` 必须处理 `Location` 的实测依据）；
+  同一时刻 `github.com:443` 在本机 **连接超时**（两次各 75 s 失败，而 04:20 取 AAR 时还是 13 MB/s），所以 `silero_vad.onnx` 那份没能远端复核，
+  只有本机上 04:20 之前那份（643,854 B、`9e2449e1…`，与官方 `digest` 一致）。**清单里 VAD 只有 GitHub 一个地址**，这是已知的单点，
+  备选源要等实测到「同一个 sha256」才能进清单——本轮探测的两个 hf-mirror 路径都返回 404，因此没有写入。
+- **2026-10-15 05:25 三次复核（设备侧）**：不带 `-L` 直接看 `tokens.txt` 的响应行是 **`HTTP/2 307` + 相对 `Location`**
+  （`/api/resolve-cache/models/.../<rev>/tokens.txt?...`）——不是 302，`HttpFetcher` 的判定写的是 `status in 300..399`，覆盖 307；
+  同一份 URL 在 emulator-5554 上由 App 自己的代码取回，字节数与 sha256 与本机一致（`ModelManagerNetworkTest`）。
+  同一时刻设备侧连 `github.com:443` 也是 **15 s connect 超时**（`SocketTimeoutException`，栈里是 `com.android.okhttp.internal.huc.HttpsURLConnectionImpl`），
+  所以「GitHub 单源」这个风险现在有了两条独立证据（宿主机 + 模拟器），而 `objects.githubusercontent.com` 与 `hf-mirror.com` 从设备 ICMP 可达。
 - GitHub 也有整包 `.../releases/download/asr-models/sherpa-onnx-paraformer-zh-2023-09-14.tar.bz2`（**234.05 MB**），但 release 资产 **digest 字段为 null → 无官方校验值**，且本机只有 45 KB/s，不推荐。
 - `OfflineParaformerModelConfig` 只有 `model` 一个字段（A3/源码），应用只需要 `model.int8.onnx` + `tokens.txt` 两个文件；int8 与 fp32 二选一，清单里默认 int8。
 
@@ -155,19 +165,37 @@ data class TokenTiming(val text: String, val startMs: Long, val endMs: Long)
 
 ## 7. 模型准备与校验（FR-510、需求「模型部署策略」）
 
-三种准备路径，都归一到 `ModelManager.verify()`：
+三种准备路径，最终都归一到 `ModelVerifier.verify(spec, modelsRoot, verifiedAtMs)`（存在 → 大小 → SHA-256 三步，全过才算就绪）：
 
-1. **在线下载**（默认）：按清单 URL 下到 `filesDir/models/<modelId>/`，边下边算 SHA-256，与清单值比对；无官方校验值的文件记录「首次成功下载后由本机钉住 sha256」，并写入 `models.lock.json`（含来源 URL、下载时间、大小）。清单来源可追溯性见 §3 表格。
-2. **本地导入**（完全离线的首次使用）：用户在设置页选一个模型包目录（SAF），`ModelManager` 校验必需文件存在 + 大小匹配 + sha256 与清单一致（或用户显式确认「清单未提供校验值」），再移入私有目录。
+1. **在线下载**（默认）→ **已实现（2026-10-15）**：`asr/ModelManager.kt`。
+   - 目录：`filesDir/models/<ModelSpec.id>/`（`ModelVerifier.dirOf`）。
+   - 流程：`ModelFetcher.fetch` 把字节写进 `<file>.part` → 比大小 → `ModelVerifier.sha256` 流式比对清单值 → 全对才 `renameTo(正式文件)`；
+     任何一步失败都删 `.part`，**不留一份「看起来存在」的坏模型**。断点续传只到**文件级**（已合格的文件跳过，半截文件下次从头重下），
+     不用 HTTP Range：清单的哈希是整份文件的，拿半截去比对没有意义。
+   - 多源：按 `ModelFileSpec.candidateUrls`（首选 + 备用）依次尝试，全失败才抛 `ModelDownloadException`，异常里带上每个地址各自的失败原因。
+   - 来源记录：每个取回成功的文件向模型目录里的 `download-provenance.properties` 追加 6 行
+     （`<file>.url` / `.bytes` / `.sha256` / `.checksum=official|pinned-by-first-download` / `.model_id` / `.fetched_at_ms`）。
+     无官方校验值的文件（当前只有 `tokens.txt`）记的就是 `pinned-by-first-download`，与 §3 表格一致。
+   - 进度：`HttpFetcher` 的 64 KB 分块回调按**单调时钟**限流 250 ms 才推一次 `ModelStatus.download`（尾包必推），
+     否则一次 243 MB 的下载要往 `StateFlow` 塞 ~3700 个值。
+   - 传输层是 `HttpURLConnection`（不引 OkHttp），自己跟 `Location`（相对地址按当前 URL 解析），
+     `instanceFollowRedirects=false` + 最多 5 跳，见 §3 里 hf-mirror 实测返回缓存 URL 那条。
+     **注意**：设备上的 `HttpURLConnection` 实现是 `com.android.okhttp.internal.huc.*`（Android Framework 自带的 OkHttp 移植），
+     与 host JDK 那份不是同一套代码，所以「JVM 单测绿」不构成「设备能下载」的证据——这条路径由 `androidTest/asr/ModelManagerNetworkTest.kt`
+     用真实 hf-mirror URL 验证（2026-10-15，4/4 通过，`docs/testing.md` §4）。前提条件是 `AndroidManifest` 里的 `INTERNET` 权限，
+     它当初被漏掉时**没有任何一条单测变红**，这是这类代码的固有风险。
+2. **本地导入**（完全离线的首次使用）→ **未实现**：设置页选一个模型包目录（SAF），跑同一个 `ModelVerifier`，再把文件移入私有目录。
+   校验逻辑已经复用得上（`ModelVerifier.checkFile` 就是给它准备的），缺的是 SAF 侧的搬运与 UI。
 3. **预置**：把模型放 APK assets —— **不做**（§2.2 体积结论：仅模型就 232 MiB，远超可接受范围）。
 
-删除模型：只删 `filesDir/models/`，字幕与历史保留；`AsrEngine.readiness` 变 `MODEL_MISSING`，转录入口禁用，播放不受影响（FR-508）。
+删除模型：`ModelManager.delete(spec)` 只删 `filesDir/models/<id>/` 里清单列出的文件、`.part` 与来源记录，再删目录本身；
+字幕与收听历史一律不碰（FR-508）。删除不成功的文件路径会写进 `ModelStatus.error`，不假装删干净了。
 
 ## 8. 降级与失败处理
 
 | 触发 | 行为 |
 | --- | --- |
-| `timestamps` 为空或与 tokens 数量不一致（A6 的硬条件） | 该段标记 `no_token_timing`；整本比例 > 20% 时任务仍 SUCCESS，但字幕以 VAD 段级时间戳为准（段起点 + 段时长均分**仅用于段内**，并在 `models.lock.json` 与文档里记录为降级），UI 顶部提示「字幕时间为段级估计」；否则不产出该句 |
+| `timestamps` 为空或与 tokens 数量不一致（A6 的硬条件） | 该段标记 `no_token_timing`；整本比例 > 20% 时任务仍 SUCCESS，但字幕以 VAD 段级时间戳为准（段起点 + 段时长均分**仅用于段内**，并在转录任务记录与本文里标明为降级），UI 顶部提示「字幕时间为段级估计」；否则不产出该句 |
 | 实际使用的模型不支持时间戳（用户误导入 zh-2024-03-09 等，A4） | `verify()` 阶段就比对清单 modelId 与文件哈希，不匹配直接拒绝并提示正确模型 |
 | 解码失败 / 不支持的编码 | job `FAILED(DECODE_FAILED)`，文案指向「该文件可能不是 MP3 或已损坏」；不改 `transcription_state` 以外的数据 |
 | 授权被撤销 | `FAILED(PERMISSION_REVOKED)`，任务列表给「重新授权」快捷入口 |
@@ -179,6 +207,8 @@ data class TokenTiming(val text: String, val startMs: Long, val endMs: Long)
 1. `curl` 取 AAR → 放 `app/libs/`（构建脚本在缺失时打印确切 URL 与大小，不静默失败）。
 2. `./gradlew :app:assembleDebug`（确认 arm64 so 打进包、`package-abi` 过滤生效）。
 3. 用 `ModelManager` 在设备上下载 paraformer int8 + silero VAD，校验 sha256 与 §3 一致（把实测值与清单值同时记录进 `docs/testing.md`）。
+   **部分完成（2026-10-15）**：设备上用真实 URL 取回并核对了 `tokens.txt`（75,756 B，sha 独立复算一致）；
+   243 MB 的 `model.int8.onnx` 与 GitHub 单源的 `silero_vad.onnx` 还没在设备上取回过（前者是磁盘与耗时顾虑，后者是 `github.com:443` 本机与设备都连不上）。
 4. 准备真实素材：一段 3–10 分钟中文书解 MP3（本机自行生成或用用户提供的样本），跑转录，人工抽查 10 处字幕时间对齐误差（记录 ±ms 分布）。
 5. 仪器化测试覆盖「分段偏移合并」「切句」「重转替换」「任务取消/重试」，JVM 单测覆盖纯逻辑。
 6. 真机（≥2GB RAM）实测峰值 RSS 与 RTF；未做则明确标注未完成。
@@ -186,8 +216,15 @@ data class TokenTiming(val text: String, val startMs: Long, val endMs: Long)
 ## 10. 当前状态（诚实标注）
 
 - **已确证/已落地**：AAR 取回并打进包（§2.1，`assembleDebug` 通过，APK 40.79 MB，只含 arm64 一份 sherpa `.so`）；
-  三个模型文件已在**本机**下载并逐一核对 sha256（§3，Paraformer int8 + tokens + silero VAD）。
+  三个模型文件已在**本机**下载并逐一核对 sha256（§3，Paraformer int8 + tokens + silero VAD，`tokens.txt` 于 2026-10-15 二次复核仍一致）；
+  模型管理这层已有代码：`asr/ModelCatalog.kt`（清单，数值由 `ModelCatalogTest` 钉住）、`asr/ModelVerifier.kt`（存在/大小/SHA-256 三步核对）、
+  `asr/ModelManager.kt` + `asr/ModelFetcher.kt`（下载 → `.part` → 校验 → 改名 → 记来源，含多源回退、文件级跳过、删除、按单调时钟限流的进度），
+  已挂进 `AppGraph`（`modelsRoot = filesDir/models`），35 条 JVM 单测覆盖（`docs/testing.md` §4）。
 - **尚未实现**：`asr/` 里还没有 `SherpaOnnxEngine`、`VadSegmenter`、`PcmDecoder`、`TranscriptCoordinator`，`work/` 是空的，
   `transcript_job` 表也还没建。**所以「ASR 端到端可用」仍然未完成**——本机那些模型文件目前只是躺在 `app/libs/models/`（gitignore 内），
   App 一次都没有加载过它们，一行真实转录都没产出过。
+- **模型管理这层的设备侧状态（2026-10-15 更新）**：`AndroidManifest` 现在有 `INTERNET` 权限（**之前漏了**，那 35 条单测全绿也发现不了），
+  `androidTest/asr/ModelManagerNetworkTest.kt` 用清单里真实的 hf-mirror URL 在 emulator-5554 上下过 `tokens.txt` 并独立复算 sha256（4/4 通过）。
+  仍然空白的三块：243 MB 的 int8 模型没从设备取回过；`silero_vad.onnx`（GitHub 单源）本机与设备**都**连不上、一次都没取回过；
+  设置页/转录页也还没有入口用它。**「点一下就能下模型」要到 Phase 6 第 6 项才算交付。**
 - Phase 5 用测试字幕验证的是七句窗口管线；测试字幕与 ASR 产物在数据上以 `source=MANUAL_TEST` / `ASR` 严格区分，不得互相冒充。

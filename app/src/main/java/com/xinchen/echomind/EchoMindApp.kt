@@ -3,6 +3,7 @@ package com.xinchen.echomind
 import android.app.Application
 import android.content.Intent
 import androidx.room.Room
+import com.xinchen.echomind.asr.ModelManager
 import com.xinchen.echomind.core.time.AndroidTimeSource
 import com.xinchen.echomind.core.time.TimeSource
 import com.xinchen.echomind.data.db.EchoMindDatabase
@@ -20,6 +21,7 @@ import com.xinchen.echomind.domain.playback.PlaybackController
 import com.xinchen.echomind.playback.EchoMindMediaService
 import com.xinchen.echomind.playback.Media3PlaybackController
 import com.xinchen.echomind.playback.PlayerHolder
+import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -38,6 +40,7 @@ class AppGraph(
     val playbackRepository: PlaybackRepository,
     val subtitleRepository: SubtitleRepository,
     val playbackController: PlaybackController,
+    val modelManager: ModelManager,
     val appScope: CoroutineScope,
     val playbackScope: CoroutineScope,
 )
@@ -70,6 +73,11 @@ class EchoMindApp : Application() {
             ),
             playbackRepository = playbackRepository,
             subtitleRepository = SubtitleRepositoryImpl(db, timeSource),
+            modelManager = ModelManager(
+                // 模型放内部 filesDir：不需要任何运行时权限，卸载即清干净，也不出现在别的 App 的读写范围里
+                modelsRoot = File(filesDir, "models"),
+                timeSource = timeSource,
+            ),
             playbackController = Media3PlaybackController(
                 player = PlayerHolder.get(this),
                 repository = playbackRepository,

@@ -10,6 +10,10 @@
     <!-- 转录长任务的前台通知（WorkManager setForeground） -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
+    <!-- 只用于「把模型取回本机」（asr/HttpFetcher → ModelManager）。
+         转录与播放本身不调任何在线 API：FR-501 的边界是「准备模型要联网，准备完飞行模式可用」。 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <!-- 音频通过 SAF 树授权读取，不需要 READ_EXTERNAL_STORAGE / READ_MEDIA_AUDIO -->
 
     <application
