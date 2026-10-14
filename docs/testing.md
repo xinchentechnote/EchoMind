@@ -24,7 +24,7 @@ source ~/android-dev/env.sh     # 否则 GRADLE_USER_HOME 退回 ~/.gradle，且
 | 模拟耳机拔出 | — | **做不到**：`ACTION_AUDIO_BECOMING_NOISY` 是受保护广播，`am broadcast` 打不进来；`adb emu help` 里没有耳机/音频路由命令。只能真机 |
 | 发布包 | `./gradlew :app:assembleRelease` | **本机 `--offline` 下必失败**（lint-gradle 未缓存），已用 `checkReleaseBuilds=false` 规避 |
 | 远端 CI | `gh run list` / `gh run view <id> --log-failed` | 仓库 `https://github.com/xinchentechnote/EchoMind`（私有），工作流 `.github/workflows/ci.yml`：push/PR 跑 `assembleDebug` + `testDebugUnitTest` 并上传 APK。**判定成败要读 `--json conclusion`**，`gh run watch` 接了管道就拿不到退出码 |
-| 仪器化测试（CI 覆盖不到） | 只能本地 `adb install -r` + `am instrument` | **CI 里没有模拟器**，那 48 项 Room/Repository 测试仍然只有本机会跑（决定与代价见 `docs/environment.md` §8） |
+| 仪器化测试（CI 覆盖不到） | 只能本地 `adb install -r` + `am instrument` | **CI 里没有模拟器**，那 52 项（48 项 Room/Repository + 4 项真实 URL 下载）仍然只有本机会跑（决定与代价见 `docs/environment.md` §8） |
 
 ### 2b. 设备自动化实测到的坑（Phase 3 / 5）
 
@@ -349,6 +349,37 @@ FR-707（只在当前句变化时更新）用**设备 + 单测两头**取证：�
 - `HttpFetcher` 不做 HTTP Range 续传：断线后同一个文件从头重下，这是取舍不是遗漏（见 `docs/architecture.md` D24）。
 - 设备用例依赖外网可达，本机与 CI 都**没有**把它们放进门禁（CI 只跑 `assembleDebug` + `testDebugUnitTest`）。所以它们是本机一次性凭据，不是每次提交都守得住的回归网。
 
+## Phase 6 第 3 项（前半）：PCM 转换 / 抗混叠重采样 / ≤20s 分块（2026-10-15 05:40 ~ 06:05）
+
+`domain/asr/PcmConversion.kt`、`domain/asr/SincResampler.kt`、`domain/asr/AsrChunkPlanner.kt` + `domain/model/AsrModels.kt`，
+共 36 条 JVM 单测（`SincResamplerTest` 11、`PcmConversionTest` 11、`AsrChunkPlannerTest` 14）。**全部是纯 Kotlin**：
+`grep` 确认 `domain/` 下没有任何 `android.*` / `androidx.*` / Media3 / Room 的 import（AGENTS.md §3 的前提）。
+
+| 动作 | 结果 | 凭据 |
+| --- | --- | --- |
+| 为什么不用现成的重采样 | 实测 `media3-common-1.11.1.aar` 的 `classes.jar` 里**类路径含 `resampl` 的条目 0 条**（`AudioResamplingAudioProcessor` 已不在该产物中），`media3-decoder-1.11.1.aar` 只有 `Buffer/Decoder/SimpleDecoder` 一族、**没有 `MediaDecoder`** → 只能用框架 `MediaExtractor`+`MediaCodec` 解码、采样率自己搬 | `unzip -l classes.jar \| grep -ci resampl` = 0；`androidx/media3/decoder/*` 类名清单 |
+| 首轮运行 | **34 tests / 3 failed**（看 `app/build/test-results/**/*.xml`，不看绿字） | 同上 |
+| 失败 1（**真问题，改的是生产代码**） | `同采样率必须是恒等变换`：原来 `isFinal` 那块允许「中心已越过数据末尾」的输出靠零填充算出来，于是 44100→16000 产出 16001~16016 个、同采样率下长度与数值都不再不变。产出判据改成**只有「中心样本还在数据里」**（非 final 还要求整个抽头窗在数据里），恒等与精确长度同时恢复 | `SincResampler.resample` / `outputsProducible` |
+| 失败 2、3（**测试写错，不是代码错**） | ① `assertEquals(span.sampleCount, plans.sumOf { … })` 里 Int 与 Long 装箱后走 `(Object,Object)` 重载，永远不等 → 显式 `.toLong()`；② 把 `msOf(44_100L, 44_100)` 期望成 `1L`，而 `msOf` 是「样本→毫秒」，正确值是 `1_000L` → 改断言 | 两条测试改动 |
+| 二轮运行 | **34 tests / 1 failed**：恒等用例在输入**恰好为 `0.0f`** 的两个样本上失败，逐元素差 `2.9e-33`（系数在整数栅格上只剩中心抽头 1.0，旁瓣是 `sin(π·整数)` 的浮点残差）→ 不是滤波错，是 `contentEquals` 对零没有相对容差。改成「最大逐元素差 < 1e-5」并把实测值写进断言消息 | 用 Python 复刻同一套 float32 运算定位到只有 i=208/419 两个样本不一致，再改断言 |
+| 频响实测（不是估算） | 临时探针单测（1 秒单频正弦、掐头去尾各 64 样本做相干 DFT，跑完即删）：48k→16k 在 1/3.5/5 kHz = 0.0/0.0/−0.09 dB，6.5 kHz −1.33，7 kHz −2.38，7.9 kHz −5.56；**会折进输出 4 kHz 的 12 kHz 压到 −69.3 dB**，20 kHz −91.0 dB；44.1k→16k 同形（5 kHz −0.05、7 kHz −2.16、12 kHz −77.9）。据此把测试阈值从「> 40dB」提到「> 60dB」 | 探针 `system-out`（XML 报告），已删的 `SincMeasurementProbeTest.kt` |
+| 为什么先前写成 −40 dB | 我最初用一份 Python 复刻算出 −40.4 dB 并打算照抄进文档；**混叠 bin 取错**（拿 12 kHz 当输出 bin，而它折到 4 kHz）加上探针窗宽不同，两次复刻给出 −40/−54/−69 三个值。最后是在真代码上跑出来的 −69.3 才写进 KDoc。教训：复刻脚本的数不能当凭据 | 本表上两行 |
+| 边缘效应（如实记录） | 常数 0.25 输入：中段逐样本 == 0.25（单测断言 <1e-4），**首样本 0.170、末样本 0.267** —— 头尾各 `T=16` 个输出（≈±1ms）的抽头窗伸出数据边界要补零，有限窗 FIR 的固有现象，不是 bug。`docs/asr-design.md` §5 用它解释「VAD 段边界有 ±1ms 量级的不确定」 | 同一探针输出 |
+| 输出长度的可预测式 | 实测 `out.size == ceil(N × outRate / inRate)` 对 N = 1/2/33/100/4410/44100/97600 全部成立（先前猜的 `floor(N·out/in)+1` 在整除时多给 1 个，已弃用），钉成单测。`PcmDecoder` 要靠它做「样本数 ÷ 采样率 == 时长」对账 | `SincResamplerTest.输出样本数正好等于…` |
+| 分块 == 一次性 | 377 样本一片喂入与整段一次喂入**逐元素相同**（`reset()` 用例同样比对新建实例） | `SincResamplerTest` |
+| 转换的声道混合 | 双声道按**均值**下混：等幅反相 → ≈0；同相 → 原值；单侧非零 → 幅度减半（不是取左声道）。16-bit 小端字节序、`-32768 → -1.0f` 缩放、尾字节如实报出、3 声道均值，共 11 条用例 | `PcmConversionTest` |
+| 分块规划 | 单块 ≤ `AudioFormats.ASR_MAX_SEGMENT_MS`(20s)、第 N 块起点用**全局样本下标**换算（180 块连续 20s 段实测 `endMs == 3_600_000`，即 60 分钟零漂移）；均分使各块长度最多差 1 样本；空段/负起点段跳过；`maxChunkMs = 0` 直接 `require` 拒绝 | `AsrChunkPlannerTest` 14 条 |
+| 本机最终构建 | `assembleDebug` **BUILD SUCCESSFUL**，APK 40,854,051 → **40,873,192 B**；`testDebugUnitTest --rerun` **154 tests / 0 failures / 0 skipped**（118 → 154，本轮 +36） | `ls -l` + 测试 XML |
+
+**这一轮没做 / 做不了**：
+
+- **一个真实字节都没解过**。这三个类是纯数学，输入全靠合成信号与手搓字节；`PcmDecoder`（`MediaExtractor` + `MediaCodec`）还没写，
+  所以「MP3 → 这些函数的输入」那一步完全空白，重采样器也从没吃过真书解音频。下一项就是它，并要在 `emulator-5554` 上实测样本数与时长对账。
+- **没有仪器化测试**：这三个类不 import Android 类型，按 AGENTS.md §6「纯逻辑走 JVM 单测」处理；但它们的上游（解码）与下游（VAD/识别）都要设备验证。
+- **设备上的耗时没测**：宿主机 JVM 上 1,000,000 样本 44.1k→16k 是 6 ms（JIT 热身后），arm64 真机要慢多少未知，等 Phase 6 端到端一起量。
+- 通带 7 kHz 处 −2.2 dB 的跌落是 33 抽头的物理限制，本轮**不**打算用更长的滤波器去修（理由见 `docs/architecture.md` D26）。
+- `SpeechSpan` 目前没有生产者：VAD 段落 → `SpeechSpan` 的转换属 `VadSegmenter`（下一项），而且 `SpeechSegment.start` 的单位（样本还是毫秒）**仍未在设备上验证**。
+
 ## 5. 待补的自动化测试清单（按阶段）
 
 | Phase | 用例 |
@@ -356,7 +387,7 @@ FR-707（只在当前句变化时更新）用**设备 + 单测两头**取证：�
 | 3 | **已覆盖**：递归 3 层子目录 + 扩展名白名单 + 深度/数量截断；连续扫描不产生新记录；同一 URI 重复出现只算一次；size/mtime 变化 → CHANGED 且字幕标 EXPIRED、手改标题不被覆盖；文件消失 → MISSING 且不删记录；文件原样回来 → MISSING 翻回 PRESENT；跨文件夹重复文件留在原文件夹；授权无法持久化 → 导入失败不写库；重扫跳过授权失效文件夹但继续其他文件夹；时长读取失败 → `duration_read_failed`；书架 tab/搜索状态与查询同源。**待补（依赖 Phase 4 的会话表）**：消失文件的收听历史仍然保留 |
 | 4 | **已覆盖**：4.9s 不计次 / 5.0s 计次；缓冲+暂停+焦点丢失不计时；2x 播 10min → `listened_ms=600000`、`consumed_audio_ms=1200000`；拖到末尾不完播；1.5x 听完 → 完播；两次听完 → 完播 2；崩溃恢复不重复累计（含幂等与「不结算之后的新会话」）；重算与增量一致；重算能修正被写坏的缓存；切歌结束旧会话；删书保留 `listening_session`；统计只算已结算行；倍速只落自己那一列；时长未知不覆盖已知时长。**待补（最大的一块）**：`Media3PlaybackController` 零测试——需要 Media3 `SimpleBasePlayer` 当 `Player` 替身才测得动，而「自动切歌不换倍速」这个真 bug 正是因为没有这层测试才只能在设备上撞见。另待补：消失文件的收听历史仍然保留 |
 | 5 | **已覆盖**：首句/中间/末句窗口与不补位；空字幕表与「位置还在首句之前」（`currentIndex=-1`）；gap 内不跳动、越过 `start-250ms` 才切；seek 后窗口更新；5000 句二分正确性；换曲后重挂字幕流；导入解析（SRT/VTT/TSV、缺小时格式、一位小数毫秒、乱序重排、`end ≤ start` 整份拒绝、空文件失败）；单事务整本替换；删书连带删字幕且历史留着。**待补**：真实 ASR 产出的时间重叠/倒退（要 Phase 6 的模型输出）、长句换行的高亮目视（fixture 每句都短）|
-| 6 | 分段绝对偏移（第 N 段不从 0 开始）；无标点长文本切句；异常时间戳清洗；取消/重试状态机；重转替换的原子性；`FakeAsrEngine` 端到端入库 |
+| 6 | **已覆盖（2026-10-15，纯逻辑层）**：分段绝对偏移（第 N 段不从 0 开始、180 段零漂移、块间不重叠不留缝）；>20s 段均分且各块长度最多差 1 样本；空段/负起点段跳过；`msOf`/`samplesOf` 换算与取整；16-bit LE 字节序与 ±1 缩放；多声道均值下混（反相 → ≈0、单侧 → 减半）与尾字节如实报出；重采样恒等性/常数增益/通带与阻带频响/分块==一次性/`reset()`/输出长度 `ceil(N·out/in)`。**待补**：真 MP3 解码出的样本数与时长对账（`PcmDecoder`，下一项，需设备）、无标点长文本切句、异常时间戳清洗、取消/重试状态机、重转替换的原子性、`FakeAsrEngine` 端到端入库 |
 | 迁移 | **已覆盖 MIGRATION_1_2**：`MigrationTestHelper` 对导出 `2.json` 校验（`recreateTableOnMigrationError=false`）、已有书籍与收听历史保留、FK 与索引存在。规则不变：每条新 Migration 都要有对应测试，`fallbackToDestructiveMigration` 保持不出现 |
 
 ## 6. 只能人工/真机验证的项（尚未执行，勿声称完成）

@@ -102,7 +102,13 @@ CI **不覆盖**：仪器化测试（没有模拟器）、真机验证、ASR 端
    挂进 `AppGraph`（`modelsRoot = filesDir/models`），35 条 JVM 单测 + 4 条仪器化用例（`ModelManagerNetworkTest` 用清单里真实的 hf-mirror URL 取回 `tokens.txt` 并独立复算 sha256）；
    清单三个文件的字节数与 SHA-256 全部实测过、`tokens.txt` 标了「无官方校验值 + 本机钉住」；顺带补上被漏掉的 `INTERNET` 权限（漏它时 35 条单测一条都不红）。
    **仍缺三块**：① 本地导入（SAF 选目录）未实现；② 243 MB 的 int8 与 GitHub 单源的 VAD 都没从设备取回过（`github.com:443` 本机与模拟器同时超时，实测记录见 `docs/testing.md` §4）；③ 没有任何 UI 消费 `ModelManager.statuses`，所以「点一下就能下模型」还没交付 —— 归本清单第 6 项。
-3. `PcmDecoder`（Media3 `MediaDecoder`/`ExoPlayer` 抽 PCM）→ `VadSegmenter` → `SherpaOnnxEngine`（单段 ≤20s、不在主线程、`release()` 成对）。
+3. ~~PCM → VAD → 引擎~~ → **PARTIAL（2026-10-15，前半的纯逻辑已落地）**：`domain/asr/PcmConversion`（16-bit LE → 单声道 float，均值下混）、
+   `domain/asr/SincResampler`（源采样率 → 16k 抗混叠 FIR；**必须自己写**——实测 Media3 1.11.1 里没有 `AudioResamplingAudioProcessor`，
+   `media3-decoder` 里也没有 `MediaDecoder`，所以本条原计划的「Media3 `MediaDecoder`/`ExoPlayer` 抽 PCM」这条路**不成立**，改用框架 `MediaExtractor` + `MediaCodec`）、
+   `domain/asr/AsrChunkPlanner` + `domain/model/AsrModels`（>20s 均分成 ≤20s 块、绝对毫秒偏移，FR-505 零漂移单测）——共 36 条 JVM 单测，APK 40,873,192 B。
+   **还缺**：`asr/PcmDecoder`（下一个任务，要在 `emulator-5554` 上拿真 MP3 对账样本数与时长）、`VadSegmenter`、`SherpaOnnxEngine`（单段 ≤20s、不在主线程、`release()` 成对）。
+   ⚠ 两个必须实测、不许猜的单位问题仍是空白：模型 `timestamps` 的单位（秒还是毫秒）、`SpeechSegment.start` 的单位（样本还是毫秒）——
+   现在这些类没有调用方，所以两处都还没被真数据检验过（36 条单测只覆盖纯逻辑，1 个真实字节都没解过）。
 4. `transcript_job` 表（v2→v3，顺带给 `subtitle_segment.job_id` 补 FK）+ `TranscriptCoordinator` + WorkManager 任务与重启恢复。
 5. FR-602/603 的切句与时间戳清洗（这次才是真需要 `SentenceSplitter` 的地方）。
 6. 转录页（现在是 placeholder）+ 失败降级文案。

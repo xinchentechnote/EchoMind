@@ -36,7 +36,10 @@ app/src/main/java/com/xinchen/echomind/
 │   ├── subtitle/SubtitleSynchronizer.kt // ✅ 当前句二分查找 + 七句窗口 + gap 迟滞
 │   ├── subtitle/TestSubtitleParser.kt   // ✅ SRT/VTT/TSV → 带时间的句（只服务调试导入通道）
 │   ├── text/SentenceSplitter.kt     // — Phase 6（切句对象是模型输出的整段文本）
-│   └── asr/PcmChunkPlanner.kt       // 分段与时间偏移计算 — Phase 6
+│   ├── asr/PcmConversion.kt         // ✅ 16-bit LE 字节 → 单声道 float（均值下混），纯 Kotlin
+│   ├── asr/SincResampler.kt         // ✅ 源采样率 → 16k 的抗混叠流式重采样（窗口 sinc，33 抽头）
+│   ├── asr/AsrChunkPlanner.kt       // ✅ >20s 语音段均分成 ≤20s 块 + 绝对毫秒偏移（FR-505）
+│   └── model/AsrModels.kt           // ✅ SpeechSpan / PcmChunkPlan（不暴露任何 native 类型）
 ├── data/
 │   ├── db/                        // ✅ Entity / DAO / EchoMindDatabase / Migrations
 │   │   └──（v2 实到 5 表：imported_folder、audio_book、playback_state、listening_session、subtitle_segment）
@@ -129,11 +132,15 @@ interface PlaybackRepository {                        // 播放记忆 + 统计�
     suspend fun recomputeAggregates()                 // FR-410/905
 }
 
+// ⚠ 下面是**设计稿，代码里还没有**（2026-10-15 `grep -r "interface AsrEngine"` 无结果）。签名与 `docs/asr-design.md` §4 统一为 float 输入：
+//   音频在进引擎前已由 PcmConversion + SincResampler 变成 16 kHz 单声道 float，`ShortArray` 那版是早期草稿，会白丢 8 dB 精度。
 interface AsrEngine {                                  // 推理侧唯一抽象
-    val readiness: EngineReadiness                     // READY / MODEL_MISSING / BROKEN / OOM
-    fun prepare(): EngineHandle
-    fun EngineHandle.transcribeChunk(pcm: ShortArray, startOffsetMs: Long): List<TokenTiming>
-    fun release(handle: EngineHandle)
+    val readiness: EngineReadiness                     // READY / MODEL_MISSING / MODEL_CORRUPT / UNSUPPORTED_ABI / OUT_OF_MEMORY
+    fun load(): EngineSession
+    interface EngineSession {
+        fun segmentsOf(pcm: FloatArray, startOffsetMs: Long, sampleRate: Int): List<RecognizedSegment>
+        fun release()
+    }
 }
 
 class ModelManager(modelsRoot: File, timeSource: TimeSource, specs: List<ModelSpec>, fetcher: ModelFetcher, ioDispatcher: CoroutineDispatcher) {
@@ -198,7 +205,7 @@ TranscriptRepository.enqueue ─► WorkManager(前台类型 mediaPlayback? 见�
   ─► TranscriptCoordinator:
        PcmDecoder(MediaExtractor+MediaCodec, 流式) ─► PcmResampler(16k mono)
        ─► PcmChunkPlanner(定长块 + 重叠窗口, 记录绝对起点)
-       ─► AsrEngine.transcribeChunk ─► tokens(+时间) 
+       ─► AsrEngine.segmentsOf ─► tokens(+时间) 
        ─► SentenceSplitter(标点切句 + 时间清洗) 
        ─► Room 事务：删旧字幕 + 插新字幕 + job=SUCCESS + audio.transcriptionState=READY
   ─► 进度每块更新一次（内存节流 ≥1s 写库）
@@ -238,7 +245,8 @@ controller.state.map { it.positionMs }        // 500ms tick，即 PlaybackPolicy
 - 可测试性设计：`TimeSource`、`PlaybackPolicy`、`SessionTracker`、`SubtitleSynchronizer`、`TestSubtitleParser` 全是纯 Kotlin，无 Android import，可在 JVM 里跑。
   `asr/ModelCatalog`、`ModelVerifier`、`ModelFetcher`、`ModelManager` 同理（只用 `java.io.File` / `java.net` / `MessageDigest`），35 条 JVM 单测就是这么来的；
   它们的**接缝在依赖上**（注入假 `ModelFetcher` + `FakeTimeSource` + `TemporaryFolder`），不是靠给 `ModelManager` 套接口。
-  `SentenceSplitter`、`PcmChunkPlanner` 是 Phase 6 计划的同类接缝，**目前代码里还没有**。
+  `domain/asr/PcmConversion`、`SincResampler`、`AsrChunkPlanner` 也是同一类接缝（合成信号 + 手搓字节，36 条 JVM 单测），它们**不需要设备**：
+  没有 Android 类型，靠单频探针就能验出「滤波器有没有在工作」。`text/SentenceSplitter` **目前代码里还没有**（Phase 6 第 5 项）。
 
 ## 8. 错误处理与降级
 
@@ -291,3 +299,5 @@ controller.state.map { it.positionMs }        // 500ms tick，即 PlaybackPolicy
 | D23 | 38.7 MB 的 sherpa-onnx AAR 不进仓库，改由 **CI 按钉住的 SHA-256 从官方 release 取回**（配 `actions/cache`），本机缺失时 `app/build.gradle.kts` 在配置阶段抛异常打印 URL/大小/哈希 | 二进制入库会让每次 clone 都背 38 MB 且无法复核来源；静默自动下载又违背「不许偷偷拉几百 MB」（AGENTS.md §5）。让 CI 显式下载 + `sha256sum -c`，构建机与本机用同一份钉住值，取不到就红。代价：CI 依赖 GitHub release 的可用性（实测 runner 直连 13 MB/s，比本机还快），且 `app/build.gradle.kts` 多了一段人类可读的报错 |
 | D24 | 模型取回用 `HttpURLConnection`（`HttpFetcher`）而不是再引一个 HTTP 库；**先写 `<file>.part` → 比大小 → 算整份 SHA-256 → 才 `renameTo` 正式文件**，失败删 `.part`；续传只做**文件级**（已合格的文件跳过，半截的重下） | 项目里已有 Media3 与 WorkManager，为「下一个 243 MB 的文件」再引 OkHttp 不划算，`HttpURLConnection` 够用但要自己跟 `Location`（实测 hf-mirror 会重定向到 `/api/resolve-cache/…`，GitHub 更是 302 到对象存储）。「改名前必须整份校验」是为了让磁盘上永远不存在「名字对但内容坏」的模型——那种文件下一步就是被 `AsrEngine` 加载。不做 HTTP Range 续传的取舍：清单里每个文件的哈希是**整份**的，半截文件既不能部分校验也不能假装可用，加 Range 只会把「重下」这条唯一的正确路径变复杂；代价是弱网下 243 MB 要重来（`docs/asr-design.md` §7）。进度按**单调时钟**限流 250 ms 推一次，因为 `StateFlow` 是合并式的，回调密度再高 UI 也只能看到最后一个值 |
 | D25 | 下载这条路径**必须**留一条打真实 URL 的仪器化用例，哪怕它不在 CI 门禁里、且会因上游不可达变红 | 实测理由：`AndroidManifest` 漏了 `INTERNET` 权限时，**35 条 JVM 单测一条都不红**——假 fetcher 与 host 上的临时 `HttpServer` 都不过 Android 的权限检查；而且设备栈帧里是 `com.android.okhttp.internal.huc.HttpsURLConnectionImpl`，Android 的 `HttpURLConnection` 底层是 Framework 自带的 OkHttp 移植，与 host JDK 那份不是同一套实现（TLS、重定向、HTTP 版本行为都可能不同）。代价：这条用例依赖外网可达，CI 没有模拟器 → 它是**本机一次性凭据**而不是持续回归网；所以 GitHub 连不上时选择**移除**那条用例并如实记录（`silero_vad.onnx` 至今没从设备取回过），而不是留一条红色的假警报 |
+| D26 | 采样率转换**自己写**（`domain/asr/SincResampler`：窗口 sinc / Blackman、每侧 16 抽头、按 `j*L/M` 的整数相位查系数表、每相位归一到直流增益 1），而不是线性插值、也不是引第三方重采样库 | 三个选项都实测过：① Media3 1.11.1 **没有**现成实现——`media3-common-1.11.1.aar` 的 `classes.jar` 里类路径含 `resampl` 的条目 **0 条**（`AudioResamplingAudioProcessor` 已不在该产物中），`media3-decoder-1.11.1.aar` 只剩 `Buffer/Decoder/SimpleDecoder` 一族（没有 `MediaDecoder`）；② 线性插值等于**不做低通**，44.1/48 kHz 书解里 8 kHz 以上的成分会整块折进 0–8 kHz，模型吃的是它没见过的噪声，而字幕上只会表现为「偶尔识别得差」，几乎无法归因；③ 引 libsamplerate/SoX 之类违背 AGENTS.md §3「不引未实测的大框架」，而这件事只需要一个有理数比的 FIR。实测（1 秒单频正弦 + 相干 DFT）：1/3.5/5 kHz 平坦（≤ −0.09 dB），7 kHz −2.2 ~ −2.4 dB，会折进输出 4 kHz 的 12 kHz 压到 **−69 ~ −78 dB**，20 kHz −91 dB；代价是 33 抽头在通带末端那 2 dB 跌落（要抹平得翻倍抽头，转录时间换边际收益，不做）与头尾各 ~1 ms 的边缘样本不准（常数 0.25 输入实测首样本 0.170、末样本 0.267）。另两条设计约束来自踩坑：产出判据只认「中心样本还在数据里」（否则同采样率下的恒等性质被末尾几个零填充样本破坏），以及系数表按**约分后的有理数**建（44.1k→16k 只有 160 个相位，不是每样本重算一次） |
+| D27 | 分块与绝对时间偏移放在 `domain/asr/AsrChunkPlanner`（纯 Kotlin），`PcmChunkPlan` 带 `startSample/startMs/endMs`，**不在编排层用「累计时长」推时间** | FR-505 要求第 N 段的句时间戳落在绝对位置上。用「上一段末尾 + 本段时长」推 offsets 会把每段几毫秒的取整误差一路累加，180 段（1 小时）就是几百毫秒的漂移；改成一律 `startSample * 1000 / 16000`，单测用 180 段连续音频断言 `endMs == 3_600_000`（零漂移）钉住。>20s 的段**均分**成 `ceil(N/max)` 块（不是切满 20s 留一个尾巴块），避免最后剩个几百毫秒的小块——那既是一整次推理的固定开销，也最容易出空结果 |

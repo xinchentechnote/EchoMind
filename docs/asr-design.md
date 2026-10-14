@@ -100,17 +100,29 @@
 ## 4. 组件划分（对应 `architecture.md` 的 `asr/` 包）
 
 ```
-AsrEngine (interface)                     ← 唯一的推理抽象
-├── SherpaOnnxEngine                      ← 真实实现，持有 OfflineRecognizer + Vad
-└── FakeAsrEngine (test)                  ← 固定文本 + 可预测时间戳，用于端到端流程测试
-ModelManager                              ← 清单/下载/导入/SHA-256 校验/删除/状态 Flow
-PcmDecoder                                ← MediaExtractor + MediaCodec（同步模式）流式解码
-VadSegmenter                              ← silero VAD：float 块 → [startSample, endSample]
-TranscriptCoordinator                     ← 编排：解码→VAD→逐段识别→偏移合并→切句→入库
-AsrChunkPlanner (domain, 纯 Kotlin)        ← 绝对时间偏移计算，单测覆盖
+AsrEngine (interface)                     ← 唯一的推理抽象                代码里还没有
+├── SherpaOnnxEngine                      ← 真实实现，持有 OfflineRecognizer + Vad   代码里还没有
+└── FakeAsrEngine (test)                  ← 固定文本 + 可预测时间戳，用于端到端流程测试  代码里还没有
+ModelManager                              ← 清单/下载/导入/SHA-256 校验/删除/状态 Flow   ✅ DONE（设备真 URL 验证过，见 §7）
+PcmDecoder                                ← MediaExtractor + MediaCodec（同步模式）流式解码   TODO（Phase 6 第 3 项前半）
+domain/asr/PcmConversion                  ← 16-bit LE PCM 字节 → 单声道 float（均值下混）  ✅ DONE + 11 条 JVM 单测
+domain/asr/SincResampler                  ← 源采样率 → 16 kHz 的抗混叠流式重采样            ✅ DONE + 9 条 JVM 单测
+VadSegmenter                              ← silero VAD：float 块 → [startSample, endSample]  TODO
+domain/asr/AsrChunkPlanner                ← 绝对时间偏移计算 + ≤20s 分块，纯 Kotlin          ✅ DONE + 14 条 JVM 单测
+domain/model/AsrModels                    ← SpeechSpan / PcmChunkPlan（不带任何 native 类型）✅ DONE
+TranscriptCoordinator                     ← 编排：解码→VAD→逐块识别→偏移合并→切句→入库      TODO
 ```
 
-`AsrEngine` 契约（有意保持窄）：
+**为什么重采样要自己写**（不是偷懒，是实测没有现成的）：`AudioFormats.ASR_SAMPLE_RATE = 16_000`，而书解 MP3 常见是
+44.1 / 48 kHz，silero VAD 只吃 16k（§1-A8）。Media3 1.11.1 里翻不到任何重采样实现——实测
+`media3-common-1.11.1.aar` 的 `classes.jar` 里含 `resampl` 的类路径**0 条**（`AudioResamplingAudioProcessor` 已不在该产物中），
+`media3-decoder-1.11.1.aar` 只有 `Buffer/Decoder/SimpleDecoder` 一族、**没有** `MediaDecoder`。
+所以解码只能用框架 `MediaExtractor` + `MediaCodec`，采样率转换只能用 `domain/asr/SincResampler`（窗口 sinc / Blackman，33 抽头，
+按 `j*L/M` 的整数相位查系数表，每相位归一到直流增益 1）。这里刻意**不做线性插值**：线性插值等于没有低通，
+源里 8 kHz 以上的成分会折叠进 0–8 kHz，给模型喂一层它训练时没见过的噪声——`SincResamplerTest` 用两个单频探针
+（1 kHz 通过、12 kHz 衰减 > 40 dB）把这件事钉在 JVM 里。
+
+`AsrEngine` 契约（有意保持窄；**下面是设计稿，代码里还没有这个接口**，2026-10-15 实测 `grep -r "interface AsrEngine"` 无结果）：
 
 ```kotlin
 interface AsrEngine {
@@ -135,14 +147,20 @@ data class TokenTiming(val text: String, val startMs: Long, val endMs: Long)
 
 ```
 1. 打开 SAF InputStream（只读，不复制文件）
-2. MediaExtractor 选出 mp3 track → MediaCodec 解码为 16-bit PCM（保持源采样率）
-3. 转为 FloatArray [-1,1]，按 VAD 窗口 512 样本喂 VadModel.acceptWaveform（多声道先取均值转单声道）
+2. PcmDecoder（TODO）：MediaExtractor 选出 mp3 track → MediaCodec 同步模式解出 16-bit LE PCM（保持源采样率）
+3. 转为 FloatArray [-1,1]（domain/asr/PcmConversion，DONE），按 VAD 窗口 512 样本喂 VadModel.acceptWaveform（多声道先取均值转单声道）
    ─ 每次只持有 ≤ 1s 的窗口缓冲，峰值内存受控（NFR-05/07）
-4. VAD 产出语音段：minSilenceDuration=0.5s、maxSpeechDuration=20s（A5 的硬约束）
+   ─ 源采样率 ≠ 16k 时先过 domain/asr/SincResampler（DONE）：窗口 sinc（Blackman，33 抽头）低通 + 整数相位取值，
+     **不是线性插值**（线性插值等于没有低通，源里 >8kHz 的成分会折进可听带，给模型喂它没训练过的噪声）。
+     为什么必须自己写：实测 media3-common 1.11.1 的 classes.jar 里含 `resampl` 的类 **0 条**、
+     media3-decoder 1.11.1 只有 `Buffer/Decoder/SimpleDecoder` 一族（没有 `MediaDecoder`），
+     系统侧也没有「解码时顺带改采样率」的可靠开关——见 `docs/architecture.md` D26
+4. VAD 产出语音段：minSilence=0.25s、minSpeech=0.15s、maxSpeech=20s（取 sherpa-onnx Python `vad_utils.py` 的默认值，理由与单位见 §3 末）
    段起点是样本下标 → startMs = startSample * 1000 / sampleRate（不做估计）
-5. 每段：createStream → acceptWaveform(该段 float) → decode → getResult
-   → result.timestamps 逐字秒 + 段 startMs = 绝对时间（FR-505）
-   ⚠ 时间戳为空的段落记录 tokenCountMismatch，按 §8 降级处理
+   ─ 该换算的唯一实现是 `AsrChunkPlanner.msOf`（DONE），识别前还要用它把 >20s 的段均分成 ≤20s 的块
+5. 每块：createStream → acceptWaveform(该块 float) → decode → getResult
+   → result.timestamps 逐字秒 + 块 startMs = 绝对时间（FR-505）
+   ⚠ 时间戳为空的块记录 tokenCountMismatch，按 §8 降级处理
 6. 段结果 → SentenceSplitter（§6）→ List<SubtitleSegment>
 7. 全部段完成后单事务：DELETE 旧字幕 + INSERT 新字幕 + job=SUCCESS + book.transcription_state=READY
 8. 进度：done_segments/total_segments，≥1s 节流写库（不逐段 fsync）
@@ -223,6 +241,11 @@ data class TokenTiming(val text: String, val startMs: Long, val endMs: Long)
 - **尚未实现**：`asr/` 里还没有 `SherpaOnnxEngine`、`VadSegmenter`、`PcmDecoder`、`TranscriptCoordinator`，`work/` 是空的，
   `transcript_job` 表也还没建。**所以「ASR 端到端可用」仍然未完成**——本机那些模型文件目前只是躺在 `app/libs/models/`（gitignore 内），
   App 一次都没有加载过它们，一行真实转录都没产出过。
+- **音频数学层（2026-10-15 新增，Phase 6 第 3 项前半）**：`domain/asr/PcmConversion`（16-bit LE → 单声道 float，多声道取均值）、
+  `domain/asr/SincResampler`（窗口 sinc / Blackman、每侧 16 抽头、整数相位系数表、每相位归一直流增益；实测 12 kHz 折进输出 4 kHz 的成分压到 −69 dB，
+  见 `docs/architecture.md` D26）、`domain/asr/AsrChunkPlanner` + `domain/model/AsrModels`（>20s 均分、绝对毫秒偏移，见 D27）。
+  36 条 JVM 单测，`grep` 确认 `domain/` 无 Android/Media3/Room import。**这些类目前没有任何调用方**：
+  上游的 `PcmDecoder` 还没写，所以**一个真实 MP3 字节都没进过这些函数**，频响与长度性质都只在合成信号上证过。
 - **模型管理这层的设备侧状态（2026-10-15 更新）**：`AndroidManifest` 现在有 `INTERNET` 权限（**之前漏了**，那 35 条单测全绿也发现不了），
   `androidTest/asr/ModelManagerNetworkTest.kt` 用清单里真实的 hf-mirror URL 在 emulator-5554 上下过 `tokens.txt` 并独立复算 sha256（4/4 通过）。
   仍然空白的三块：243 MB 的 int8 模型没从设备取回过；`silero_vad.onnx`（GitHub 单源）本机与设备**都**连不上、一次都没取回过；
