@@ -9,7 +9,7 @@ Android 原生（Kotlin + Jetpack Compose + Media3 + Room）听书应用。导�
 | 能力 | 状态 |
 | --- | --- |
 | 工程骨架 / Compose 导航 / 构建产物 | **DONE**：`assembleDebug` 通过，已在 API 36 arm64 设备实测启动 |
-| CI | **PARTIAL**：GitHub Actions 每次 push/PR 跑 `assembleDebug` + 83 项 JVM 单测并上传 APK；**仪器化测试不在 CI 里**（需模拟器，原因见 `docs/testing.md` §2） |
+| CI | **PARTIAL**：GitHub Actions（私有库 `xinchentechnote/EchoMind`）每次 push/PR 跑 `assembleDebug` + 83 项 JVM 单测并上传 APK，已跑绿（run 38632644725，`BUILD SUCCESSFUL in 5m36s`）；**仪器化测试不在 CI 里**（没有模拟器，原因与代价见 `docs/environment.md` §8） |
 | 文件夹导入、书架 | **PARTIAL**：SAF 授权持久化、递归扫描、去重/变更/消失/复活、时长提取、标题可改、搜索、收藏、继续上次收听卡片，均已在模拟器用真实 mp3 实测。**缺**：文件夹管理/重新授权页、扫描取消与进度、行内改名 → 见 `docs/roadmap.md`「Phase 3 遗留」 |
 | 播放、后台播放、播放记忆与统计 | **PARTIAL**：Media3 ExoPlayer + `MediaSessionService` 后台播放、±15s、每首独立倍速、上一首/下一首、焦点处理；按记忆位置起播、有效次数（≥5s）、累计收听时长（倍速不放大）、完播判定、会话历史、崩溃恢复与重算对账，均已在模拟器实测（59→83 项 JVM 单测 + 48 项仪器化测试）。**缺**：耳机拔出（需真机）、设置页「重算统计」入口、前台长时间播放 → 见「Phase 4 遗留」 |
 | 七句字幕窗口 | **PARTIAL**：v2 表 + 显式 `MIGRATION_1_2`（`MigrationTestHelper` 设备验证）、`SubtitleSynchronizer` 二分定位、3+1+3 窗口、点句跳转、切歌换字幕。**字幕内容 100% 来自手工导入的测试文件（`MANUAL_TEST`），不是 ASR 产物** → 见「Phase 5 遗留」 |
@@ -40,9 +40,16 @@ adb -s emulator-5554 shell am start -n com.xinchen.echomind/.MainActivity
 ```
 
 要求：JDK 17、Android SDK platform 37（目录名 `android-37.0`）、build-tools 37、Gradle 9.6.0（wrapper 自动取）、AGP 9.4.1。
-网络：`maven.aliyun.com` 镜像优先（`repo1.maven.org` 在本机 DNS 超时）。
+网络：`maven.aliyun.com` 镜像优先（`repo1.maven.org` 在本机 DNS 超时）；**CI 上反过来必须用官方仓库**——runner 打阿里云镜像会 502，`settings.gradle.kts` 按 `GITHUB_ACTIONS` 分岔，原因见 `docs/environment.md` §3、§8。
 
-转录功能还需要：sherpa-onnx 的 Android AAR（放 `app/libs/`，URL 见 `docs/asr-design.md` §2）与中文 Paraformer + Silero VAD 模型（App 内下载或本地导入，校验值见 §3）。**在拿到模型之前，App 的播放功能不受影响，字幕功能如实提示不可用。**
+**`app/libs/` 不在仓库里，所以 clone 之后必须先手工取回 AAR，否则 `:app` 配置阶段就报错并打印确切 URL/大小/SHA-256**（这是有意的：宁可构建失败也不静默下载 38 MB）：
+
+```bash
+mkdir -p app/libs && curl -sSL -o app/libs/sherpa-onnx-static-link-onnxruntime-1.13.8.aar \
+  https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/sherpa-onnx-static-link-onnxruntime-1.13.8.aar
+```
+
+转录功能还需要中文 Paraformer + Silero VAD 模型（App 内下载或本地导入，校验值见 `docs/asr-design.md` §3）。**在拿到模型之前，App 的播放功能不受影响，字幕功能如实提示不可用。**
 
 ## 文档
 
@@ -60,7 +67,7 @@ adb -s emulator-5554 shell am start -n com.xinchen.echomind/.MainActivity
 ## 技术栈与版本
 
 Kotlin（AGP 9.4.1 built-in Kotlin）· Jetpack Compose（BOM 2026.09.00）+ Material 3 · AndroidX Media3 1.11.1（ExoPlayer + MediaSessionService）· Room 2.8.5（KSP 2.3.12）· WorkManager 2.12.0 · Coroutines 1.11.0 · 单 Gradle 模块 + 包分层。
-`minSdk 26` / `targetSdk 36` / `compileSdk 37`，ABI 优先 `arm64-v8a`。
+`minSdk 26` / `targetSdk 36` / `compileSdk 37`，ABI **只打 `arm64-v8a`**（本机 AVD 与目标真机都是它；带 x86_64 会让调试包多 27 MB）。
 
 ## 应用标识
 

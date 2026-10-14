@@ -23,6 +23,8 @@ source ~/android-dev/env.sh     # 否则 GRADLE_USER_HOME 退回 ~/.gradle，且
 | 看焦点与播放态 | `adb -s emulator-5554 shell dumpsys audio`；`… shell dumpsys media_session` | 读位置要用 `grep -E "com\.xinchen\.echomind/androidx" -A 16` 再挑 `state=… position=…`；用 `package=com.xinchen.echomind` 当锚点加 `-A 12` 会**漏掉 state 行** |
 | 模拟耳机拔出 | — | **做不到**：`ACTION_AUDIO_BECOMING_NOISY` 是受保护广播，`am broadcast` 打不进来；`adb emu help` 里没有耳机/音频路由命令。只能真机 |
 | 发布包 | `./gradlew :app:assembleRelease` | **本机 `--offline` 下必失败**（lint-gradle 未缓存），已用 `checkReleaseBuilds=false` 规避 |
+| 远端 CI | `gh run list` / `gh run view <id> --log-failed` | 仓库 `https://github.com/xinchentechnote/EchoMind`（私有），工作流 `.github/workflows/ci.yml`：push/PR 跑 `assembleDebug` + `testDebugUnitTest` 并上传 APK。**判定成败要读 `--json conclusion`**，`gh run watch` 接了管道就拿不到退出码 |
+| 仪器化测试（CI 覆盖不到） | 只能本地 `adb install -r` + `am instrument` | **CI 里没有模拟器**，那 48 项 Room/Repository 测试仍然只有本机会跑（决定与代价见 `docs/environment.md` §8） |
 
 ### 2b. 设备自动化实测到的坑（Phase 3 / 5）
 
@@ -286,6 +288,30 @@ FR-707（只在当前句变化时更新）用**设备 + 单测两头**取证：�
 - 「装了 v1 旧包的用户覆盖安装」这条真实升级路径没走过：本机从未安装过 v1 版本的 App，只有 `MigrationTestHelper` 在设备上造的 v1 文件被迁移过。
 - FR-708「长句换行仍可辨识」只做了目视（本轮 fixture 每句都短，没触发换行）；字号调节属 Phase 7。
 - `uiautomator dump` 在 DocumentsUI 的确认弹窗上不稳定，仍按 §2b 的先 `rm -f` 再 dump 处理。
+
+### 远端 CI 与 Phase 6 第 1 项（2026-10-15 04:18 ~ 04:36）
+
+建仓库 → 配 CI → 取回 AAR，这一段全部是**远端与真机的实测**，没有推测。
+
+| 动作 | 结果 | 凭据 |
+| --- | --- | --- |
+| 首次提交并推私有库 | `a7fb83a`（94 files / 10,662 insertions）→ `main`，`visibility=PRIVATE` | `gh repo view --json visibility` |
+| 暂存前审计 | `git ls-files --others --exclude-standard` 共 92 个待入库文件，最大 48 KB；`git diff --cached --name-only` 里**没有** `local.properties` / `app/libs` / `*.aar` / `*.onnx` / 密钥；`app/schemas/{1,2}.json` 已入库 | 命令输出 |
+| 换行符 | 新加 `.gitattributes`（`* text=auto eol=lf`、`*.bat text eol=crlf`），`gradlew.bat` 工作区保持 CRLF、仓库内是 LF（这就是 `eol=crlf` 的语义，不是丢了） | `git show :gradlew.bat \| od -c` |
+| CI 第 1 次 | **失败**：`command -v sdkmanager` 在 runner 上找不到 | run 38630970985 |
+| CI 第 2 次 | **失败**：SDK 校验过了，Gradle 报 `Plugin com.google.devtools.ksp:2.3.12 was not found` | run 38631245294 |
+| 诊断（不猜） | 临时加探测工作流，在 runner 上打状态码矩阵：aliyun `gradle-plugin` / `public` 对 KSP marker **502**，Maven Central / plugins.gradle.org **GET=200 HEAD=200**；runner 镜像 Readme 确认已自带 `android-37.0` + `build-tools 37.0.0` | run 38631763968，用完即删 |
+| CI 第 3 次 | **成功**：`assembleDebug` + 83 项 JVM 单测（`BUILD SUCCESSFUL in 5m36s`，job 6m19s），AAR 按钉住哈希取回、`sha256sum -c` 通过，APK artifact 25,405,781 B | run 38632644725，14 个步骤全 success |
+| AAR 取回（本机） | `sherpa-onnx-static-link-onnxruntime-1.13.8.aar` 38,691,998 B / 3.0s / 13.0 MB/s；`shasum -a 256` = `b22c3fc1…`，与 `gh api` 读到的官方 `digest` **逐字符一致** | `app/libs/`（gitignore 内） |
+| ABI 收窄 | `abiFilters` 改为只留 `arm64-v8a`（`adb shell getprop ro.product.cpu.abi` 实测 `arm64-v8a`） | `app/build.gradle.kts` |
+| 接 AAR 后的本机构建 | `assembleDebug` **BUILD SUCCESSFUL 23s**，APK 16.1 MB → **40,794,372 B**；`unzip -l` 里 sherpa 只有 `lib/arm64-v8a/libsherpa-onnx-jni.so`（24,169,352 B）一份；`testDebugUnitTest` **BUILD SUCCESSFUL，83 tests / 0 failures**（从 XML 汇总，不看绿字） | 本机命令输出 |
+| 模型取回（本机） | `model.int8.onnx` 243,371,218 B / 6.2s / **39.2 MB/s**，sha256 `f36a0433…` == HF LFS `oid`；`tokens.txt` 75,756 B（钉住 `59aba887…`）；`silero_vad.onnx` 643,854 B == 官方 `digest` | `app/libs/models/`（gitignore 内） |
+
+**这一轮没做 / 做不了**：
+
+- **没有跑过任何一次推理**。AAR 只是被链接进 APK 并打包了 `.so`，`asr/` 里还没有引擎代码，模型文件还躺在开发机的 `app/libs/models/`。所以 Phase 6 状态仍是 TODO，「ASR 端到端未完成」。
+- CI 没有模拟器 → `assembleDebugAndroidTest` 之后那 48 项仪器化测试不在 CI 门禁里。
+- CI 的仓库顺序按 `GITHUB_ACTIONS` 分岔，因此**本机跑不到 CI 那条解析路径**：本机模拟 `GITHUB_ACTIONS=true` 时 `repo.maven.apache.org` 对 HEAD 回 **403**（Gradle 正好先发 HEAD），这是本机特有的拦截，runner 上是 200。结论只能靠远端实测拿，别拿本机 curl 的 200 反驳它。
 
 ## 5. 待补的自动化测试清单（按阶段）
 

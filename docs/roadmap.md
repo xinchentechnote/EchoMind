@@ -84,9 +84,19 @@
 6. **`job_id` 可空且暂无外键**：Phase 6 建 `transcript_job` 时要走一次 v2→v3 整表重建补上 FK（`database-design.md` §5.1）。
 7. 长句换行时的高亮可辨识性（FR-708）只做了目视，字号调节（FR-902）在 Phase 7。
 
+## 远端 CI（2026-10-15 建好）
+
+私有库 `https://github.com/xinchentechnote/EchoMind`（`main`），工作流 `.github/workflows/ci.yml` 在 push/PR/workflow_dispatch 上跑
+`:app:assembleDebug` + `:app:testDebugUnitTest`，并把调试 APK 作为 artifact 上传。**第三次跑才绿**（run 38632644725，83 项单测，`BUILD SUCCESSFUL in 5m36s`）；
+前两次的真实死因与排查过程记在 `docs/environment.md` §8 与 `docs/testing.md` §4——其中「阿里云镜像在 runner 上 502」这条只有远端测得出来。
+
+CI **不覆盖**：仪器化测试（没有模拟器）、真机验证、ASR 端到端。这三项仍然按老规矩在本地/设备上做，绿 CI 不等于它们过了。
+
 ## Phase 6 待办（下一步）
 
-1. sherpa-onnx AAR 取回与 ABI 收敛（`app/libs/` 已在 `.gitignore`，构建脚本缺文件时要打印**确切 URL 与期望大小**）。
+1. ~~sherpa-onnx AAR 取回与 ABI 收敛~~ → **已完成（2026-10-15）**：静态链接版 AAR（38,691,998 B，官方 `digest` 已核对）放进 `app/libs/`（不入库），
+   `app/build.gradle.kts` 缺文件时抛异常打印 URL/大小/SHA-256，CI 按同一份哈希取回；`abiFilters` 收窄为只有 `arm64-v8a`，
+   实测 `assembleDebug` 通过、APK 40,794,372 B、包内只有一份 `libsherpa-onnx-jni.so`。**注意：只做到「链接进包」，一次推理都没跑过。**
 2. `ModelManager`：下载/导入、SHA-256 校验、删除；`ModelCatalog` 每个值都要有来源 URL，无官方校验值的要标注并本机钉首次哈希。
 3. `PcmDecoder`（Media3 `MediaDecoder`/`ExoPlayer` 抽 PCM）→ `VadSegmenter` → `SherpaOnnxEngine`（单段 ≤20s、不在主线程、`release()` 成对）。
 4. `transcript_job` 表（v2→v3，顺带给 `subtitle_segment.job_id` 补 FK）+ `TranscriptCoordinator` + WorkManager 任务与重启恢复。
@@ -115,5 +125,5 @@
 | 文件夹管理 UI | 只有全局重扫；FR-102/904 要求的按文件夹授权/重扫没有入口 | Phase 7 |
 | `connectedDebugAndroidTest` 会清掉被测 App 的数据 | 实测：跑完仪器化测试后 `dumpsys package` 显示 `notLaunched=true`、databases 目录消失、持久化授权一并失效，需要重装 APK 并重新走一遍 SAF 导入 | 设备验证放在仪器化测试**之后**做，或接受重导入成本 |
 | v1 schema 曾在开发期就地扩表 | Phase 3/4 往 `version = 1` 里直接加过表（未发版、数据可丢）。**Phase 5 起已改为显式 Migration**：`Migrations.MIGRATION_1_2` + `Migration_1_2_Test`，`EchoMindApp` 只注册 `Migrations.ALL`，没有 destructive 兜底 | Phase 6 建 `transcript_job` 时写 v2→v3，并顺带给 `subtitle_segment.job_id` 补外键（要整表重建） |
-| x86_64 ABI | 目前 `abiFilters` 含 arm64-v8a + x86_64；引入 sherpa AAR 后 x86_64 会显著增大体积 | Phase 6 决定是否收窄为 arm64 only |
+| x86_64 ABI | ~~目前 `abiFilters` 含 arm64-v8a + x86_64~~ → **已收窄为只打 arm64-v8a**（2026-10-15，接 AAR 的同时做的；本机 AVD `ro.product.cpu.abi` 实测 `arm64-v8a`，x86_64 那份 sherpa so 未压缩 27.4 MB 纯属浪费） | 已处理；x86 真机/模拟器如需用，再单独放开并实测体积 |
 | 手工 DI | `AppGraph` 会随阶段变胖 | 若超过 ~15 个装配项或出现循环依赖再评估拆模块 |

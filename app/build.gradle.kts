@@ -121,7 +121,7 @@ if (!sherpaAar.exists()) {
         |  URL     : https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/sherpa-onnx-static-link-onnxruntime-1.13.8.aar
         |  期望大小: 38,691,998 B
         |  SHA-256 : b22c3fc1b6a45666d28892bb2f7694beeb77a8362d7ebd77c1a5431ec9435471
-        |            （官方 release 未发布校验值，这是本机首次下载钉住的哈希，见 docs/asr-design.md §2.1）
+        |            （官方 release 资产的 digest 字段就是它，`gh api repos/k2-fsa/sherpa-onnx/releases/tags/v1.13.8` 可复核）
         |  取回：mkdir -p app/libs && curl -sSL -o <上面的路径> <上面的 URL>
         """.trimMargin()
     )

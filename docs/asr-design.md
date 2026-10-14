@@ -37,7 +37,18 @@
 - 备选：`sherpa-onnx-1.13.8.aar`（50,129,134 B），arm64 四个 so 未压缩 31.93 MB，需自己 exclude `libsherpa-onnx-c-api.so` / `-cxx-api.so`。
 - AAR 元数据：`minSdkVersion=21`（与本项目 minSdk 26 无冲突），`minCompileSdk=1`，`minAndroidGradlePluginVersion=1.0.0`，包名 `com.k2fsa.sherpa.onnx`，Kotlin 侧固定 `System.loadLibrary("sherpa-onnx-jni")`。
 - 本机下载耗时估算：45–51 KB/s → 38.7 MB 约 **13–15 分钟**（A10）。因此 AAR **一次性手工取回放到 `app/libs/`，并加入 `.gitignore`**（47 MB 二进制不入库），构建脚本用 `implementation(files("libs/…aar"))`；缺失时构建给出可执行的提示（见 §9）。
+  **2026-10-15 实际取回记录**（替换上面那句估算，网络已经不是瓶颈了）：`curl -sSL` 直连 GitHub release，**38,691,998 B / 3.0s / 13.0 MB/s**，与确证大小一致；
+  本机钉住 `SHA-256 b22c3fc1b6a45666d28892bb2f7694beeb77a8362d7ebd77c1a5431ec9435471`，
+  并用 `gh api repos/k2-fsa/sherpa-onnx/releases/tags/v1.13.8` 读到该 release 资产的 `digest` 字段
+  = `sha256:b22c3fc1b6a45666d28892bb2f7694beeb77a8362d7ebd77c1a5431ec9435471` —— **与本机下载逐字节一致，所以这份有官方校验值**
+  （§2.1 早期写作时以为 release 资产没有 digest，那是把 `asr-models` 那个 tag 的 `silero_vad_v5.onnx`（`digest: null`）当成了普遍情况；
+  顺带确证：`asr-models` 的 `silero_vad.onnx` `digest` = `sha256:9e2449e1…`、`size` 643,854 B，本机取回逐字节相同）。
+  `app/build.gradle.kts` 在文件缺失时抛 `GradleException` 打印 URL/大小/这份哈希；CI 每次按同一份哈希 `sha256sum -c` 后放进 `app/libs/`（`docs/environment.md` §8）。
+- Kotlin API 面（`unzip` 出 `classes.jar`，238,706 B，122 个 class，包 `com.k2fsa.sherpa.onnx`）实测确认可用：
+  `OfflineRecognizer` / `OfflineRecognizerConfig` / `OfflineRecognizerResult` / `OfflineStream` / `OfflineParaformerModelConfig` / `OfflineModelConfig`、
+  `Vad` / `VadModelConfig` / `SileroVadModelConfig` / `WaveData`。类文件带 `$Companion` 与 `*Kt`，**是 Kotlin API 而非 Java 反射壳**，`SherpaOnnxEngine` 可以直接调，不需要 JNI 自写。
 - ABI：AAR 含 `arm64-v8a / armeabi-v7a / x86 / x86_64`。本项目 `abiFilters` **只留 arm64-v8a**（真机优先；本机模拟器 `emulator-5554` 也是 arm64-v8a，仪器化测试同样可用），全 ABI 打进包里未压缩约 105 MB，不可接受。
+  **2026-10-15 已收窄并实测生效**：`app-debug.apk` 16.1 MB → **40,794,372 B**，`unzip -l` 里 sherpa 只有 `lib/arm64-v8a/libsherpa-onnx-jni.so`（24,169,352 B）一份。
 
 ### 2.2 体积/内存预算
 
@@ -54,10 +65,13 @@
 | 文件 | 大小 | SHA-256 | 来源 |
 | --- | --- | --- | --- |
 | `model.int8.onnx` | 243,371,218 B | `f36a0433bcf096bd6d6f11b80a3ac8bed110bdca632fe0d731df8d1a84475945` | HF LFS `oid`： https://hf-mirror.com/api/models/csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14/tree/main |
-| `tokens.txt` | 75,756 B | 无官方校验值（同上 API 未给 sha256） | 同上仓库 |
+| `tokens.txt` | 75,756 B | 官方未给（HF API 的 `sha256` 字段为空）→ **本机钉住 `59aba8873a2ed1e122c25fee421e25f283b63290efbde85c1f01a853d83cb6e6`** | 同上仓库 |
 | `config.yaml` | ≈0.06 MB | 不需要（sherpa-onnx 已把 cmvn/lfr 烧进 ONNX metadata） | 同上 |
 
-- 下载首选 **hf-mirror.com**（A10 实测 5.86 MB/s，约 45s）；`huggingface.co` 本机超时，只作为备用源写在清单里。
+- **2026-10-15 实测取回**：`https://hf-mirror.com/csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14/resolve/main/{model.int8.onnx,tokens.txt}`
+  → 243,371,218 B / **6.2s / 39.2 MB/s**，`shasum -a 256` 得 `f36a0433bcf096bd6d6f11b80a3ac8bed110bdca632fe0d731df8d1a84475945`，**与 HF LFS `oid` 逐字符相同**；
+  `tokens.txt` 75,756 B 同时落到 `app/libs/models/sherpa-onnx-paraformer-zh-2023-09-14/`（gitignore 内，不入库）。
+- 下载首选 **hf-mirror.com**（本轮实测 39.2 MB/s；A10 那次是 5.86 MB/s，速度同样会漂）；`huggingface.co` 本机超时，只作为备用源写在清单里。
 - GitHub 也有整包 `.../releases/download/asr-models/sherpa-onnx-paraformer-zh-2023-09-14.tar.bz2`（**234.05 MB**），但 release 资产 **digest 字段为 null → 无官方校验值**，且本机只有 45 KB/s，不推荐。
 - `OfflineParaformerModelConfig` 只有 `model` 一个字段（A3/源码），应用只需要 `model.int8.onnx` + `tokens.txt` 两个文件；int8 与 fp32 二选一，清单里默认 int8。
 
@@ -65,7 +79,7 @@
 
 | 文件 | 大小 | SHA-256 | 来源 |
 | --- | --- | --- | --- |
-| `silero_vad.onnx` | 0.64 MB | `9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6` | GitHub release 资产 `digest` 字段（官方发布） |
+| `silero_vad.onnx` | 643,854 B | `9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6`（官方 `digest`，**已逐字节复核**） | `https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx`；2026-10-15 取回 643,854 B，`shasum -a 256` 与 `gh api` 的 `digest` 一致 |
 
 ### 方案 B（备选/对照）：SenseVoice int8
 
@@ -171,5 +185,9 @@ data class TokenTiming(val text: String, val startMs: Long, val endMs: Long)
 
 ## 10. 当前状态（诚实标注）
 
-- `docs` 与代码里的 `SherpaOnnxEngine` **在 Phase 6 之前不存在**；Phase 5 用测试字幕验证七句窗口，Phase 6 才引入 AAR 与真实推理。
-- 截至本文写作时刻，本机**尚未下载 AAR 与模型**，因此「ASR 端到端可用」**未完成**，不得被任何测试或 UI 冒充。
+- **已确证/已落地**：AAR 取回并打进包（§2.1，`assembleDebug` 通过，APK 40.79 MB，只含 arm64 一份 sherpa `.so`）；
+  三个模型文件已在**本机**下载并逐一核对 sha256（§3，Paraformer int8 + tokens + silero VAD）。
+- **尚未实现**：`asr/` 里还没有 `SherpaOnnxEngine`、`VadSegmenter`、`PcmDecoder`、`TranscriptCoordinator`，`work/` 是空的，
+  `transcript_job` 表也还没建。**所以「ASR 端到端可用」仍然未完成**——本机那些模型文件目前只是躺在 `app/libs/models/`（gitignore 内），
+  App 一次都没有加载过它们，一行真实转录都没产出过。
+- Phase 5 用测试字幕验证的是七句窗口管线；测试字幕与 ASR 产物在数据上以 `source=MANUAL_TEST` / `ASR` 严格区分，不得互相冒充。
