@@ -13,7 +13,7 @@
 | 3 | 文件夹导入 + 书架 | **PARTIAL** | `assembleDebug` + 31 项 JVM 单测 + 20 项仪器化测试全绿；`emulator-5554` 真实 SAF 导入 6 首、连续重扫不重复建记录、移走→MISSING、原样移回→PRESENT、手改标题不被覆盖、force-stop 后书架不丢，DB 查询与截图为证（`testing.md` §4）。缺口见下「Phase 3 遗留」 |
 | 4 | Media3 播放 + 播放记忆与统计 | **PARTIAL** | `assembleDebug` + 59 项 JVM 单测 + 41 项仪器化测试全绿（2026-10-15）；`emulator-5554` 实测：前台中媒体通知、通知栏控制、媒体键、瞬时焦点丢失暂停且不自动续播、自动切歌逐首分账、崩溃恢复标 `CRASHED`、重算==增量、统计页与 DB 对账一致。缺口见下「Phase 4 遗留」 |
 | 5 | 字幕基础设施与七句窗口 | **PARTIAL** | `assembleDebug` + 83 项 JVM 单测 + 48 项仪器化测试全绿（2026-10-15）；`emulator-5554` 实测：v2 建表、七句窗口 3+1+3、末句不补位、当前句高亮、点句跳 `start_ms`（DB 复核 12000/15000/24000）、拖动与倍速后跟手、切歌后换成另一套字幕、测试字幕常驻标注「非 ASR 产物」。缺口见下「Phase 5 遗留」 |
-| 6 | 本地 ASR（sherpa-onnx） | **TODO**（设计已 DONE） | **ASR 端到端未完成**：`asr/`、`work/` 包里一个文件都还没有，没有模型、没有真实转录。当前播放页能看到的字幕全部来自 debug 通道导入的测试字幕文件 |
+| 6 | 本地 ASR（sherpa-onnx） | **PARTIAL**（**端到端仍未完成**） | 已实装并在 `emulator-5554` 上真跑过：模型清单/下载/校验（35 JVM + 4 仪器化）、PCM 解码（4 仪器化，148 s 真素材）、VAD 分段（6 仪器化，RTF 0.017~0.020）、SherpaOnnx 推理（8 仪器化，装载 ~4.9 s，识别 RTF 0.083~0.143 —— 模拟器两轮差 1.6 倍）、逐字时间换算（14 JVM）。JVM 169 / 仪器化 70 全绿。**缺口**：`work/` 包还是空的，没有 `TranscriptCoordinator`/任务表/WorkManager，**模型识别出的字句一次都没进过数据库**；当前播放页能看到的字幕全部来自 debug 通道导入的测试字幕文件。模型是 `adb push` 搬进设备的，App 自己下载 243 MB 那条路还没验过。见下「Phase 6 待办」 |
 | 7 | UI 完整化与端到端验收 | **TODO** | — |
 | 8 | 交付文档与总结 | **TODO** | — |
 
@@ -102,18 +102,30 @@ CI **不覆盖**：仪器化测试（没有模拟器）、真机验证、ASR 端
    挂进 `AppGraph`（`modelsRoot = filesDir/models`），35 条 JVM 单测 + 4 条仪器化用例（`ModelManagerNetworkTest` 用清单里真实的 hf-mirror URL 取回 `tokens.txt` 并独立复算 sha256）；
    清单三个文件的字节数与 SHA-256 全部实测过、`tokens.txt` 标了「无官方校验值 + 本机钉住」；顺带补上被漏掉的 `INTERNET` 权限（漏它时 35 条单测一条都不红）。
    **仍缺三块**：① 本地导入（SAF 选目录）未实现；② 243 MB 的 int8 与 GitHub 单源的 VAD 都没从设备取回过（`github.com:443` 本机与模拟器同时超时，实测记录见 `docs/testing.md` §4）；③ 没有任何 UI 消费 `ModelManager.statuses`，所以「点一下就能下模型」还没交付 —— 归本清单第 6 项。
-3. ~~PCM → VAD → 引擎~~ → **PARTIAL（2026-10-15，解码这一环已在设备跑通）**：`domain/asr/PcmConversion`（16-bit LE → 单声道 float，均值下混）、
+3. ~~PCM → VAD → 引擎~~ → **DONE（2026-10-15，三层都在设备上真跑过；端到端「入库」归第 4 项）**：
+   `domain/asr/PcmConversion`（16-bit LE → 单声道 float，均值下混）、
    `domain/asr/SincResampler`（源采样率 → 16k 抗混叠 FIR；**必须自己写**——实测 Media3 1.11.1 里没有 `AudioResamplingAudioProcessor`，
    `media3-decoder` 里也没有 `MediaDecoder`，所以本条原计划的「Media3 `MediaDecoder`/`ExoPlayer` 抽 PCM」这条路**不成立**，改用框架 `MediaExtractor` + `MediaCodec`）、
-   `domain/asr/AsrChunkPlanner` + `domain/model/AsrModels`（>20s 均分成 ≤20s 块、绝对毫秒偏移，FR-505 零漂移单测）——共 37 条 JVM 单测；
-   **加上 `asr/PcmDecoder`（✅ DONE）**：同步模式贪心解码，`emulator-5554` 上真解 148 s 立体声 MP3，样本数与容器时长对账偏差 **0.22%**、
-   581 块首尾相接、`peak=0.659`、单缓冲上界 4,608 B（= 文件 0.002 倍，NFR-05 第一次有数）、取消与非音频路径各有用例，4 条仪器化全绿；
-   RTF ≈0.17（模拟器，真机未测）。APK 40,919,888 B，JVM 155 / 仪器化 56 全绿（`docs/testing.md` §4）。
+   `domain/asr/AsrChunkPlanner` + `domain/model/AsrModels`（>20s 均分成 ≤20s 块、绝对毫秒偏移，FR-505 零漂移单测）、
+   `domain/asr/TokenTimingMapper`（逐字「秒」→ 绝对毫秒；数量不符/越界/倒序抛 `Mismatch`，不猜）——共 51 条 JVM 单测；
+   **`asr/PcmDecoder`（✅）**：同步模式贪心解码，真解 148 s 立体声 MP3，样本数与容器时长对账偏差 **0.22%**、581 块首尾相接、`peak=0.659`、
+   单缓冲上界 4,608 B（= 文件 0.002 倍，NFR-05 第一次有数），4 条仪器化；
+   **`asr/VadSegmenter`（✅）**：流式 512 样本窗 + 段带样本回来，6 条仪器化。60 s 真素材出 9 段、最长 7.4 s（`maxSpeechDuration=20s` 从未被迫强切）、
+   纯 VAD **RTF 0.017~0.020**（1,021 / 1,211 ms 两轮，同一素材）；不同喂入块长（4096/1024/3000/整串）分段结果逐项相同；
+   **`asr/SherpaOnnxEngine`（✅）**：装载前按清单核对，单段 >20s 或样本数与块不符直接抛，主线程构造直接拒，`release()` 幂等，8 条仪器化。
+   真模型第一次开口：单块 19.2 s → 13 个逐字时间、「那片笑声让我想起我的那些年」、**RTF 0.143**；端到端 6 块 → **58 个 token**、
+   跨块时间单调、**RTF 0.131**、引擎装载 4,906 ms（后台线程）。**第二轮复跑（同一天 07:19）证明结果完全可复现**（58 个 token、跨度 14,134~49,446 ms、
+   9 段的 startList/lenList 逐项相同），但**耗时抖动大**：端到端 RTF 0.083、单块 0.134、装载 4,914 ms → RTF 在模拟器上只当量级看。
+   APK ~40.9 MB（本机同一天三次构建 40,859,995~40,951,147 B，尺寸不当判据，见 `docs/testing.md` §4），JVM 169 / 仪器化 70 全绿。
    ⚠ **本轮挖出的新事实**：Phase 3~5 一直在用的 `/sdcard/Music/EchoMind/` 那批「《三体》」素材**是静音占位 MP3**（帧体 99% 为 0x00，宿主机逐字节核对）。
    长度类结论不受影响，但**音频内容此前从未被验证过**，转录精度必须换真人语音素材（本机无 MP3 编码器，得用户提供）。
-   **还缺**：`VadSegmenter`、`SherpaOnnxEngine`（单段 ≤20s、不在主线程、`release()` 成对）、以及把 `PcmDecoder` 接进编排层（它目前只被测试调用）。
-   ⚠ 两个必须实测、不许猜的单位问题仍是空白：模型 `timestamps` 的单位（秒还是毫秒）、`SpeechSegment.start` 的单位（样本还是毫秒）——
-   要等 `SherpaOnnxEngine` 落地才可能被真数据检验。
+   ~~⚠ 两个必须实测、不许猜的单位问题仍是空白~~ → **已用真数据答掉（不是猜的）**：`SpeechSegment.start` 是 **16k 样本下标**（全部落在 1 ms=16 样本的网格上；
+   原先假设的「必是 512 窗整数倍」被真数据**否掉**了），`OfflineRecognizerResult.timestamps` 是**秒**且相对本块起点，`durations` 长度 **0**（所以末字只能收到块末尾）。
+   三条判据都做成了仪器化断言，另有一条反向对照用例（把毫秒当秒喂 → 必须抛）。
+   ⚠ **另一条实测到的坏消息**：块边界不等于句子边界——同一段歌词整块 20 s 识别出「那片笑声让我想起我的那些年」，被 VAD 切成两块后给出「偏笑声让」+「想起我的那些话」。
+   逐字时间仍有效，但**块文本不能直接当字幕**，这是第 5 项 `SentenceSplitter` 的活。
+   **还缺**：把这三层接进生产编排（现在只有测试在串它）、`transcript_job` 表与 WorkManager、入库事务、模型的设备端 HTTP 取回（现在这两个模型是 `adb push` + `run-as` 搬进 `filesDir/models/` 的，
+   与「App 能自己下载」是两件事）。
 4. `transcript_job` 表（v2→v3，顺带给 `subtitle_segment.job_id` 补 FK）+ `TranscriptCoordinator` + WorkManager 任务与重启恢复。
 5. FR-602/603 的切句与时间戳清洗（这次才是真需要 `SentenceSplitter` 的地方）。
 6. 转录页（现在是 placeholder）+ 失败降级文案。

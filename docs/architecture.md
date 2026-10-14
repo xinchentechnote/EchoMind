@@ -5,7 +5,7 @@
 首版用**一个 Android Library/Application 模块 `:app`**，靠包结构分层。理由（也写进了 `environment.md` 的约束）：
 
 - AGP 9.4.1 + Gradle 9.6.0 在本机已缓存，单模块构建最快、离线风险面最小；多模块会把 `lint`、`checkReleaseBuilds` 之类的坑放大。
-- sherpa-onnx 的依赖引入方式尚未确证（可能不是 Maven 坐标而是本地 AAR，见 `asr-design.md`），过早拆 `:asr` 模块会让构建脚本返工。
+- sherpa-onnx 已确证是**本地 AAR**（`app/libs/*.aar` 不入库，CI 按钉住的 SHA-256 从官方 release 取回，见 §10 D23），不是 Maven 坐标。所以「拆 `:asr` 会让构建脚本返工」这条依然成立，只是原因变成了 ABI 过滤与 AAR 归属；当前推理只有两个类，仍按单模块走。
 - 分层靠接口约束，不靠 Gradle 边界。
 
 **拆模块的触发条件**（记录，避免无动机拆分）：
@@ -23,7 +23,7 @@ app/src/main/java/com/xinchen/echomind/
 │   ├── time/TimeSource.kt         // ✅ 单调时钟抽象（可注入，测试替换）
 │   ├── time/AndroidTimeSource.kt  // ✅ elapsedRealtime / currentTimeMillis 的实现
 │   ├── conf/PlaybackPolicy.kt     // ✅ 全部统计/播放阈值集中处
-│   └── conf/AudioFormats.kt       // ✅ 扩展名白名单、采样率、分块大小
+│   └── conf/AudioFormats.kt       // ✅ 扩展名白名单、采样率、分块大小 + VAD/识别器参数（唯一出处）
 ├── domain/                        // 纯 Kotlin，不 import android.*
 │   ├── model/ImportModels.kt      // ✅
 │   ├── model/PlaybackModels.kt    // ✅ ListeningSessionData / PlaybackProgress / SessionEndReason / SessionStatus
@@ -39,7 +39,8 @@ app/src/main/java/com/xinchen/echomind/
 │   ├── asr/PcmConversion.kt         // ✅ 16-bit LE 字节 → 单声道 float（均值下混），纯 Kotlin
 │   ├── asr/SincResampler.kt         // ✅ 源采样率 → 16k 的抗混叠流式重采样（窗口 sinc，33 抽头）
 │   ├── asr/AsrChunkPlanner.kt       // ✅ >20s 语音段均分成 ≤20s 块 + 绝对毫秒偏移（FR-505）
-│   └── model/AsrModels.kt           // ✅ SpeechSpan / PcmChunkPlan（不暴露任何 native 类型）
+│   ├── asr/TokenTimingMapper.kt     // ✅ 模型逐字「秒」→ 绝对毫秒；数量不符/越界/倒序一律抛 Mismatch，不猜
+│   └── model/AsrModels.kt           // ✅ SpeechSpan / PcmChunkPlan / TokenTiming / ChunkRecognition（不暴露任何 native 类型）
 ├── data/
 │   ├── db/                        // ✅ Entity / DAO / EchoMindDatabase / Migrations
 │   │   └──（v2 实到 5 表：imported_folder、audio_book、playback_state、listening_session、subtitle_segment）
@@ -50,13 +51,15 @@ app/src/main/java/com/xinchen/echomind/
 │   ├── Media3PlaybackController.kt// ✅ 实现 + Player.Listener + 统计事件翻译 + 串行落库通道
 │   ├── PlayerHolder.kt            // ✅ 单例 ExoPlayer 持有（同进程共享给 Service；不提供 release()）
 │   └── EchoMindMediaService.kt    // ✅ MediaSessionService + addSession + 前台通知 + onTaskRemoved
-├── asr/                           // 模型准备侧 ✅ + 解码侧 ✅（推理侧仍未开始，Phase 6 后续项）
+├── asr/                           // 模型准备 ✅ + 解码 ✅ + VAD ✅ + 推理 ✅（端到端串联与入库还没有）
 │   ├── ModelCatalog.kt            // ✅ 清单唯一出处：URL/字节数/SHA-256 全部实测，无官方校验值标 null 并本机钉住
 │   ├── ModelVerifier.kt           // ✅ 存在 → 大小 → SHA-256 三步核对 + 流式哈希（纯 JVM，可单测）
 │   ├── ModelFetcher.kt            // ✅ `fun interface ModelFetcher`（测试接缝）+ `HttpFetcher`（HttpURLConnection，手工跟 Location）
 │   ├── ModelManager.kt            // ✅ statuses/download/delete/refresh：`.part` → 校验 → 改名 → 记来源，多源回退、文件级跳过、250ms 进度限流
-│   ├── PcmDecoder.kt              // ✅ MediaExtractor+MediaCodec 同步模式流式解码 → 16k 单声道定长块；4 条仪器化在真 MP3 上跑过（尚无业务调用方）
-│   └── SherpaOnnxEngine / VadSegmenter / TranscriptCoordinator — **Phase 6，代码里还没有**
+│   ├── PcmDecoder.kt              // ✅ MediaExtractor+MediaCodec 同步模式流式解码 → 16k 单声道定长块；4 条仪器化在真 MP3 上跑过
+│   ├── VadSegmenter.kt            // ✅ silero VAD 流式封装：push 块 → 出段（绝对样本下标 + 段内样本），6 条仪器化
+│   ├── SherpaOnnxEngine.kt        // ✅ 离线 Paraformer 封装：open 前按清单核对，recognize(块) → 逐字绝对毫秒；8 条仪器化
+│   └── TranscriptCoordinator      // — Phase 6 第 4 项（把上面三层串起来 + 取消/重试/入库）
 │       （`PcmResampler` 这个名字不再需要：采样率转换落在 `domain/asr/SincResampler`）
 ├── work/                          // TranscriptWorker / FolderRescanWorker — Phase 6
 │   └──（当前无 WorkManager：重扫是 appScope 里的 `Dispatchers.IO` 协程）
@@ -134,16 +137,21 @@ interface PlaybackRepository {                        // 播放记忆 + 统计�
     suspend fun recomputeAggregates()                 // FR-410/905
 }
 
-// ⚠ 下面是**设计稿，代码里还没有**（2026-10-15 `grep -r "interface AsrEngine"` 无结果）。签名与 `docs/asr-design.md` §4 统一为 float 输入：
-//   音频在进引擎前已由 PcmConversion + SincResampler 变成 16 kHz 单声道 float，`ShortArray` 那版是早期草稿，会白丢 8 dB 精度。
-interface AsrEngine {                                  // 推理侧唯一抽象
-    val readiness: EngineReadiness                     // READY / MODEL_MISSING / MODEL_CORRUPT / UNSUPPORTED_ABI / OUT_OF_MEMORY
-    fun load(): EngineSession
-    interface EngineSession {
-        fun segmentsOf(pcm: FloatArray, startOffsetMs: Long, sampleRate: Int): List<RecognizedSegment>
-        fun release()
-    }
+// ✅ Phase 6 实现（asr/SherpaOnnxEngine.kt）。**没有 AsrEngine 接口**：只有一个实现、没有第二个替身，
+//   套接口等于给「未来可能换引擎」预付费用。见 `docs/asr-design.md` §4 末的取舍。
+class SherpaOnnxEngine private constructor(...) {
+    companion object { fun open(modelsRoot: File): SherpaOnnxEngine }   // 主线程调用直接抛；按 ModelCatalog 核对后才加载；实测装载 4,906~4,914 ms
+    fun recognize(chunk: PcmChunkPlan, samples: FloatArray): ChunkRecognition  // 样本数必须与块一致、≤20s，否则 AsrInputException
+    fun release()                                                        // 幂等；之后 recognize 立刻抛，不会 use-after-free
 }
+// ✅ Phase 6 实现（asr/VadSegmenter.kt）：流式喂块，段带样本回来（整章音频从不驻留内存）
+class VadSegmenter(modelFile: File, sampleRate: Int = 16_000) {
+    fun push(samples: FloatArray): List<VadUtterance>   // 攒满 512 样本的窗才推进模型；尾巴留住
+    fun finish(): List<VadUtterance>                    // 补最后一窗 + vad.flush() + 排空
+    fun release()
+}
+// VadUtterance(startSample: Long, samples: FloatArray)：startSample 是 16k 下的**样本下标**（实测落在 1 ms=16 样本网格上），
+// span 属性直接给出 domain 的 SpeechSpan，所以分段结果不经过任何 native 类型就进了纯 Kotlin 的 AsrChunkPlanner。
 
 class ModelManager(modelsRoot: File, timeSource: TimeSource, specs: List<ModelSpec>, fetcher: ModelFetcher, ioDispatcher: CoroutineDispatcher) {
     val statuses: StateFlow<List<ModelStatus>>        // UI 只读这一个：verification / isDownloading / download / error
@@ -204,15 +212,19 @@ EchoMindMediaService(MediaSessionService) ── addSession(MediaSession.Builder
 ### 5.3 转录
 ```
 TranscriptRepository.enqueue ─► WorkManager(前台类型 mediaPlayback? 见下) 
-  ─► TranscriptCoordinator:
+  ─► TranscriptCoordinator(代码里还没有，Phase 6 第 4 项):
        PcmDecoder ✅(MediaExtractor+MediaCodec 同步流式 → PcmConversion 均值下混 → SincResampler 到 16k → 定长块回调)
-       ─► VadSegmenter(代码里还没有：silero VAD，float 块 → SpeechSpan 绝对样本区间)
+       ─► VadSegmenter ✅(silero VAD，float 块 → VadUtterance(绝对样本下标 + 段内样本)，段与段不重叠，≤20 s 强制切段)
        ─► AsrChunkPlanner ✅(>20s 段均分成 ≤20s 块，用全局样本下标算绝对 startMs/endMs)
-       ─► AsrEngine.segmentsOf ─► tokens(+时间) 
-       ─► SentenceSplitter(标点切句 + 时间清洗) 
+       ─► SherpaOnnxEngine ✅.recognize(块) ─► ChunkRecognition(text + tokens[绝对毫秒])
+       ─► SentenceSplitter(标点切句 + 时间清洗 — 还没有，Phase 6 第 5 项)
        ─► Room 事务：删旧字幕 + 插新字幕 + job=SUCCESS + audio.transcriptionState=READY
   ─► 进度每块更新一次（内存节流 ≥1s 写库）
 ```
+前三步已在 emulator-5554 上真串起来跑过（`VAD段逐块识别出来的时间是全局单调的`：60 s 素材 → 9 段 → 6 块 → 58 个逐字时间，
+跨块单调、全部落块内），但**串联代码在测试里，不在生产代码里**：`TranscriptCoordinator`、任务表、WorkManager、入库事务都还没写。
+一条实测到的坑：块的边界不等于句子的边界——同一段歌词整块 20 s 识别出「那片笑声让我想起我的那些年」，
+被 VAD 切成两块后给出「偏笑声让」+「想起我的那些话」。逐字时间依然有效，但文本要靠 `SentenceSplitter` 收拾，不能拿块文本直接当字幕。
 前台服务用于长任务通知：转录用 `ForegroundInfo`（WorkManager 支持在 worker 返回 `Result` 前 `setForeground`），不额外起 Service。
 
 ### 5.4 字幕同步（Phase 5 已实现，名字与代码一致）
@@ -233,8 +245,8 @@ controller.state.map { it.positionMs }        // 500ms tick，即 PlaybackPolicy
 | 播放事件的落库 | 控制器内 `Channel<suspend () -> Unit>(UNLIMITED)`，单个 IO 协程按序消费：Media3 回调并发进来，串行才不会有两个写对同一行「读-改-写」。每个 op 用 `runCatching` 包住，失败只 `Log.w` 后跳过（不重试、不崩播放），所以**统计落库失败会静默丢这一笔**，见 §10 D13 |
 | 目录扫描 | `Dispatchers.IO`（WorkManager 或 appScope 协程） |
 | 播放器回调 | Media3 应用线程（主线程），只做轻量状态搬运 |
-| PCM 解码/重采样 | 转录 worker 的协程/线程池，`Dispatchers.Default` |
-| ASR 推理 | 单线程串行（`asrDispatcher = newSingleThreadContext`），避免多模型实例并存；同一时刻只一个引擎句柄 |
+| PCM 解码/重采样/VAD | **设计**：转录 worker 的协程/线程池，`Dispatchers.Default`（`PcmDecoder`/`VadSegmenter` 代码已就绪，worker 还没写，目前只在仪器化测试的调用线程上跑） |
+| ASR 推理 | **设计（代码里还没有）**：单线程串行（`asrDispatcher = newSingleThreadContext`），避免多模型实例并存；同一时刻只一个引擎句柄。当前只有仪器化测试在调用线程上直接 `SherpaOnnxEngine.open()`，两个类里的 `check(Looper… != getMainLooper())` 是这条约束目前唯一的执行者 |
 | UI | Compose + `collectAsStateWithLifecycle` |
 
 约束：
@@ -249,9 +261,14 @@ controller.state.map { it.positionMs }        // 500ms tick，即 PlaybackPolicy
   `asr/ModelCatalog`、`ModelVerifier`、`ModelFetcher`、`ModelManager` 同理（只用 `java.io.File` / `java.net` / `MessageDigest`），35 条 JVM 单测就是这么来的；
   它们的**接缝在依赖上**（注入假 `ModelFetcher` + `FakeTimeSource` + `TemporaryFolder`），不是靠给 `ModelManager` 套接口。
   `domain/asr/PcmConversion`、`SincResampler`、`AsrChunkPlanner` 也是同一类接缝（合成信号 + 手搓字节，37 条 JVM 单测），它们**不需要设备**：
-  没有 Android 类型，靠单频探针就能验出「滤波器有没有在工作」。反过来 `asr/PcmDecoder` 是**必须上设备**的那一层：
+  没有 Android 类型，靠单频探针就能验出「滤波器有没有在工作」。`domain/asr/TokenTimingMapper` 也是同一层：
+  把「秒还是毫秒」这种猜错就偏移 1000 倍的换算规则做成纯函数，14 条 JVM 单测把越界/倒序/数量不符都钉成异常，设备上一旦出现就能立刻认出来。
+  反过来 `asr/PcmDecoder` 是**必须上设备**的那一层：
   它吃 `Context`/`Uri`，只能测「这台机器的解码器实际给什么」——4 条仪器化用例（真 MP3 时长对账、块连续性、幅度、取消、非音频），
   接缝是 `fun interface PcmChunkSink`：解码逻辑与「拿到块以后干什么」在测试里被分开。
+  `asr/VadSegmenter`（6 条）与 `asr/SherpaOnnxEngine`（8 条）同属必须上设备的一层，而且**比解码更贵**：它们要真模型（243 MB）才动得起来，
+  所以引擎侧的可测性做法是「一个类共用一个句柄」（`@BeforeClass` 装、`@AfterClass` 释放）+ 把单位判据写成断言而不是日志。
+  这也意味着没有 `AsrEngine` 接口就没有假引擎：JVM 侧只能测到 `TokenTimingMapper` 与 `AsrChunkPlanner` 这一层，端到端必须真跑。
   `text/SentenceSplitter` **目前代码里还没有**（Phase 6 第 5 项）。
 
 ## 8. 错误处理与降级
@@ -263,14 +280,14 @@ controller.state.map { it.positionMs }        // 500ms tick，即 PlaybackPolicy
 | 播放器报错 `onPlayerError` | **Phase 4 已实现**：`Log.w("EchoMindPlayback")` + 先 `flushNow()` 结算这场（已经听过的时间要落账），再把 `无法播放（<errorCodeName>）` 透出到 `PlaybackUiState.error`，播放页红字显示。不做自动重试、不自动跳下一首 |
 | 无字幕 / 字幕表为空 | **Phase 5 已实现**：七句窗口不渲染，卡片里如实写「还没有字幕。本地转录（Phase 6 的 sherpa-onnx）接入后这里会自动出现，之前不会放任何假字幕。」；没有「生成字幕」入口（那是 Phase 6）。debug 包多一个「导入测试字幕」按钮，release 包按 `FLAG_DEBUGGABLE` 判掉 |
 | 测试字幕文件解析失败 | 整份拒绝并把**行号 + 原因**回给用户（`导入失败：第 N 行的开始时间无法解析…`），绝不退化成补零或按字数均分（AGENTS.md §5） |
-| 模型缺失/损坏 | `EngineReadiness` → 转录入口禁用并说明；设置页给出下载/导入；**播放不受影响** |
-| 推理 OOM | 捕获后释放句柄、任务 `FAILED(reason=OUT_OF_MEMORY)`、建议减小分块；下次重试自动用小分块（记录为设计取舍） |
+| 模型缺失/损坏 | **引擎侧已实现（Phase 6 第 3 项）**：`SherpaOnnxEngine.open()` 先按 `ModelCatalog` 走 `ModelVerifier`（存在 → 大小 → SHA-256），任一步不合格抛 `AsrModelNotReadyException`，消息里点名缺哪个文件、目录在哪（用例 `模型不合格时引擎拒绝装载并把原因写清楚`）。**没有「文件在就用」**。设置页的下载/导入入口与「禁用转录入口」还没做（Phase 6 第 6 项）；**播放不受影响**（播放路径不加载模型） |
+| 推理 OOM | — **还没做**（Phase 6 第 4 项）。现在只有两条前置拒绝：单块 ≤20 s、样本数与块描述一致。装载 243 MB 模型在 2 GB RAM 真机上的峰值 RSS 未实测（模拟器上装载 ~4.9 s、识别 RTF 0.083~0.143，两轮同一素材差 1.6 倍，只能当量级看） |
 | 进程被杀 | 启动时 `recoverCrashedSessions`（幂等，任何写之前自动先跑）把残留 `ACTIVE` 行按最后一次 flush 结算为 `CRASHED` |
 | Room 迁移失败 | 不做 destructive 兜底；崩溃前记录并提示（正式版策略：修复迁移） |
 
 ## 9. UI 结构
 
-**现状（Phase 5 末）**：单 Activity + Compose Navigation，5 个目的地：`shelf`（全部/最近/收藏 tab + 搜索）✅ → `player/{audioId}`（播放/暂停、±15s、拖动、倍速 5 档、上下曲、收藏、停止、本首统计、**七句字幕窗口**：当前句高亮、点一句跳到该句起点、数量与来源常驻标注、无字幕时如实说明）✅ → `transcript`（**placeholder，标注 Phase 6**）→ `stats`（总时长/次数/完播 + 最近收听 + 规则说明）✅ → `settings`（**placeholder，标注 Phase 7**）。底部导航固定 4 个：书 / 转 / 统 / 设。主题 Material 3，Android 12+ 走 dynamic color（`dynamicColor=true`），深浅色由系统决定（App 内切换在 Phase 7）。
+**现状（Phase 6 第 1-3 项之后，UI 未变）**：单 Activity + Compose Navigation，5 个目的地：`shelf`（全部/最近/收藏 tab + 搜索）✅ → `player/{audioId}`（播放/暂停、±15s、拖动、倍速 5 档、上下曲、收藏、停止、本首统计、**七句字幕窗口**：当前句高亮、点一句跳到该句起点、数量与来源常驻标注、无字幕时如实说明）✅ → `transcript`（**placeholder，标注 Phase 6**）→ `stats`（总时长/次数/完播 + 最近收听 + 规则说明）✅ → `settings`（**placeholder，标注 Phase 7**）。底部导航固定 4 个：书 / 转 / 统 / 设。主题 Material 3，Android 12+ 走 dynamic color（`dynamicColor=true`），深浅色由系统决定（App 内切换在 Phase 7）。
 
 **尚未实现的目标（别当现状读）**：播放页从上往下滑出迷你条；设置页改字号与深浅色；「重算统计」入口；按文件夹的重新授权入口。这些都在 Phase 7。
 
@@ -303,8 +320,10 @@ controller.state.map { it.positionMs }        // 500ms tick，即 PlaybackPolicy
 | D21 | 书架那一格只描述**转录任务**状态（`transcription_state`），NONE 渲染成「未转录」而不是「无字幕」 | 手工导入的测试字幕故意不动 `transcription_state`（那列归 Phase 6 任务管线），于是一本有测试字幕的书在书架上仍是「未转录」——这句话是真的，而「无字幕」是假的。代价：想显示「有字幕」得让书架查询 JOIN 一次 `subtitle_segment`，为了一个 debug 通道不值得 |
 | D22 | Maven 仓库顺序按 `GITHUB_ACTIONS` 环境变量分岔：本机阿里云镜像优先，CI 只用官方源 | 实测两头的网络结论相反——本机 `repo1.maven.org` DNS 超时只能用镜像；runner 打 `maven.aliyun.com/repository/{gradle-plugin,public}` 对 KSP marker 回 **502**，而 Gradle 把 5xx 当致命错、不再试下一个仓库，最后报成「plugin not found」（run 38631763968 的状态码矩阵）。代价：`settings.gradle.kts` 有一处环境分支，且**本机无法复现 CI 的解析路径**（本机 `repo.maven.apache.org` 对 HEAD 回 403），只能靠远端实测把关。用 `GITHUB_ACTIONS` 而不是自建变量名，是为了让「在 CI 上」这件事不需要第二份配置 |
 | D23 | 38.7 MB 的 sherpa-onnx AAR 不进仓库，改由 **CI 按钉住的 SHA-256 从官方 release 取回**（配 `actions/cache`），本机缺失时 `app/build.gradle.kts` 在配置阶段抛异常打印 URL/大小/哈希 | 二进制入库会让每次 clone 都背 38 MB 且无法复核来源；静默自动下载又违背「不许偷偷拉几百 MB」（AGENTS.md §5）。让 CI 显式下载 + `sha256sum -c`，构建机与本机用同一份钉住值，取不到就红。代价：CI 依赖 GitHub release 的可用性（实测 runner 直连 13 MB/s，比本机还快），且 `app/build.gradle.kts` 多了一段人类可读的报错 |
-| D24 | 模型取回用 `HttpURLConnection`（`HttpFetcher`）而不是再引一个 HTTP 库；**先写 `<file>.part` → 比大小 → 算整份 SHA-256 → 才 `renameTo` 正式文件**，失败删 `.part`；续传只做**文件级**（已合格的文件跳过，半截的重下） | 项目里已有 Media3 与 WorkManager，为「下一个 243 MB 的文件」再引 OkHttp 不划算，`HttpURLConnection` 够用但要自己跟 `Location`（实测 hf-mirror 会重定向到 `/api/resolve-cache/…`，GitHub 更是 302 到对象存储）。「改名前必须整份校验」是为了让磁盘上永远不存在「名字对但内容坏」的模型——那种文件下一步就是被 `AsrEngine` 加载。不做 HTTP Range 续传的取舍：清单里每个文件的哈希是**整份**的，半截文件既不能部分校验也不能假装可用，加 Range 只会把「重下」这条唯一的正确路径变复杂；代价是弱网下 243 MB 要重来（`docs/asr-design.md` §7）。进度按**单调时钟**限流 250 ms 推一次，因为 `StateFlow` 是合并式的，回调密度再高 UI 也只能看到最后一个值 |
+| D24 | 模型取回用 `HttpURLConnection`（`HttpFetcher`）而不是再引一个 HTTP 库；**先写 `<file>.part` → 比大小 → 算整份 SHA-256 → 才 `renameTo` 正式文件**，失败删 `.part`；续传只做**文件级**（已合格的文件跳过，半截的重下） | 项目里已有 Media3 与 WorkManager，为「下一个 243 MB 的文件」再引 OkHttp 不划算，`HttpURLConnection` 够用但要自己跟 `Location`（实测 hf-mirror 会重定向到 `/api/resolve-cache/…`，GitHub 更是 302 到对象存储）。「改名前必须整份校验」是为了让磁盘上永远不存在「名字对但内容坏」的模型——那种文件下一步就会被 `SherpaOnnxEngine.open()` 加载。不做 HTTP Range 续传的取舍：清单里每个文件的哈希是**整份**的，半截文件既不能部分校验也不能假装可用，加 Range 只会把「重下」这条唯一的正确路径变复杂；代价是弱网下 243 MB 要重来（`docs/asr-design.md` §7）。进度按**单调时钟**限流 250 ms 推一次，因为 `StateFlow` 是合并式的，回调密度再高 UI 也只能看到最后一个值 |
 | D25 | 下载这条路径**必须**留一条打真实 URL 的仪器化用例，哪怕它不在 CI 门禁里、且会因上游不可达变红 | 实测理由：`AndroidManifest` 漏了 `INTERNET` 权限时，**35 条 JVM 单测一条都不红**——假 fetcher 与 host 上的临时 `HttpServer` 都不过 Android 的权限检查；而且设备栈帧里是 `com.android.okhttp.internal.huc.HttpsURLConnectionImpl`，Android 的 `HttpURLConnection` 底层是 Framework 自带的 OkHttp 移植，与 host JDK 那份不是同一套实现（TLS、重定向、HTTP 版本行为都可能不同）。代价：这条用例依赖外网可达，CI 没有模拟器 → 它是**本机一次性凭据**而不是持续回归网；所以 GitHub 连不上时选择**移除**那条用例并如实记录（`silero_vad.onnx` 至今没从设备取回过），而不是留一条红色的假警报 |
 | D26 | 采样率转换**自己写**（`domain/asr/SincResampler`：窗口 sinc / Blackman、每侧 16 抽头、按 `j*L/M` 的整数相位查系数表、每相位归一到直流增益 1），而不是线性插值、也不是引第三方重采样库 | 三个选项都实测过：① Media3 1.11.1 **没有**现成实现——`media3-common-1.11.1.aar` 的 `classes.jar` 里类路径含 `resampl` 的条目 **0 条**（`AudioResamplingAudioProcessor` 已不在该产物中），`media3-decoder-1.11.1.aar` 只剩 `Buffer/Decoder/SimpleDecoder` 一族（没有 `MediaDecoder`）；② 线性插值等于**不做低通**，44.1/48 kHz 书解里 8 kHz 以上的成分会整块折进 0–8 kHz，模型吃的是它没见过的噪声，而字幕上只会表现为「偶尔识别得差」，几乎无法归因；③ 引 libsamplerate/SoX 之类违背 AGENTS.md §3「不引未实测的大框架」，而这件事只需要一个有理数比的 FIR。实测（1 秒单频正弦 + 相干 DFT）：1/3.5/5 kHz 平坦（≤ −0.09 dB），7 kHz −2.2 ~ −2.4 dB，会折进输出 4 kHz 的 12 kHz 压到 **−69 ~ −78 dB**，20 kHz −91 dB；代价是 33 抽头在通带末端那 2 dB 跌落（要抹平得翻倍抽头，转录时间换边际收益，不做）与头尾各 ~1 ms 的边缘样本不准（常数 0.25 输入实测首样本 0.170、末样本 0.267）。另两条设计约束来自踩坑：产出判据只认「中心样本还在数据里」（否则同采样率下的恒等性质被末尾几个零填充样本破坏），以及系数表按**约分后的有理数**建（44.1k→16k 只有 160 个相位，不是每样本重算一次） |
 | D27 | 分块与绝对时间偏移放在 `domain/asr/AsrChunkPlanner`（纯 Kotlin），`PcmChunkPlan` 带 `startSample/startMs/endMs`，**不在编排层用「累计时长」推时间** | FR-505 要求第 N 段的句时间戳落在绝对位置上。用「上一段末尾 + 本段时长」推 offsets 会把每段几毫秒的取整误差一路累加，180 段（1 小时）就是几百毫秒的漂移；改成一律 `startSample * 1000 / 16000`，单测用 180 段连续音频断言 `endMs == 3_600_000`（零漂移）钉住。>20s 的段**均分**成 `ceil(N/max)` 块（不是切满 20s 留一个尾巴块），避免最后剩个几百毫秒的小块——那既是一整次推理的固定开销，也最容易出空结果 |
 | D28 | `PcmDecoder` 用 `MediaCodec` **同步模式 + 贪心喂入**（一次把能塞的输入都塞进去，本轮有产出就用 0 超时非阻塞继续取，两头都不动才等 10 ms），不用异步回调 API，也不逐「一进一出」 | 实测代价与收益：一进一出时解码器经常没活干，每轮都在 `dequeueOutputBuffer` 的超时上干等——148 s 真素材 27,974 ms（RTF 0.189）；改贪心后 24,557 ms（RTF 0.166），**产出字节序列逐样本相同**（`outSamples 2,378,188`、581 块、`peak/rms` 一致），所以这是调度而非算法改动。不选异步回调（`setCallback` + `MediaCodec.Callback`）：回调跑在专用线程上，要自己做「回调线程 ↔ 调用方取消」的同步与缓冲生命周期管理，而转录本来就在 `Dispatchers.IO` 协程里跑，同步模式 + 协程取消位（`PcmChunkSink` 返回 false）已经够用且状态全在一条栈上看得清。兜底：连续 3,000 轮（≈30 s）两头不动就抛 `PcmDecodeException`，不让任务无限挂住 |
+| D29 | 逐字时间戳的换算**独立成纯 Kotlin 的 `TokenTimingMapper`**，单位按实测钉死为**秒**（`timestamps` 相对本块起点），`durations` 数组长度是 **0** 所以每字的 `endMs` 取**下一个字的起点**、末字收到块末尾；任何自相矛盾（字数≠时间戳数、NaN/Inf、负数、越块、倒序）抛 `TokenTimingMapper.Mismatch`，**不返回半份结果也不猜缺的是哪一个** | 这是全项目最容易自欺的一环：猜错单位是整条字幕偏移 1000 倍，而它不会崩、只会「看起来有点不对」。所以三条判据都写成了设备断言（`逐字时间落在块内且单调` + 反向对照 `把秒当成毫秒喂进换算器会立刻抛错`），而不是靠日志里看一眼。`endMs` 不猜的代价：相邻字挤在同一毫秒会得到零长字幕，实测存在且合法，UI 靠 `SubtitleSynchronizer` 的 gap 迟滞吸收。数量不等也绝不「按少的对齐」——真出这种结果说明模型与封装版本不匹配，静默对齐就是把未知错误写进字幕表 |
+| D30 | `VadSegmenter` 是**流式**的（`push(FloatArray)` → 段列表，`finish()` 收尾），并且把**段内样本一起带回来**（`VadUtterance(startSample, samples)`），而不是只报区间让调用方回头再读一遍音频 | 内存账：1 小时书解 = 3.6×10⁷ 样本 = 144 MB float（还有解码中间态），而实测最长语音段 118,720 样本 ≈ 0.48 MB → 峰值只需 1 个输入块 + 512 样本窗 + 已出段。只报区间的写法要么整章进内存，要么解码两遍（这台设备 148 s 素材单趟解码就 8.9 s，RTF 0.15，两遍直接翻倍）。副作用实测：喂入块长（4096/1024/3000/整串一次）不影响分段结果——同一批样本吐出完全相同的 `(startSample, len)` 列表，这条已做成用例，就是「攒不满一窗的尾巴要留住」的实现契约。另外**不给 `AsrEngine` 套接口**：目前只有一个实现、没有假引擎可注入，代价是推理层只能上设备测（JVM 侧退到 `TokenTimingMapper`/`AsrChunkPlanner`），等真需要第二个引擎时再抽 |

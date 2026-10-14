@@ -26,7 +26,7 @@ source ~/android-dev/env.sh     # 否则 GRADLE_USER_HOME 退回 ~/.gradle，且
 | 远端 CI | `gh run list` / `gh run view <id> --log-failed` | 仓库 `https://github.com/xinchentechnote/EchoMind`（私有），工作流 `.github/workflows/ci.yml`：push/PR 跑 `assembleDebug` + `testDebugUnitTest` 并上传 APK。**判定成败要读 `--json conclusion`**，`gh run watch` 接了管道就拿不到退出码 |
 | 仪器化测试（CI 覆盖不到） | 只能本地 `adb install -r` + `am instrument` | **CI 里没有模拟器**，那 52 项（48 项 Room/Repository + 4 项真实 URL 下载）仍然只有本机会跑（决定与代价见 `docs/environment.md` §8） |
 
-### 2b. 设备自动化实测到的坑（Phase 3 / 5）
+### 2b. 设备自动化实测到的坑（Phase 3 / 5 / 6）
 
 - `connectedDebugAndroidTest` **会清掉被测 App 的数据**：跑完 `dumpsys package` 显示 `notLaunched=true`，`databases/` 目录消失，SAF 持久化授权随之失效，App 也被卸载。之后要 `adb install -r` 重装并重新走一遍文件夹授权。→ 设备验证排在仪器化测试之后。
 - `uiautomator dump` 在「刚启动 / 刚点过一下」之后经常返回 `ERROR: null root node returned by UiTestAutomationBridge`。它失败时**既不写也不删**目标文件：必须 `adb shell rm -f /sdcard/em.xml` → dump → `pull` → 校验 `</hierarchy>`，并重试（本项目实测 2~3 次内成功）。只删本地副本不够。
@@ -39,15 +39,17 @@ source ~/android-dev/env.sh     # 否则 GRADLE_USER_HOME 退回 ~/.gradle，且
 - `dumpsys media.session` 在服务名上是 `media_session`（下划线）；`media.session` 会返回 `Can't find service`。队列里正在播哪一首看 `metadata: … description=<标题>` 与 `state=… position=…`。
 - 播放页 dump 出来的 `0:08 / -0:36` 这类读数要拿去和 `audio_book.duration_ms` 对账：两者相加就是当前这一首的时长。Phase 5 有一次「字幕没刷新」的疑似 bug 就是这样破的——实际是短曲播完自动切到了下一首（那一首确实没字幕）。
 - **仪器化测试的方法名不能带空格**（Phase 6 实测）：`minSdk = 26` 时 D8 出的是 dex 039，`Space characters in SimpleName '…' are not allowed prior to DEX version 040` 直接把 `dexBuilderDebugAndroidTest` 打停。JVM 单测不经过 dex，所以 `app/src/test/` 里那批带空格的中文名字一直是合法的——只有写进 `androidTest` 才会炸。
+- **`adb shell mkdir` 在 `/sdcard/Android/data/<pkg>/files/` 下建的子目录 App 读不到**（Phase 6 实测）：属主变成 `root`（`drwxrws--- root ext_data_rw`），App 侧 `File.isFile` 一律 false，表现是「文件明明 `ls` 得到，测试却报缺模型」。要把模型/素材放进 App 私有目录就用 `run-as`：`adb push <file> /data/local/tmp/x` → `adb shell run-as <pkg> sh -c 'cat /data/local/tmp/x > files/models/<id>/<file>'`。顺带好处是布局与生产 `filesDir/models` 一致。
+- **`am instrument` 不清数据**（与 §2b 第一条对照）：只有 `connectedDebugAndroidTest` 会重装并清空，`adb install -r -t` + `am instrument -w` 这条路跑完整套件后 SAF 授权与库都在。
 - **测音频内容必须自己数零字节**（Phase 6 实测）：书架那批「《三体》」素材帧体 99% 是 `0x00`，也就是静音。它能通过所有「长度类」断言（时长、进度、切歌、样本数），所以只要断言里出现 `peak`/`rms`，就必须同时准备**一份真音频**和**一份静音对照**。素材放 `getExternalFilesDir("asr-fixtures")`：读写自己的 external 目录不需要运行时权限，`adb push` 就能放。
 
 ## 3. 测试分层策略
 
 | 层 | 位置 | 覆盖内容 |
 | --- | --- | --- |
-| 纯 JVM 单测 | `app/src/test/` | **已有（155 项）**：`AudioTreeWalker`（8）、`AudioImportPlanner`（9）、`TitleDeriver`（7）、`Format`（5）、`ShelfViewModel`（2）、**`SessionTracker`（22：有效次边界、倍速只放大消耗量、墙钟跳变、缓冲/暂停不计时、拖到末尾不完播、切歌先结算上一场）**、**`PlayerViewModel`（10：按记忆位置起播、已在播不重开、听完从头播、自动切歌换页头、收藏作用于正在播的那本、书不在书架不起播、字幕窗口跟随位置、切歌后换成另一套字幕、导入写进正在播的那本、同一句内部推进不重发窗口）**、**`SubtitleSynchronizer`（11：首句/中间/末句、空表、位置在首句之前、gap 迟滞、5000 句二分）**、**`TestSubtitleParser`（9：SRT/VTT/TSV、缺小时与一位小数毫秒、乱序重排、`end ≤ start` 拒绝、空文件失败）**、**`ModelCatalog`/`ModelVerifier`/`ModelManager`（10 + 9 + 16：清单合法性、SHA-256 测试向量、下载与断点状态机）**、**`PcmConversion`（11）/`SincResampler`（12：恒等、常数增益、通带与阻带实测频响、分块==一次性、生产调用形状、`reset()`、长度 `ceil(N·out/in)`）/`AsrChunkPlanner`（14）**。**待补**：`SentenceSplitter`（标点/无标点/异常时间戳）——属 Phase 6 第 5 项 |
-| 仪器化测试 | `app/src/androidTest/` | **已有（56 项）**：Room DAO 读写与唯一索引（11）、`AudioRepositoryImpl` 的导入编排（9）、`PlaybackRepository`（21：会话行生命周期、flush 覆盖写不累加、结算的事务性、增量==重算、重算能修正被写坏的缓存、崩溃恢复标 `CRASHED`/幂等/短会话不计次、删书保留历史、倍速只落自己那一列、时长未知不覆盖已知）、**`Migration_1_2_Test`（3：v1→v2 结构对导出 JSON、历史保留、FK 与索引存在）**、**`SubtitleRepositoryTest`（4：索引连续、整本替换、摘要分辨来源、删书连带删字幕但留历史）**、**`ModelManagerNetworkTest`（4：真 URL 下载、重定向、404 不落地、校验失败）**、**`PcmDecoderTest`（4：真 MP3 解码 148s 素材、时长对账 0.22%、块连续与 ±1 幅度、静音对照、取消、非音频报错）**。**待补**：SAF 真实 URI 扫描、转录结果入库 |
-| 手工设备验证 | 见 §6 | 耳机拔出、低内存、真实模型推理、飞行模式；焦点抢占与后台播放已在模拟器实测（§4 Phase 4），七句窗口与点句跳转已实测（§4 Phase 5） |
+| 纯 JVM 单测 | `app/src/test/` | **已有（169 项）**：`AudioTreeWalker`（8）、`AudioImportPlanner`（9）、`TitleDeriver`（7）、`Format`（5）、`ShelfViewModel`（2）、**`SessionTracker`（22：有效次边界、倍速只放大消耗量、墙钟跳变、缓冲/暂停不计时、拖到末尾不完播、切歌先结算上一场）**、**`PlayerViewModel`（10：按记忆位置起播、已在播不重开、听完从头播、自动切歌换页头、收藏作用于正在播的那本、书不在书架不起播、字幕窗口跟随位置、切歌后换成另一套字幕、导入写进正在播的那本、同一句内部推进不重发窗口）**、**`SubtitleSynchronizer`（11：首句/中间/末句、空表、位置在首句之前、gap 迟滞、5000 句二分）**、**`TestSubtitleParser`（9：SRT/VTT/TSV、缺小时与一位小数毫秒、乱序重排、`end ≤ start` 拒绝、空文件失败）**、**`ModelCatalog`/`ModelVerifier`/`ModelManager`（10 + 9 + 16：清单合法性、SHA-256 测试向量、下载与断点状态机）**、**`PcmConversion`（11）/`SincResampler`（12：恒等、常数增益、通带与阻带实测频响、分块==一次性、生产调用形状、`reset()`、长度 `ceil(N·out/in)`）/`AsrChunkPlanner`（14）**、**`TokenTimingMapper`（14：秒→绝对毫秒、`endMs`=下一字起点、末字收块尾、取整只向下、数量不等/负值/NaN/越界/倒序一律抛 `Mismatch` 而不猜、同毫秒零长 token 合法）**。**待补**：`SentenceSplitter`（标点/无标点/异常时间戳）——属 Phase 6 第 5 项 |
+| 仪器化测试 | `app/src/androidTest/` | **已有（70 项）**：Room DAO 读写与唯一索引（11）、`AudioRepositoryImpl` 的导入编排（9）、`PlaybackRepository`（21：会话行生命周期、flush 覆盖写不累加、结算的事务性、增量==重算、重算能修正被写坏的缓存、崩溃恢复标 `CRASHED`/幂等/短会话不计次、删书保留历史、倍速只落自己那一列、时长未知不覆盖已知）、**`Migration_1_2_Test`（3：v1→v2 结构对导出 JSON、历史保留、FK 与索引存在）**、**`SubtitleRepositoryTest`（4：索引连续、整本替换、摘要分辨来源、删书连带删字幕但留历史）**、**`ModelManagerNetworkTest`（4：真 URL 下载、重定向、404 不落地、校验失败）**、**`PcmDecoderTest`（4：真 MP3 解码 148s 素材、时长对账 0.22%、块连续与 ±1 幅度、静音对照、取消、非音频报错）**、**`VadSegmenterTest`（6：真模型分段且起点是 16k 样本号、段不重叠、`maxSpeechDuration` 强制切段生效、同一音频不同喂入块长结果一致、release 后不可用、主线程拒绝构造、缺文件/非 16k 给人话错）**、**`SherpaOnnxEngineTest`（8：设备侧按清单核对 243 MB、逐字时间落在块内且单调（单位=秒）、端到端解码→VAD→分块→识别跨块时间单调、>20s 与样本数不符都拒绝、缺模型报错点名文件、主线程拒绝装载、秒当毫秒立刻抛）**。**待补**：SAF 真实 URI 扫描、转录结果入库 |
+| 手工设备验证 | 见 §6 | 耳机拔出、低内存、飞行模式；**本地推理已在模拟器实测**（§4 Phase 6 第 3 项终：真模型装载 + 端到端识别），焦点抢占与后台播放已在模拟器实测（§4 Phase 4），七句窗口与点句跳转已实测（§4 Phase 5） |
 
 约束：`domain` 包不得 import `android.*`（这是「能在 JVM 里测」的前提）；`TimeSource` 注入假时钟，因此时长类断言不依赖真实时间流逝。实测这条约束确实成立——`SessionTrackerTest` 全程没有 Robolectric、没有设备。
 
@@ -413,14 +415,50 @@ FR-707（只在当前句变化时更新）用**设备 + 单测两头**取证：�
 - **缺真语音素材**（本轮新暴露的阻塞）：转录精度需要一段 3~10 分钟中文书解，机器上现在只有静音占位与歌曲。要么用户提供，要么等模型跑通后现场录一段。
 - `SpeechSegment.start` 与 `timestamps` 的单位**仍未验证**——这条从上一轮原样带过来，要等 `SherpaOnnxEngine` 落地才能钉死。
 
-## 5. 待补的自动化测试清单（按阶段）
+### Phase 6 第 3 项（终）：silero VAD + 第一次真推理（2026-10-15 06:30 ~ 07:25，含复跑）
+
+`asr/VadSegmenter.kt`（流式窗缓冲 + `VadUtterance`）、`asr/SherpaOnnxEngine.kt`（`OfflineRecognizer`，文件系统路径、`assetManager = null`）、
+`domain/asr/TokenTimingMapper.kt`（秒 → 绝对毫秒，纯 Kotlin）+ 14 条 JVM 单测 + 6 条 VAD 仪器化 + 8 条推理仪器化。
+**上一轮遗留的两个「不许猜」的单位问题在这一轮被真数据钉死，ASR 第一次产出可用于字幕的逐字时间。**
+
+| 动作 | 结果 | 凭据 |
+| --- | --- | --- |
+| 先把探针跑一遍（不交付） | 写完 `SherpaFirstInferenceProbeTest` 直接在设备上量：`段0 start=223904`、`timestamps[0]=13.599999 … last=19.32`、`tokens=13 timestamps=13 durations=0`。探针里那条 `start % 512 == 0` 断言**跑红了**——它是我猜的判据，不是模型的判据 | logcat `SherpaProbe`；探针文件本轮结束时删除，结论改由正式测试守护 |
+| **单位结论①** `SpeechSegment.start` | **16 kHz 下的样本下标**，且落在 1 ms（= 16 样本）网格上。判据：60 s 素材喂进 VAD 得 962,560 样本 = 60,160 ms，而 9 个 start 全是六位数量级（`223904 … 944288`），当毫秒解释比整篇长 15 倍 → 只能是样本号；`start % 16 == 0` 逐段成立，`% 512` 不成立（说明它对齐到毫秒而不是窗边界） | `VadSegmenterTest.真素材流式分段起点是16k样本下标且段与段不重叠`（断言 `%16==0` 且 `start+len ≤ 总样本`） |
+| **单位结论②** `timestamps` | **秒**，相对这一块音频。19.2 s 的块给出 13 个 token、首个换算出 **13,580 ms**（原值 ≈13.58 s；更早那轮探针在 20.224 s 的块上读到 13.599999~19.32，两个数字互相印证）。当毫秒解释整条轴会往前错 1000 倍、立刻出块。`durations` 长度实测 **0** → Paraformer 不给每字时长，所以 `endMs` 只能取**下一个字的 `startMs`**（末字收到块末尾）：起点仍是模型原值，不是均分伪造 | `SherpaOnnxEngineTest.逐字时间落在块内且单调单位是秒`；`TokenTimingMapperTest.每个字的结束就是下一个字的开始…` |
+| 反向对照：把秒当毫秒会怎样 | 正式测试里把已换算的毫秒再当秒喂一次 → `TokenTimingMapper` 立刻抛 `Mismatch`（越界），而不是夹回块内产出漂移字幕 | `SherpaOnnxEngineTest.把秒当成毫秒喂进换算器会立刻抛错…` |
+| 模型怎么摆到设备上 | 先按上一轮的做法 `adb shell mkdir` + `adb push` 到 external 目录 → **App 读不到**：`adb shell mkdir` 建的子目录属主是 `root`（`drwxrws--- root ext_data_rw`），App 侧 `file.isFile` 直接返回 false，6 条 VAD 测试里 5 条报「缺少模型」。改用 `run-as`：`adb push` 到 `/data/local/tmp` → `run-as com.xinchen.echomind sh -c 'cat … > files/models/<id>/<file>'`，于是文件归 App 自己，**目录布局也与生产 `AppGraph.modelsRoot = filesDir/models` 完全一致** | 首轮 instrument 输出（5 条 fail 的报错文本）+ `run-as … ls -l files/models` |
+| 设备侧核对三个模型 | `ModelVerifier.verify(paraformer, filesDir/models)` → OK；目录合计 **243,446,974 B** 与清单 `totalBytes` 逐项相等；`silero_vad.onnx` 643,854 B 亦按清单核对通过。**注意：这证明的是「搬上来的这份与清单一致」，不等于「设备能从网络下载它」** | `SherpaOnnxEngineTest.设备侧按清单复核识别模型的三个文件` 日志行 |
+| 第一次真推理（单块） | 19.2 s 真音频 → `text=「那片笑声让我想起我的那些年」`、`tokens=13`、首字 13,580 ms、末字收到 19,200 ms、`decodeMs=2749` → **RTF 0.1432**；引擎装载 `OfflineRecognizer` 实测 **4,906 ms**（后台线程，主线程构造被 `check` 拒掉） | logcat `SherpaEngineTest` |
+| 第一次端到端（解码 → VAD → 分块 → 识别） | 前 60 s 素材：VAD 出 9 段（`lenList=[31168 … 18272]`，最长 118,720 样本 = 7.4 s，无一超 20 s），逐块识别取前 6 块 → **58 个 token**、跨度 14,134~49,446 ms、跨块时间单调、`RTF(纯识别)=0.1313`、`RTF(纯VAD)=0.0170`（1,021 ms / 60,160 ms）。识别出的原文（节选）：`在我生命每一个角落静静为我开着` / `我曾以为我会永远守在他身旁` / `今天我们已经离去在人海茫茫` / `他们都老了吧` | 两条测试的 logcat 全行 |
+| 切块边界会影响识别结果（如实记录） | 同一段歌词：整块 20 s 喂进去给「那片笑声让我想起我的那些**年**」，VAD 切成 13,994~15,942 ms 与 16,234~20,166 ms 两块则给「**偏**笑声让」「想起我的那些**话**」。**逐字时间仍然有效**（都在自己块内、跨块单调），但文本与断句随块边界变化 → 字幕按块拼句时不能假设「块边界 = 句子边界」，这正是 Phase 6 第 5 项 `SentenceSplitter` 要处理的 | 上面两行的日志对比 |
+| 一条测试自己错了 | `同一素材不同解码块长得出一模一样的分段` 首轮红：`4096 → (259744, 63840)` vs `1024 → (259744, 60768)`。根因**不在 VAD**：测试用「解到第 20 秒就停」当输入，两种块长的停止点相差 3,072 样本（323,584 vs 320,512），最后一截是 `flush()` 出来的，自然不等长。改成**同一份 `FloatArray`、只换每次 `push` 的长度**（4096 / 1024 / 3000（与 512 不整除）/ 单块）后四者完全一致 → 窗缓冲实现是对的，`%512` 那类「按窗对齐」的猜想确实是错的 | 失败断言原文 + 改名后 `OK (6 tests)` |
+| VAD 的两条边界事实 | ①`minSpeechDuration` 不约束 `flush()` 出来的最后一截（本轮最长素材的第一段 1,948 ms、最后一段 1,142 ms），断言只对 `dropLast(1)` 成立；②`maxSpeechDuration=20s` 的强制切段**实测生效**（9 段全部 ≤20 s），所以 `AsrChunkPlanner` 是第二道保险而不是摆设 | `VadSegmenterTest` 两条断言 |
+| 引擎的三条护栏 | ①超 20 s 的块（21 s，故意用 `maxChunkMs=30_000` 绕过规划器）→ `AsrInputException`，不悄悄截断；②`samples.size ≠ chunk.sampleCount` → `AsrInputException`；③`modelsRoot` 下没有模型 → `AsrModelNotReadyException`，消息里点名 `model.int8.onnx 不存在`、`tokens.txt 不存在` 并给出目录；④`release()` 幂等，release 后再 `push`/`recognize` 立刻抛，不会 use-after-free | `SherpaOnnxEngineTest` 4 条 + `VadSegmenterTest.release之后再喂要立刻报错` |
+| 主线程护栏真的会拦 | 两条测试都用 `runOnMainSync { … }` 构造 → 都在 native 加载之前抛 `IllegalStateException`（VAD 与识别器各一条） | `VadSegmenterTest.主线程构造要直接拒绝`、`SherpaOnnxEngineTest.主线程装载模型要直接拒绝` |
+| `AudioFormats` 补常量 | `VAD_WINDOW_SAMPLES/THRESHOLD/MIN_SILENCE_SEC/MIN_SPEECH_SEC/MAX_SPEECH_SEC` + `ASR_FEATURE_DIM=80`/`ASR_DITHER=0f`/`ASR_NUM_THREADS=2`（都是设备上装载成功的那组值），并把清单里的文件名收进 `ModelCatalog.PARAFORMER_MODEL_FILE` 等常量，避免 `asr/` 两处写死同一字符串（AGENTS.md §3） | `grep -c` 确认无重复字面量 |
+| 本轮最终构建 | `assembleDebug` **BUILD SUCCESSFUL**；JVM `testDebugUnitTest --rerun` **169 / 0 failures / 0 skipped**（16 个类，从 XML 汇总脚本读出）；仪器化整套件 `am instrument -w` **OK (70 tests)**，耗时 104.4 s（其中推理 29.6 s、VAD 13.2 s） | 测试 XML 汇总 + instrument 输出 |
+| **复跑整套件（同日 07:19，为了看结果稳不稳）** | 结论：**内容完全可复现，耗时不可**。复现的部分——58 个 token、跨度 14,134~49,446 ms、9 段 `startList=[223904 … 944288]` 与 `lenList` 逐项相同、块文本逐字相同（`偏笑声让` / `想起我的那些话` / …）、`durations` 仍为空、模型目录仍 243,446,974 B、整套件仍 OK (70 tests)（81.8 s）。抖动的部分——`decodeMs` 端到端 3,922 → 2,467（RTF 0.131 → **0.083**）、单块 2,749 → 2,564（0.143 → **0.134**）、VAD 1,021 → 1,211 ms（0.0170 → **0.0201**）、装载 4,906 → **4,914 ms**。**所以文档里所有 RTF 都只当量级看，别当指标**（AGENTS.md §5 的诚实性要求也适用于我自己的数字） | 第二次 `adb logcat -d -s SherpaEngineTest:I VadSegmenterTest:I` 全行 |
+| APK 尺寸不是逐字节可复现的 | 同一天三次构建读出 40,889,235 / 40,951,147 / **40,859,995 B**（`--rerun-tasks` 全量重建后），相差最大 ~91 KB。代码在这几次之间只有注释与文档改动，所以差异来自打包环节（未 minify；具体成因未查，不在本轮范围）。**结论：以后只按「~40.9 MB」记量级，不再把字节数当回归判据** | 三次 `ls -l app/build/outputs/apk/debug/app-debug.apk` |
+
+**这一轮没做 / 做不了**：
+
+- **还没有生产调用方**：`VadSegmenter`/`SherpaOnnxEngine`/`TokenTimingMapper` 只被测试调用，`AppGraph` 里没有它们，
+  `transcript_job` 表与 `TranscriptCoordinator` 还没写 → **「点一下就能转录并出字幕」仍未交付**（Phase 6 第 4、6 项）。
+- **识别文本没做人工抽查**：素材是歌曲《那些花儿》，本轮只证明了「时间落在块内、跨块单调、RTF 可行」，
+  **没有**对 10 处字幕做时间对齐误差抽查（FR-506 要求 ±ms 分布）。需要一段真中文书解才能测精度，机器上仍然没有。
+- **只测了 60 s 内的音频**：一小时书的峰值内存、`filesDir/models` 被 `ModelManager.delete()` 之后的重下载路径、
+  推理中途取消，都没有覆盖。
+- **模型是 `adb` 搬上去的**：`model.int8.onnx` 与 `silero_vad.onnx` 至今没在设备上通过 HTTP 取回过（GitHub 不通、243 MB 走 hf-mirror 未测）。
+- 内存：模拟器 2.5 GB（可用 ~1.2 GB），本轮把 VAD + 识别器同时装过一次（端到端测试）而没测峰值 RSS；真机 2 GB 机器上的表现未知。
+
 
 | Phase | 用例 |
 | --- | --- |
 | 3 | **已覆盖**：递归 3 层子目录 + 扩展名白名单 + 深度/数量截断；连续扫描不产生新记录；同一 URI 重复出现只算一次；size/mtime 变化 → CHANGED 且字幕标 EXPIRED、手改标题不被覆盖；文件消失 → MISSING 且不删记录；文件原样回来 → MISSING 翻回 PRESENT；跨文件夹重复文件留在原文件夹；授权无法持久化 → 导入失败不写库；重扫跳过授权失效文件夹但继续其他文件夹；时长读取失败 → `duration_read_failed`；书架 tab/搜索状态与查询同源。**待补（依赖 Phase 4 的会话表）**：消失文件的收听历史仍然保留 |
 | 4 | **已覆盖**：4.9s 不计次 / 5.0s 计次；缓冲+暂停+焦点丢失不计时；2x 播 10min → `listened_ms=600000`、`consumed_audio_ms=1200000`；拖到末尾不完播；1.5x 听完 → 完播；两次听完 → 完播 2；崩溃恢复不重复累计（含幂等与「不结算之后的新会话」）；重算与增量一致；重算能修正被写坏的缓存；切歌结束旧会话；删书保留 `listening_session`；统计只算已结算行；倍速只落自己那一列；时长未知不覆盖已知时长。**待补（最大的一块）**：`Media3PlaybackController` 零测试——需要 Media3 `SimpleBasePlayer` 当 `Player` 替身才测得动，而「自动切歌不换倍速」这个真 bug 正是因为没有这层测试才只能在设备上撞见。另待补：消失文件的收听历史仍然保留 |
 | 5 | **已覆盖**：首句/中间/末句窗口与不补位；空字幕表与「位置还在首句之前」（`currentIndex=-1`）；gap 内不跳动、越过 `start-250ms` 才切；seek 后窗口更新；5000 句二分正确性；换曲后重挂字幕流；导入解析（SRT/VTT/TSV、缺小时格式、一位小数毫秒、乱序重排、`end ≤ start` 整份拒绝、空文件失败）；单事务整本替换；删书连带删字幕且历史留着。**待补**：真实 ASR 产出的时间重叠/倒退（要 Phase 6 的模型输出）、长句换行的高亮目视（fixture 每句都短）|
-| 6 | **已覆盖（2026-10-15，纯逻辑层 + 解码层）**：分段绝对偏移（第 N 段不从 0 开始、180 段零漂移、块间不重叠不留缝）；>20s 段均分且各块长度最多差 1 样本；空段/负起点段跳过；`msOf`/`samplesOf` 换算与取整；16-bit LE 字节序与 ±1 缩放；多声道均值下混（反相 → ≈0、单侧 → 减半）与尾字节如实报出；重采样恒等性/常数增益/通带与阻带频响/分块==一次性/生产调用形状/`reset()`/输出长度 `ceil(N·out/in)`；**设备上真 MP3 解码**（148s 立体声素材：样本数对账偏差 0.22%、581 块首尾相接、幅度落在 ±1、`peak=0.659`、单缓冲上界 4,608 B 与文件长度无关、取消只交付 3 块、非音频文件给人话异常、静音素材解出全零）。**待补**：`VadSegmenter` 与 `SherpaOnnxEngine`（含 `timestamps`/`SpeechSegment.start` 单位验证、推理 RTF）、无标点长文本切句、异常时间戳清洗、取消/重试状态机、重转替换的原子性、`FakeAsrEngine` 端到端入库、m4a/FLAC 容器 |
+| 6 | **已覆盖（2026-10-15，纯逻辑层 → 解码层 → VAD → 真推理）**：分段绝对偏移（第 N 段不从 0 开始、180 段零漂移、块间不重叠不留缝）；>20s 段均分且各块长度最多差 1 样本；空段/负起点段跳过；`msOf`/`samplesOf` 换算与取整；16-bit LE 字节序与 ±1 缩放；多声道均值下混（反相 → ≈0、单侧 → 减半）与尾字节如实报出；重采样恒等性/常数增益/通带与阻带频响/分块==一次性/生产调用形状/`reset()`/输出长度 `ceil(N·out/in)`；**设备上真 MP3 解码**（148s 立体声素材：样本数对账偏差 0.22%、581 块首尾相接、幅度落在 ±1、`peak=0.659`、单缓冲上界 4,608 B 与文件长度无关、取消只交付 3 块、非音频文件给人话异常、静音素材解出全零）；**设备上真 VAD**（9 段、起点=16k 样本下标且 `%16==0`、段不重叠、`maxSpeechDuration` 生效、不同喂入块长结果一致）；**设备上真推理**（逐字 `timestamps` 单位=秒、落在自己块内、跨块单调、`durations` 空所以 `endMs` 取下一字起点、>20s 与样本数不符被拒）。**待补**：无标点长文本切句、异常时间戳清洗、取消/重试状态机、重转替换的原子性、转录结果入库（`FakeAsrEngine` 或真引擎）、字幕时间对齐误差人工抽查（FR-506）、m4a/FLAC 容器 |
 | 迁移 | **已覆盖 MIGRATION_1_2**：`MigrationTestHelper` 对导出 `2.json` 校验（`recreateTableOnMigrationError=false`）、已有书籍与收听历史保留、FK 与索引存在。规则不变：每条新 Migration 都要有对应测试，`fallbackToDestructiveMigration` 保持不出现 |
 
 ## 6. 只能人工/真机验证的项（尚未执行，勿声称完成）

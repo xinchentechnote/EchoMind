@@ -53,6 +53,11 @@ object ModelCatalog {
     const val PARAFORMER_ID = "paraformer-zh-2023-09-14-int8"
     const val SILERO_VAD_ID = "silero-vad"
 
+    /** 包内文件名也是清单的一部分：引擎按名字取文件，别处不许再抄一遍字符串。 */
+    const val PARAFORMER_MODEL_FILE = "model.int8.onnx"
+    const val PARAFORMER_TOKENS_FILE = "tokens.txt"
+    const val SILERO_VAD_MODEL_FILE = "silero_vad.onnx"
+
     private const val HF_MIRROR = "https://hf-mirror.com/csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14/resolve/main"
     private const val HUGGINGFACE = "https://huggingface.co/csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14/resolve/main"
 
@@ -62,18 +67,18 @@ object ModelCatalog {
         role = ModelRole.Recognizer,
         files = listOf(
             ModelFileSpec(
-                fileName = "model.int8.onnx",
-                url = "$HF_MIRROR/model.int8.onnx",
-                backupUrls = listOf("$HUGGINGFACE/model.int8.onnx"),
+                fileName = PARAFORMER_MODEL_FILE,
+                url = "$HF_MIRROR/$PARAFORMER_MODEL_FILE",
+                backupUrls = listOf("$HUGGINGFACE/$PARAFORMER_MODEL_FILE"),
                 expectedBytes = 243_371_218L,
                 // HuggingFace LFS 发布的就是这个 sha256（tree API 的 oid 字段），算官方给的
                 officialSha256 = "f36a0433bcf096bd6d6f11b80a3ac8bed110bdca632fe0d731df8d1a84475945",
                 pinnedSha256 = "f36a0433bcf096bd6d6f11b80a3ac8bed110bdca632fe0d731df8d1a84475945",
             ),
             ModelFileSpec(
-                fileName = "tokens.txt",
-                url = "$HF_MIRROR/tokens.txt",
-                backupUrls = listOf("$HUGGINGFACE/tokens.txt"),
+                fileName = PARAFORMER_TOKENS_FILE,
+                url = "$HF_MIRROR/$PARAFORMER_TOKENS_FILE",
+                backupUrls = listOf("$HUGGINGFACE/$PARAFORMER_TOKENS_FILE"),
                 expectedBytes = 75_756L,
                 officialSha256 = null,
                 pinnedSha256 = "59aba8873a2ed1e122c25fee421e25f283b63290efbde85c1f01a853d83cb6e6",
@@ -87,7 +92,7 @@ object ModelCatalog {
         role = ModelRole.VoiceActivityDetector,
         files = listOf(
             ModelFileSpec(
-                fileName = "silero_vad.onnx",
+                fileName = SILERO_VAD_MODEL_FILE,
                 url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
                 backupUrls = emptyList(),
                 expectedBytes = 643_854L,

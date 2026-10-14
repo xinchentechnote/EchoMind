@@ -38,3 +38,35 @@ data class PcmChunkPlan(
         require(endMs >= startMs) { "endMs=$endMs 早于 startMs=$startMs" }
     }
 }
+
+/**
+ * 一个字/词和它的**绝对**时间（整篇音频的毫秒，FR-504 的产物形态）。
+ *
+ * [startMs] 一律来自模型的 `timestamps`（换算见 `domain/asr/TokenTimingMapper`），
+ * [endMs] 取下一个 token 的起点——paraformer 的 `durations` 实测是空数组，模型没给每字时长。
+ * 两者都不许用「按字数均分」造出来（AGENTS.md §5）。
+ */
+data class TokenTiming(
+    val token: String,
+    val startMs: Long,
+    val endMs: Long,
+) {
+    init {
+        require(startMs >= 0) { "startMs 不能为负：$startMs" }
+        require(endMs >= startMs) { "token「$token」endMs=$endMs 早于 startMs=$startMs" }
+    }
+}
+
+/**
+ * 识别器对**一小块**音频的产出：原文 + 逐字时间。
+ *
+ * [text] 是模型给整句的文本（含标点、可能带空格），[tokens] 是逐字时间；
+ * 两者的数量关系由 `TokenTimingMapper` 核对过才敢一起返回——
+ * 对不上时它抛异常，而不是硬凑一份看起来完整的字幕。
+ * 一个 [ChunkRecognition] 只对应一个 [PcmChunkPlan]，块与块之间的拼接由调用方负责。
+ */
+data class ChunkRecognition(
+    val chunk: PcmChunkPlan,
+    val text: String,
+    val tokens: List<TokenTiming>,
+)
