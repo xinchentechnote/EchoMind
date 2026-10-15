@@ -15,6 +15,7 @@ import com.xinchen.echomind.domain.importing.PermissionRevokedException
 import com.xinchen.echomind.domain.importing.TreeBrowser
 import com.xinchen.echomind.domain.model.ExistingAudio
 import com.xinchen.echomind.domain.model.ScannedAudioFile
+import com.xinchen.echomind.domain.model.TranscriptionTarget
 import com.xinchen.echomind.domain.text.TitleDeriver
 import java.util.UUID
 import kotlinx.coroutines.Dispatchers
@@ -43,6 +44,16 @@ interface AudioRepository {
     fun shelf(tab: ShelfTab, query: String): Flow<List<ShelfRow>>
     fun lastPlayed(): Flow<ShelfRow?>
     fun folders(): Flow<List<ImportedFolderEntity>>
+
+    /**
+     * 转录要读的那一本书（`asr/TranscriptCoordinator` 的唯一入口）。
+     *
+     * worker 也不许直接查 DAO（`domain/transcript/TranscriptRepository` 的约定），
+     * 所以「 uri 在哪、文件还在不在、要不要 SAF 授权、授权挂在哪棵树上」由这里投影成纯 Kotlin 的 [TranscriptionTarget]。
+     * 树 uri 必须在这里一起给出：文档 uri 与树 uri 长得不一样，拿文档 uri 查授权必然查不到。
+     */
+    suspend fun transcriptionTarget(audioId: String): TranscriptionTarget?
+
     suspend fun importFolder(treeUri: Uri): ImportOutcome
     suspend fun rescanAll(): List<ImportOutcome>
     suspend fun rename(audioId: String, title: String)
@@ -74,6 +85,20 @@ class AudioRepositoryImpl(
     override fun lastPlayed(): Flow<ShelfRow?> = shelfDao.observeLastPlayed()
 
     override fun folders(): Flow<List<ImportedFolderEntity>> = folderDao.observeAll()
+
+    override suspend fun transcriptionTarget(audioId: String): TranscriptionTarget? =
+        audioBookDao.getById(audioId)?.let { book ->
+            val needsTreeGrant = book.uri.startsWith("content://")
+            TranscriptionTarget(
+                audioId = book.id,
+                uri = book.uri,
+                title = book.title,
+                isFilePresent = book.fileStatus == AudioBookEntity.FileStatus.Present,
+                needsTreeGrant = needsTreeGrant,
+                // 只在 SAF 那侧查：folder_id 是外键（ON DELETE CASCADE），书还在则文件夹行必在
+                treeUri = if (needsTreeGrant) folderDao.byId(book.folderId)?.treeUri else null,
+            )
+        }
 
     override suspend fun importFolder(treeUri: Uri): ImportOutcome = withContext(Dispatchers.IO) {
         val uriText = treeUri.toString()

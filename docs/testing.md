@@ -29,6 +29,24 @@ source ~/android-dev/env.sh     # 否则 GRADLE_USER_HOME 退回 ~/.gradle，且
 ### 2b. 设备自动化实测到的坑（Phase 3 / 5 / 6）
 
 - `connectedDebugAndroidTest` **会清掉被测 App 的数据**：跑完 `dumpsys package` 显示 `notLaunched=true`，`databases/` 目录消失，SAF 持久化授权随之失效，App 也被卸载。之后要 `adb install -r` 重装并重新走一遍文件夹授权。→ 设备验证排在仪器化测试之后。
+- **同一件事在 Phase 6 代价大得多，因为「数据」里躺着 243 MB 模型和音频素材**：AGP 的卸载走 `deletePackageX`（日志里能看到 `DATA_REMOVED=true`），连 `filesDir/models/` 和 `Android/data/<pkg>/files/asr-fixtures/` 一起删。实测后果：整套件 **94 条里红 13 条**，全部集中在需要素材的四个类（`PcmDecoderTest` 3 / `VadSegmenterTest` 5 / `SherpaOnnxEngineTest` 1 / `TranscriptCoordinatorTest` 4），报错原文是「缺少测试素材…（存在=false）」和 `AsrModelNotReadyException: model.int8.onnx 不存在`；另外 81 条（Room / 仓储 / 迁移）照常绿。**红的原因是数据没了，不是代码坏了**，但只看尾行数字区分不出来。
+- 所以 ASR 那批用例改用**不卸载的跑法**（AGENTS.md §1「不要杀/不要重装用户的东西」也指向这里）：
+  ```bash
+  ./gradlew :app:assembleDebug :app:assembleDebugAndroidTest          # 两个包都要重新编译
+  adb -s emulator-5554 install -r app/build/outputs/apk/debug/app-debug.apk
+  adb -s emulator-5554 install -r -t app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+  # 模型：先 push 到 /data/local/tmp，再 run-as 拷进 App 私有目录（直接 mkdir 出来的目录属主是 root，App 读不到）
+  # 三个文件都要搬：paraformer 是 model.int8.onnx + tokens.txt，VAD 是 silero_vad.onnx；目录名用 ModelCatalog 里的 spec.id
+  adb -s emulator-5554 push app/libs/models/sherpa-onnx-paraformer-zh-2023-09-14/model.int8.onnx app/libs/models/sherpa-onnx-paraformer-zh-2023-09-14/tokens.txt app/libs/models/silero-vad/silero_vad.onnx /data/local/tmp/
+  adb -s emulator-5554 shell run-as com.xinchen.echomind sh -c 'mkdir -p files/models/paraformer-zh-2023-09-14-int8 files/models/silero-vad'
+  for f in model.int8.onnx tokens.txt; do adb -s emulator-5554 shell run-as com.xinchen.echomind sh -c "cat /data/local/tmp/$f > files/models/paraformer-zh-2023-09-14-int8/$f"; done
+  adb -s emulator-5554 shell run-as com.xinchen.echomind sh -c 'cat /data/local/tmp/silero_vad.onnx > files/models/silero-vad/silero_vad.onnx'
+  # 素材：external 目录可以直接 push（real 是 2,381,693 B 的真人的歌，silent 那份 478,716 B 是 99% 0x00 的负例）
+  adb -s emulator-5554 push /Users/xinchen/Documents/music/那些花儿.mp3 /storage/emulated/0/Android/data/com.xinchen.echomind/files/asr-fixtures/pcm-fixture-real.mp3
+  adb -s emulator-5554 shell am instrument -w -e package com.xinchen.echomind com.xinchen.echomind.test/androidx.test.runner.AndroidJUnitRunner
+  ```
+  `am instrument` 只跑测试、不动包，**上一轮的设备实测（SAF 授权、数据库、模型）全部留着**；`-e class <FQCN>` 能单跑一个类（`-e class '<FQCN>#<中文方法名>'` 单跑一条也行，方法名里有 `#` 之前的整串要加引号），`-e package com.xinchen.echomind` 只跑本包的 12 个类。
+- ⚠ **这台模拟器的数据状态会变，别照抄上一轮的结论**：Phase 6c-3 那轮结束时 `echomind.db`（`user_version=3`）里 `audio_book` / `imported_folder` / `subtitle_segment` / `transcript_job` **全是 0 行**（AGP 那轮把书和授权一起带走了，而 `am instrument` 用的是 in-memory 库，不会把任何东西填回去），所以做 Phase 6d 之前必须重新走一遍 SAF 选目录 + 授权（坐标见本节）。**Phase 6d 之后的现状**：库里有 7 本书、35 行 `source=ASR` 字幕、7 行 `transcript_job`（含 SUCCESS/FAILED(INTERRUPTED)/FAILED(OUTPUT_UNRELIABLE)/CANCELLED 各态），`那些花儿` 是 READY——这些是**人工从界面点出来的**，`connectedDebugAndroidTest` 一跑就又没了。
 - `uiautomator dump` 在「刚启动 / 刚点过一下」之后经常返回 `ERROR: null root node returned by UiTestAutomationBridge`。它失败时**既不写也不删**目标文件：必须 `adb shell rm -f /sdcard/em.xml` → dump → `pull` → 校验 `</hierarchy>`，并重试（本项目实测 2~3 次内成功）。只删本地副本不够。
 - `adb shell input text` 不支持非 ASCII（中文直接 `NullPointerException in InputShellCommand.sendText`）→ 设备上的搜索用例只能打 ASCII；中文搜索由 `AudioBookDaoTest` 覆盖。
 - `adb shell mv 'a b' c` 的引号在设备端会被重新拆分，得到 `mv a b c` → 报 `not directory`。整条命令要作为一个字符串传：`adb shell "mv 'a b' c"`。
@@ -41,6 +59,8 @@ source ~/android-dev/env.sh     # 否则 GRADLE_USER_HOME 退回 ~/.gradle，且
 - **仪器化测试的方法名不能带空格**（Phase 6 实测）：`minSdk = 26` 时 D8 出的是 dex 039，`Space characters in SimpleName '…' are not allowed prior to DEX version 040` 直接把 `dexBuilderDebugAndroidTest` 打停。JVM 单测不经过 dex，所以 `app/src/test/` 里那批带空格的中文名字一直是合法的——只有写进 `androidTest` 才会炸。
 - **`adb shell mkdir` 在 `/sdcard/Android/data/<pkg>/files/` 下建的子目录 App 读不到**（Phase 6 实测）：属主变成 `root`（`drwxrws--- root ext_data_rw`），App 侧 `File.isFile` 一律 false，表现是「文件明明 `ls` 得到，测试却报缺模型」。要把模型/素材放进 App 私有目录就用 `run-as`：`adb push <file> /data/local/tmp/x` → `adb shell run-as <pkg> sh -c 'cat /data/local/tmp/x > files/models/<id>/<file>'`。顺带好处是布局与生产 `filesDir/models` 一致。
 - **`am instrument` 不清数据**（与 §2b 第一条对照）：只有 `connectedDebugAndroidTest` 会重装并清空，`adb install -r -t` + `am instrument -w` 这条路跑完整套件后 SAF 授权与库都在。
+- **WorkManager 的前台服务要在自己清单里合并出类型**（Phase 6d 实测，点「开始转录」直接崩）：光有 `FOREGROUND_SERVICE_DATA_SYNC` 权限不够，Android 14+ 还查**起服务那个组件**的 `foregroundServiceType`。`setForeground(dataSync)` 会去起 `androidx.work.impl.foreground.SystemForegroundService`，而 work-runtime 2.12.0 清单里它的类型是空的，报错原文 `foregroundServiceType 0x00000001 is not a subset of foregroundServiceType attribute 0x00000000 in service element of manifest file`。修法是 `<service android:name="androidx.work.impl.foreground.SystemForegroundService" android:foregroundServiceType="dataSync" tools:node="merge" />`；**验收要看合并后的清单**（`app/build/intermediates/merged_manifests/`）或装好的包，读源码看不出来。
+- **底部导航别对带参数的路由用 `saveState`/`restoreState`**（Phase 6d 实测）：`popUpTo(start){saveState=true}` + `restoreState=true` 会把被 pop 的返回栈存起来再恢复；转录页是 `transcript?audioId=…`，恢复时把「转录这本书？」卡片连同 ViewModel 状态一起复活，表现是**点底部标签毫无反应**。去掉这两个 flag、只留 `popUpTo(start)` + `launchSingleTop` 就好了（`MainActivity.kt` 里有注释）。
 - **测音频内容必须自己数零字节**（Phase 6 实测）：书架那批「《三体》」素材帧体 99% 是 `0x00`，也就是静音。它能通过所有「长度类」断言（时长、进度、切歌、样本数），所以只要断言里出现 `peak`/`rms`，就必须同时准备**一份真音频**和**一份静音对照**。素材放 `getExternalFilesDir("asr-fixtures")`：读写自己的 external 目录不需要运行时权限，`adb push` 就能放。
 
 ## 3. 测试分层策略
@@ -483,6 +503,118 @@ FR-707（只在当前句变化时更新）用**设备 + 单测两头**取证：�
 - **还没有真字幕入库**：`commitSubtitles` 吃的是测试里手工构造的 `SubtitleSegment` 列表；VAD → 识别 → 切句 → 提交的端到端串接是 4b + 第 5 项（`SentenceSplitter`）。
 - 状态机没做真并行压力测试（「第二次结算被 SQL 拦下」是顺序调用两次测的，不是两个协程抢同一行）。
 
+### Phase 6c-2（切句）：`SentenceSplitter` + 设备端到端第四环（2026-10-15 08:20 ~ 08:45，含复跑）
+
+新增 `domain/asr/SentenceSplitter.kt`、`domain/model/RecognizedSegment`、`SubtitleDraft.boundaryGuess`，
+`AudioFormats` 多四个切句阈值（60 字 / 500ms / ×2 / 700ms，唯一出处）。测试：**25 条 JVM 单测** + `SherpaOnnxEngineTest` 里
+**1 条设备端到端用例**（解码 → VAD → 识别 → **切句**）。**这一轮交付的是「字句怎么变成句子」，不是「点一下就能转录」——调用方仍在 4b。**
+
+| 动作 | 结果 | 凭据 |
+| --- | --- | --- |
+| **最重要的一条：设备用例抓到了纯逻辑测不出来的错** | 设计稿（本文 §4 Phase 6 第 3 项终、`asr-design.md` §6 原稿）把「相邻起点差 ≥300ms」当段内停顿判据。第一次在设备上跑通「识别→切句」给出 **58 字 → 53 句**，平均每句 **1.6 字**，等于逐字打字；而当时三条断言（时长为正 / 不重叠 / 摘掉标点后与模型输出逐字相等）**全部通过**。「切句正确」在这种断言下是可以假的 | `SherpaOnnxEngineTest.真模型的逐字时间喂进切句器得到能读的句子`（原来只有三条，红不了） |
+| 根因不是阈值调错了，是**判据本身不成立** | `durations` 实测长度 0（§4 Phase 6 第 3 项终已钉死）→ 相邻**起点**差 = 前一字的发音长度 + 中间静音，**减不掉发音长度**。歌唱素材每个字本身占 400~600ms，那叫慢不叫停顿，任何绝对门槛都会把慢当停顿 | `SentenceSplitterTest.整段匀速地慢不是停顿一个字都不许多切`（8 字、字距 550ms 全均匀 → 必须还是一句） |
+| 改判据：绝对下限 **且** 相对本段中位数 ×2 | 停顿必须同时 ≥`ASR_INTRA_SEGMENT_PAUSE_MS`(500) 且 ≥`median(本段起点差) × ASR_PAUSE_MEDIAN_RATIO`(2)。取中位数不取平均值：一段里只有一个大间隔时平均值会被它自己抬上去反而断不开；偶数个字取靠下那个（宁可多认一个停顿，不要让虚高基准抹平停顿）；只有 1 个间隔时中位数就是它本身 → 必然断不开，「一个字比另一个字慢」不是证据 | 上面那条的镜像用例 `比本段典型字距明显更慢的那一档才断句`（同样 550ms 的差，放进 150ms 字距里就必须断） |
+| **补了一条下限断言，让「逐字字幕」再也绿不了** | `平均每句 ≥3 字`。**验证这条断言不是摆设**：把两个阈值临时改回 300/×1 重新编译装 APK 复跑 → 立刻红 `平均每句只有 1.6 字：这是逐字字幕不是句子`；改回 500/×2 复跑 → 绿 | 同用例，实测数值见下一行 |
+| 改完之后的真实产出（同一天两次独立进程复跑，结论一致） | 60 s 歌唱素材：6 段 / **58 字 → 9 句**，平均每句 **6.4 字**，按长度硬切 **0 句**。句子与《那些花儿》歌词对得上：「偏笑声让想起我的那些话。」/「在我生命每一个角落。」/「静静为我开着。」/「我曾以为我会永远。」/「守在他身旁。」/「今天我们。」/「已经离去。」/「在人海茫茫。」/「他们都老了吧。」。**注意第一句仍是错的**（模型按 VAD 切块后就把「那片笑声让我」听成「偏笑声让」，切句层不背这个锅，见 §4 Phase 6 第 3 项终的「块边界不等于句子边界」） | logcat `SherpaEngineTest: 切句：6 段 / 58 字 → 9 句` + `平均每句 6.4 字`（08:42 与 08:44 两轮逐项相同） |
+| 顺手删掉一条**够不着**的档位 | §6 第 4 条原稿在超长句里有「在最大 token 间隔处再切」一档。改完停顿判据后它的条件与段内断句**完全相同**，而能进超长分支的句子要么段内已无停顿可断、要么是跨段合并来的（合并本身有 60 字上限，进不了超长分支）→「本集合里最大」不再携带信息，删。回退顺序变成「弱标点 → 空白 → 60 字硬切（只有硬切标 `boundaryGuess`）」，与 FR-602 原文「超出按标点或空格回退切分」一致 | `最大起点差够不上停顿就只能在字数上限硬切并如实标记`（90 字、字距 100ms、中间夹一个 250ms 的「最大间隔」→ 必须硬切且 `boundaryGuess=true`）；对照 `真停顿会让长句在停顿处断开而不到字数上限`（只把 250 改成 700 → 两句都是 60/30 字，`boundaryGuess=false`） |
+| 合并窗口不许把段内断句抹掉 | `segmentFinal` 标志：只有本段最后一句允许跨段合并。段内因停顿断开的两句如果再被合回去，§6 第 2 条就白做 | `段内起点差超过门槛就断句而且合并窗口也合不回去`（间隔 550ms ≤ mergeGap 700ms 也不合） |
+| 零长句的三种收场，**没有一种需要造时间** | ①与上一句本来连着 → 文本并进上一句、上一句时长不变；②隔着一大段静音 → **不并**（否则那句话白占几十秒）；③后面有句子 → 用下一句起点；谁都给不出 → 如实丢掉。`+N ms` 这种收口全类没有 | `零长句并进上一句而不是编一个时长出来`、`隔着一大段静音的零长字不并给上一句`、`整篇只有一个零长字就如实丢掉` |
+| 只剩标点的 token 不成句 | `hasContent` 挡掉「只有一个『。』」这种句子，也不给它编时长 | `只剩标点的不成句` |
+| 清洗顺序：先重排再夹重叠 | 跨块拼接可能乱序 → 按起点排；起点只往**不早于前一字**收拢（往前就是造一个模型没给的时间）；上一字的 `endMs` 夹到下一字起点。`TokenTiming` 自己只保证 `endMs ≥ startMs`，管不了互相盖 | `token乱序时按时间重排文本也跟着走`、`上一个字压到下一个字头上时以起点为准夹住` |
+| 一条性质断言，不靠具体用例 | 200 字超长段 + 一个短段 + 一个孤立零长字混着喂，输出必须「时间升序 / 每句时长 > 0 / 互不重叠」——FR-603 验收动作就是这个 | `输出永远时间升序每句时长为正且互不重叠` |
+| 中文连排 vs 英文粘成一坨 | 两侧都是字母/数字（且都 <0x2E80）才补空格，中文之间不补。纯空白 token `trim` 成空串后既是「第三档切点」也不占字数 | `空白是第三档切点且英文分词之间补空格`（`he`+`llo` → `he llo。`） |
+| 写测试时自己的失误（如实记） | ①新用例插进类里时 `old_string` 多吃掉了下一条的 `@Test` + 函数签名，把邻居的函数体变成孤儿 → 靠 `Read` 复查发现，补回签名；②`PUNCT_FOR_TEST` 只加了引用没加定义（编译前自查到）；③`filter { !it.isWhitespace() && it !in PUNCT_FOR_TEST }` 的集合必须是 splitter 实际标点集的**超集**，宽一点无所谓（两边都摘），窄一点就会假红 | 编译输出 + 复查 |
+| 本轮最终构建（08:44 复跑 + 09:05 对最终代码树再跑一次） | `assembleDebug` / `assembleDebugAndroidTest` **BUILD SUCCESSFUL**；`testDebugUnitTest --rerun` 从 XML 汇总：**17 个类 / 194 用例 / 0 failures / 0 errors / 0 skipped**（169 → 194 = `SentenceSplitterTest` 25 条）；仪器化整套件 `am instrument -w` **OK (92 tests)**，`Time: 91.114` → 补完 KDoc 后同一棵树再跑 **89.051 s**（91 → 92 项 = 新增那条切句设备用例；两轮耗时差 2 s，与 §4 一直声明的模拟器抖动同量级，不当判据）。同一轮顺带记下装载耗时新样本：`OfflineRecognizer` **3,398 ms**（此前 4,906 / 4,914）、单块 19.2s RTF **0.115 / 0.123**、端到端 6 块 RTF **0.133** | 测试 XML 汇总脚本 + instrument 尾行 + logcat |
+
+**这一轮没做 / 做不了**：
+
+- **没有生产调用方**：`SentenceSplitter` 只被测试调用，`commitSubtitles` 至今没吃过它产出的草稿（4b）。
+- **三个阈值全部未标定**：500ms / ×2 / 700ms 只在**一份歌唱素材**上验过，朗读型真人语音 fixture 还没有（AGENTS.md §6「先实测再定数」这条这里只算半条）。已在 `asr-design.md` §6 与 `AudioFormats` 注释里写明「未标定」。
+- **`boundaryGuess` 不落库**：`subtitle_segment` 没有对应列，硬切出来的句子和证据充分的句子在库里长得一样。加列要连带 v3→v4 迁移，等 §8 降级策略一起定。
+- 句子质量只断言了「结构性质 + 平均每句字数」，**没有断言语义正确性**（没人能自动化判断「这句该在哪里断」）。人工读那 9 句是本轮的实际验收手段。
+
+
+
+### Phase 6c-3（协调器接线，即 roadmap 的 4b）：生产代码第一次把模型的字写进字幕表 + WorkManager（2026-10-15，AGP 那轮 11:19 / `am instrument` 12:24 / 协调器单类复跑 12:30 ~ 12:31 / 最终构建 12:39）
+
+新增 `asr/TranscriptCoordinator.kt`、`domain/asr/TranscriptQuality.kt`、`work/TranscriptWorker.kt`、`work/TranscriptWorkScheduler.kt`，
+在 `EchoMindApp` 的 `AppGraph` 里装配（协调器 `:96`、调度器 `:104`、`recoverInterrupted()` 在 `onCreate` 里 `:122`）。
+测试：**9 条 JVM 单测**（`TranscriptQualityTest`）+ **8 条仪器化端到端**。**这一轮交付的是「六环串起来能把字写进库」，不是「用户能转录」——界面上没有任何入口，`schedule()` 全仓库零调用方。**
+
+| 动作 | 结果 | 凭据 |
+| --- | --- | --- |
+| **本项目最该被记住的一行：模型的字第一次由生产代码写进 `subtitle_segment`** | 148 s 整首歌《那些花儿》跑完整条链（真解码、真 VAD、真模型、真 `TranscriptRepositoryImpl` + 真 Room DAO/entity/schema v3），**35 句**入库（`source=ASR`、`job_id` 指向那一行、`segment_index` 连续、时间升序、不越出容器时长）。此前所有轮次的字幕都来自手工导入的测试文件。⚠ **写的是用例进程里的 in-memory Room**（`Room.inMemoryDatabaseBuilder`）：生产代码路径第一次被真跑通，但**用户机上那份 `echomind.db` 里仍然一句 ASR 字幕都没有**（实测 `subtitle_segment` 0 行、`transcript_job` 0 行、`audio_book` 0 行——AGP 那轮 11:19 把数据连书一起清了，之后没有重新导入）。要那句字幕出现在用户能看见的库里，得等任务 #23 的界面入口 | logcat `EchoMindTranscript: 转录收口：解码 2378188 样本（44100 Hz/2 ch → 16000 Hz，容器时长 148303 ms），语音段 24 个，块 24 个，丢弃 0 个；句子 35（硬切边界 0 句），产出字幕的段 24/24`（12:31:09.770）；用例 `真模型跑完整首歌后字幕第一次进了数据库`；`run-as cat` 拉库后 `select count(*) from subtitle_segment` = 0 |
+| 端到端耗时与**产出稳定性**（同一条用例三次独立进程） | 墙钟 **42,965 / 33,453 / 63,714 ms**（含装载；对 148 s 音频 ≈ RTF 0.29 / 0.23 / 0.43）——**最快与最慢差 1.9 倍**，所以耗时只能报区间不能报结论。反过来说更有价值的是：**三次的产出逐字一致**（都是 24 段 / 24 块 / 丢弃 0 / 35 句 / 硬切边界 0 / 产出字幕的段 24/24），说明解码→VAD→识别→切句这条链在这台机器上是确定的，抖的只是速度 | 三条 logcat：`wall=33453ms`（12:31:09.794）、`wall=63714ms`（13:06:39.799）+ 前一轮 42,965 ms；三次的「转录收口」行逐项相同 |
+| **中途 `total_segments` 恒为 0 是设计而不是 bug**（流式解码时段数还不知道），协调器如实上报 0 | 进度回调实际是 `[(1,0),(2,0),…,(24,0)]` ⇒ `TranscriptJobRow.progress == null`。**UI 与通知因此不许画百分比**，只能说「已识别 N 段」——这一条是给 Phase 6d 定契约，不是记录 | 上面那行 logcat 的 `进度上报` 字段；`database-design.md` §6 |
+| 三道守护（授权 / 模型 / 文件）都排在装载模型之前，实测省下了 243 MB | 三条失败全部在 **130 ms 内**出完（`12:30:23.072` PermissionRevoked、`.096` ModelMissing、`.203` DecodeFailed），而整个类 8 条只用 46.777 s。失败原文直接进 `error_message`，不做二次加工 | `EchoMindTranscript: 转录失败（ModelMissing）：VAD 模型缺失或与清单不符（silero-vad），请先在模型页准备好` + `VAD 模型不合格：silero_vad.onnx 不存在`；用例 `模型没准备好时标MODEL_MISSING且不写字幕`、`文件已不在原位置时报解码失败且不启动推理` |
+| **改前会把每一本书都判成「授权已失效」**：SAF 可持久化授权发在**树** uri 上，而 `audio_book.uri` 是 `listFiles()` 给的**文档** uri | `hasReadGrant(文档uri)` 必然 false。修法是 `TranscriptionTarget.treeUri` + `ImportedFolderDao.byId`。日志里打出来的正是树：证明修复后查的对象对了 | `转录失败（PermissionRevoked）：文件夹授权已失效，请重新授权后重试：content://com.android.externalstorage.documents/tree/primary%3AMusic`；用例 `授权查的是所属文件夹的树而不是文档uri` |
+| 状态守卫是**生产的承重墙**，不只是测试里的漂亮话 | 「抢不到行就收手」完全依赖 `markRunning` 的 `WHERE status='QUEUED'`；`recoverInterrupted()` 先把上次被杀留下的行标 INTERRUPTED，复活的 worker 就覆盖不掉这个结论 | 用例 `正在跑的行不会被第二个worker重复跑`、`重启后复活的worker不再覆盖中断结论` |
+| 取消与「没有语音」这两条容易画假账的分支 | 取消位为真时**只停手不写终态**（终态归 `cancel()` 那条路径）；478 KB 静音素材解出 479,818 样本、VAD 段 0、句 0 ⇒ `FAILED(OUTPUT_UNRELIABLE)` 而**不是** `SUCCESS`，`audio.transcription_state` 也就不会被谎报成 READY | `转录收口：解码 479818 样本（44100 Hz/1 ch → 16000 Hz，容器时长 29919 ms），语音段 0 个，块 0 个，丢弃 0 个；句子 0（硬切边界 0 句），产出字幕的段 0/0` + `转录失败（OutputUnreliable）：模型没有给出任何带时间的字（识别 0 块，丢弃 0 块）。如果这段音频本来就没有语音，这是正常结果`；用例 `取消位为真时立刻停手且不写终态`、`没有语音的素材标成结果不可用而不是成功` |
+| 质量闸门（丢弃块占比 >20% 或零句 ⇒ 不可靠）单独可测 | 9 条 JVM 单测：阈值边界、零句、全丢、`AudioFormats.ASR_MAX_REJECTED_CHUNK_PERCENT` 只有一处定义。取整方式与占比口径在 `asr-design.md` §5 第 5 条 | `domain/asr/TranscriptQualityTest`（XML 计数 9） |
+| **本轮新发现的架构违规，没修**：唯一名是 `transcript-<audioId>`（每本书一个），两本书同时入队 = 两个 worker 各 `open()` 一份模型，违反 AGENTS.md §3「同一时刻只有一个 ASR 引擎句柄」 | 取舍与修法记在 `architecture.md` D36：跨书单一唯一名 + `ExistingWorkPolicy.APPEND`。**为什么不顺手改**：这条要一条真并发的用例才算交付，而现在没有界面入口，点不到就爆不出来——写成待办而不是写成已修。**（后续：这一条已在 Phase 6c-4 修掉，见下面那一节）** | `TranscriptWorkScheduler.kt`（原 `uniqueName`，现已删）+ D36/FR-507 |
+| ⚠ **`work/` 那两个类一次都没跑过**（诚实标注，别被 102 全绿骗了） | 8 条端到端用例**直接调协调器**，不经过 worker；`schedule()` 的调用方全仓库为 0（只有 `EchoMindApp.kt:104` 构造了它）⇒ `setForeground`/前台通知/`REPLACE`（**该策略已在 Phase 6c-4 改成全局唯一名 + `APPEND`，改后仍零测试**）/`isStopped` 传递/意外异常补 `FAILED(UNKNOWN)` **全是代码，零设备证据**。`OUT_OF_MEMORY` 分支同样只有代码 | `grep -rn "\.schedule(" app/src` 无匹配；`TranscriptWorker.kt` 与 `TranscriptWorkScheduler.kt` |
+| AGP 那条标准命令在这台设备上**会自己拆掉自己的测试数据**，得到 13 条假红 | 见 §2b 新增的三条：`deletePackageX` 连 `filesDir/models` 与 `asr-fixtures` 一起删 → 94 条里红 13（`PcmDecoderTest` 3 / `VadSegmenterTest` 5 / `SherpaOnnxEngineTest` 1 / `TranscriptCoordinatorTest` 4），报错原文是「缺少测试素材…（存在=false）」；Room/仓储/迁移那 81 条照常绿，所以**只看尾行数字区分不出「数据没了」和「代码坏了」**。绕法：`adb install -r -t` 两个包 + `run-as cat` 重搬模型 + `am instrument` | `app/build/outputs/androidTest-results/connected/debug/TEST-drill36(AVD) - 16.xml`（tests=94 failures=13 errors=0） |
+| 顺带把「模型装载吃掉多少内存」量出来了（原 §7 的两条自查项之一） | 端到端**边跑边采样** 37 次 `dumpsys meminfo`：PSS `85 → 112 → 139 → 401 → …` 之后 31 个点全在 414~442 MB 抖动，峰值 **PSS 442 MB / RSS 559 MB**（这台 AVD 总内存 2.42 GB，正好在目标机型区间）。台阶 = 243 MB 的 int8 模型，平线 = 24 段逐个识别。⚠ 平线**不能**当「没整本载入 PCM」的证据（整本也只有 9.5 MB），那条保证在代码结构里；详见 §6b、§7 | 采样脚本 + `/tmp/memsample/mem.txt` |
+| 本轮最终构建（对最终代码树） | `:app:assembleDebug` + `:app:testDebugUnitTest --rerun` **BUILD SUCCESSFUL in 1s**（44 tasks，1 executed / 43 up-to-date），XML 汇总 **18 个类 / 203 用例 / 0 failures / 0 errors / 0 skipped**（194 → 203 = `TranscriptQualityTest` 9 条）；仪器化 `am instrument -w -e package` **OK (102 tests)** `Time: 140.845`（92 → 102 = 协调器 8 条 + `attachWorkRequest` 2 条）；协调器类单跑 **OK (8 tests)** `Time: 46.777`；单条端到端用例第三次独立跑 **OK (1 test)** `Time: 63.86`（wall 63,714 ms，见上一行的三次对照） | 12:39 构建输出 + 12:24/12:31 instrument 尾行 + logcat `CoordinatorTest: 端到端…wall=63714ms`（13:06:39） |
+| 文档同步（AGENTS.md §7，改了行为就改文档） | `asr-design.md` §4 组件表 / §5 步骤 5~8 / **新增 §5.1 编排层六条** / §8 错误码逐行状态 / §9 / §10；`requirements.md` FR-504~509、FR-601/602/604 状态与理由；`database-design.md` §6（`OUTPUT_UNRELIABLE`、`work_request_id` 写入方、18 条用例、`total_segments` 中途恒 0）；`architecture.md` 包树 / §5.3 全图重画 / §6 线程表 / **§10 新增 D34 D35 D36**；`roadmap.md` 4b 改 DONE + 第 5、6 项与遗留清单；本节与 §2b、§5 | 六个文件的 diff |
+
+**这一轮没做 / 做不了**：
+
+- **用户点不到**：没有转录页、书架上也没有入队按钮，`TranscriptWorkScheduler.schedule()` 零调用方。FR-505 的验收动作（「点一下就能转录并看到进度」）仍然是 0 分 → Phase 6d。
+- **`work/` 与 `OUT_OF_MEMORY` 零证据**（见上表倒数第 3 行）。前台通知能不能真显示、被系统杀掉后 `recoverInterrupted` 与 WorkManager 重启谁先跑，都要等 Phase 6d 有入口之后在设备上验。
+- **硬切那一档设备上从未走到**（35 句里 `guessedBoundaries=0`）：只有 JVM 用例覆盖，属于「代码到得了但素材没让它露脸」。
+- **切句三个阈值仍未标定**，`boundaryGuess` 仍不落库（D35）；真 ASR 字幕的时间对齐误差**还没做人工抽查**（FR-506）——抽查要先把字幕看得见，所以排在 6d 之后。
+- 真机（2~3 GB RAM）峰值 RSS 与 RTF、m4a/FLAC 容器、大文件（>1 h）都还是空白（§6、§7）。
+
+### Phase 6c-4（D36 串行化，任务 #23 的前置）：全机同时只跑一个转录（2026-10-15，整套件 13:50 起 / 证伪与闸门装回 14:15~14:25）
+
+上一轮留下的架构违规（`transcript-<audioId>` 每本书一个唯一名 ⇒ 两本书同时入队 = 两个 worker 各 `open()` 一份 243 MB 模型）。
+改动两处：`TranscriptJobDao.markRunning` 的跃迁 SQL 加 `AND NOT EXISTS (SELECT 1 FROM transcript_job WHERE status = 'RUNNING' AND id <> :id)`；
+`TranscriptWorkScheduler` 改成**全局单一唯一名** `transcript-series` + `ExistingWorkPolicy.APPEND`（删掉 `uniqueName(audioId)`）。
+新增 2 条仪器化用例（协调器 8→**9**、仓储 18→**19**），取舍记在 `architecture.md` D36。
+
+| 动作 | 结果 | 凭据 |
+| --- | --- | --- |
+| **先证伪再算交付**（AGENTS.md §6「修 bug 先写能复现它的测试」的另一半：断言必须抓得住反向） | 临时把 DAO 里的 `NOT EXISTS` 子句删掉、重装 APK，两条用例**各自变红**：仓储侧红在 `assertFalse("第二本书竟然也拿到了运行中的行")`（栈顶 `TranscriptRepositoryTest.kt:263`），协调器侧红在 `java.lang.IllegalStateException: 第二本书竟然跑起来了（那就是两个引擎并存）：Failed(failure=OutputUnreliable, message=模型没有给出任何带时间的字（识别 0 块，丢弃 0 块）...)`（栈顶 `TranscriptCoordinatorTest.kt:257`）。**协调器那条的失败方式特别说明问题**：没有闸门时第二本书真的解了码、真的装了引擎，只是素材恰好没语音才落进 `Failed` —— 所以用例断言的是 `is Skipped`，只断言「它失败」会一路绿 | 删闸门后的 `assembleDebug`（BUILD SUCCESSFUL in 1s）+ 两次 `am instrument -e class`，各自 `Tests run: 1, Failures: 1` |
+| 闸门装回后同两条用例合跑 | **OK (2 tests)**，`Time: 0.321` | `adb install -r` 之后一次 `-e class 'A#方法,B#方法'` |
+| 第二本书抢不到行时**什么都没发生**（这才是「不写字幕」的可执行含义） | 它的行停在 `QUEUED`、`started_at_ms` 为 null、`subtitle_segment` 里 `audio_id='b'` 0 行；第一本书仍为 `RUNNING`。⚠ 用例只断言了**协调器在 `open()` 之前收手**（靠 `markRunning` 返回 false），没有断言引擎句柄数（native 层拿不到句柄计数） | 用例 `别的书正在跑时第二个协调器收手且不写字幕`、`别的任务正在跑时第二本书的任务抢不到运行中的行` |
+| **为什么守卫写在 SQL 里而不是「先查再改」** | 查与改之间就是并发窗口：两个 worker 都能读到「没有 RUNNING」，于是各自开一份模型。SQLite 的单语句原子性是这里唯一能白拿的保证，而它也是**唯一能被仪器化用例断言的那一层**——WorkManager 的排队发生在它自己的进程内状态里，测试直接调协调器根本不经过它 | `TranscriptJobDao.kt` 的 `markRunning` + 用例断言的是仓储返回值 |
+| WorkManager 那一半（`APPEND` 排队）**没有用例** | 同一唯一名下不并发是官方文档语义，本机没测；要测得先有能入队的界面按钮（任务 #23）。如实写成「只有代码」 | `TranscriptWorkScheduler.kt`（`UNIQUE_NAME` / `enqueueUniqueWork`）；`work/` 两个类仍然零测试 |
+| 新闸门带来的**新失效模式**（写清楚，别只报修了什么） | 一行卡在 `RUNNING` 会把**后面所有**转录一起挡住（原来按书分开时不会）。释放车道有三处：协调器 `settle`、`TranscriptWorker` 的 `FAILED(UNKNOWN)` 兜底、`EchoMindApp.onCreate` 的 `recoverInterrupted()`；但 worker 只 `catch Exception`，`UnsatisfiedLinkError` 这类 `Error` 会绕过它，那时要等下次进程启动才恢复。**这条目前没用例** | `TranscriptWorker.kt:74`、`EchoMindApp.kt:122`、`TranscriptJobDao.markInterrupted` |
+| 整套件（对**同一份带闸门**的代码树，13:50 那一轮；上面的证伪是之后的临时偏离，做完已原样装回并重装 APK） | `:app:assembleDebug` **BUILD SUCCESSFUL**（证伪前后各一次：in 1s / in 2s）；`testDebugUnitTest --rerun` XML 汇总 **18 个类 / 203 用例 / 0 failures / 0 errors / 0 skipped**；仪器化 `am instrument -w -e package` **OK (104 tests)**，`Time: 140.846`。逐类：`TranscriptRepositoryTest` 19、`TranscriptCoordinatorTest` 9、`SherpaOnnxEngineTest` 9、`PlaybackRepositoryTest` 21、`AudioBookDaoTest` 11、`AudioRepositoryImportTest` 9、`VadSegmenterTest` 6、`PcmDecoderTest` 4、`ModelManagerNetworkTest` 4、`SubtitleRepositoryTest` 4、`Migration_2_3_Test` 5、`Migration_1_2_Test` 3（合计 104）。⚠ 走 `am instrument` 而不是 `connectedDebugAndroidTest`，后者会 `deletePackageX` 把模型和素材连数据一起删（§2b） | 测试 XML 汇总 + instrument 尾行与逐类点号 |
+| 写测试时自己的两次失误（如实记，这两条都不是代码 bug） | ①第一条用例断言第二本书的 `transcription_state == NONE`，实际是 `QUEUED`——**`enqueue` 本来就会把书标成 QUEUED**（既有用例守的就是这件事），所以改断言而不是改代码；②第二条用例给第二本书复用了同一个文件 uri，撞上 `audio_book.uri` 的 UNIQUE 索引，`enqueue` 直接返回 `AudioNotFound`，改成「第二本书用静音素材那份文件」（守护在解码之前，用哪份文件不影响这条用例要证的事） | 两次失败输出 `expected:<[NONE]> but was:<[QUEUED]>` 与 `ClassCastException: EnqueueOutcome$AudioNotFound cannot be cast to EnqueueOutcome$Created` |
+
+**这一轮没做 / 做不了**：
+
+- `work/TranscriptWorker`、`TranscriptWorkScheduler` **仍零测试**，`schedule()` 仍零生产调用方 ⇒ 排队语义、前台通知、撤销路径都只有代码。
+- 「卡在 RUNNING 把整条队挡住」没有用例（要造一个不结算的 RUNNING 行才能测，而那需要绕过协调器的写入方，测了也不等于生产路径）。
+- 真并发（两个 worker 同时起步）没测：仪器化测试直接调协调器，测的是**闸门**而不是**竞态**；这一条要等界面入口后在设备上点两本书才知道。
+
+### Phase 6d（转录页 UI + 取消/重试 + FR-508 降级文案，任务 #23）：第一次「点一下就出字幕」（2026-10-15 20:20 ~ 21:05，全套件 21:00 复跑）
+
+生产改动四处：新增 `ui/transcript/{TranscriptScreen,TranscriptViewModel,TranscriptDisplay}.kt`、`MainActivity.kt` 的底部导航、`AndroidManifest.xml` 给 WorkManager 的前台服务补 `foregroundServiceType`。新增测试两层：JVM `TranscriptDisplayTest`（13 条）、仪器化 `work/TranscriptForegroundServiceTypeTest`（2 条）。
+
+| 动作 | 结果 | 凭据 |
+| --- | --- | --- |
+| **FR-504/506 一直缺的那条用户路径终于跑通了**：书架 → 行尾 ⋮ →「转录这本书」→ 转录页确认卡片 →「开始转录」 | 状态依次是 排队中 → 转录中（「已识别 N 段（总段数要等解码跑完才知道）」，**分母未知时不给百分比也不画进度条**）→「共 24 段全部识别」。**用户机上那份 `echomind.db`**（不是测试进程的 in-memory 库）里现在有 `source=ASR` 的 **35 行**字幕：`segment_index` 0~34 连续、`start_ms` 最小 14,134、`end_ms` 最大 145,766，都在容器时长 148,304 ms 之内；书 `那些花儿` 的 `transcription_state=READY`。播放页的七句窗口读的就是这 35 行 | `sqlite3` 直查（`/tmp/echodb5`）；截图 `/tmp/shot_tr2.png` |
+| **第一个真 bug：点「开始转录」直接把进程干掉** | `java.lang.IllegalArgumentException: foregroundServiceType 0x00000001 is not a subset of foregroundServiceType attribute 0x00000000 in service element of manifest file`，栈顶在 `androidx.work.impl.foreground.SystemForegroundService.startForeground`。**为什么权限齐了还崩**：Android 14+ 除了 `FOREGROUND_SERVICE_DATA_SYNC` 权限，还要求**起前台服务的那个组件本身**声明类型；那个组件是 work-runtime 2.12.0 清单里的 `SystemForegroundService`，它自带的 `foregroundServiceType` 是空的，合并进我们 App 后仍然是空 | 崩溃日志原文 + `app/build/intermediates/merged_manifests/debug/…/AndroidManifest.xml` 里合并后那一行 |
+| 修法 + **先写能复现它的测试**（AGENTS.md §6） | `AndroidManifest.xml` 显式合并该 service：`<service android:name="androidx.work.impl.foreground.SystemForegroundService" android:foregroundServiceType="dataSync" tools:node="merge" />`。新增 `TranscriptForegroundServiceTypeTest` 2 条，设备 **OK (2 tests)**：①从**装好的包**读 `PackageManager.getServiceInfo(…)` 断言 `foregroundServiceType and FOREGROUND_SERVICE_TYPE_DATA_SYNC != 0`；②断言 `requestedPermissions` 含 `FOREGROUND_SERVICE_DATA_SYNC` / `FOREGROUND_SERVICE` / `POST_NOTIFICATIONS`。⚠ 它故意读**已安装清单**而不是源码：这条 bug 的本质就是「源码里权限齐、合并后的组件属性没齐」，读源码的测试抓不到 | 用例 `workManager的前台服务在合并清单里声明了dataSync类型`、`前台服务类型与配对的权限一起声明` |
+| **第二个真 bug：点了底部「书架」切不走** | `popUpTo(start){saveState=true}` + `restoreState=true` 会把被 pop 掉的返回栈存下来再恢复；转录页是带查询参数的路由（`transcript?audioId=…`），恢复时把「转录这本书？」卡片连同 ViewModel 状态一起复活，实测点标签毫无反应。**修法**：去掉 `saveState`/`restoreState`，只留 `popUpTo(start)` + `launchSingleTop`（`navigateToShelfTab()` 同样处理），并在代码里留注释说明为什么不许加回来。修完按 navA→navE 重走一遍（转录页**有**卡片 → 书架 → 转录页**无**卡片 → 统计 → 书架），每步都对 | `MainActivity.kt` 的 tab `onClick`；5 次 `uiautomator dump`（`/tmp/ui_nav*.xml`） |
+| **一条没能定性的可疑记录（如实写，不算已解决）** | 导航 bug 还在的那段时间里，库里多出两行**相隔 13 秒**的同书 SUCCESS 任务：`c29cc479` 20:44:47 与 `c4595ba7` 20:45:00，而我只点了一次「开始转录」。两种猜测**都没有证据**：①卡片复活后点击/`LaunchedEffect` 被重复触发；②旧导航把同一路由压了两个实例，各提交一次。修掉导航后按同样顺序重点 4 次（含对 READY 书走「覆盖重转」）**没有再复现**——这只能说明「修完之后没再见到」，不等于找到了原因。**顺带暴露一个真缺口**：`enqueue()` 对已经在 RUNNING/SUCCESS 的书不做去重，第二次点确实会新建一行；现在只有 UI 的确认卡片挡着，**仓储层没有第二道闸** | 设备库 `transcript_job` 全表时间线（见上）；`TranscriptRepositoryImpl.enqueue` |
+| **FR-508 的四条降级文案都在设备上出现过**，且**没有一条承诺「帮你把时间填上」** | `INTERRUPTED`（上次进程被杀留下的行，`recoverInterrupted()` 在 `onCreate` 翻成 FAILED）→ 文案 + 「原始信息：…」把 `error_message` 原文照登；`OUTPUT_UNRELIABLE`（静音素材）→ 文案里「丢弃比例超过 **20%**」那个数是从 `AudioFormats.ASR_MAX_REJECTED_CHUNK_PERCENT` 渲染的，不是写死字符串，并明说「宁可失败也不按字数均分时间」；`CANCELLED`（真在跑的中途取消）→ 已取消 + 取消说明；`MODEL_MISSING` 文案里的「请先在模型页准备好」**目前指向还不存在的页面**（模型页 = 任务 #24），这是一处已知的文案与现实不符 | 截图 `/tmp/shot_failed.png`；JVM 用例 `每种失败都给得出一个动作`、`不合格占比那句话跟着常量走` |
+| 取消 / 重试在 UI 上没有说谎 | 重试是**新建一行**，旧行连错误码与原文留在列表里当上下文（实测 `dad73010`→`c29cc479`）。对**已结算**的行点取消，仓储返回 false，UI 不宣称「已取消」：第一次点取消时那轮其实已经跑完，卡片如实显示「已完成」；重做了一次真正的中途取消（入队后 ~4 s）才拿到 `CANCELLED`（`5963bd56` 20:55:50） | 设备库时间线；`/tmp/ui_cancel*.xml` |
+| **D36 串行化第一次在界面上看得见** | 两本书先后入队，同屏一张「转录中」（有进度文案）+ 一张「排队中」（`progressLabel` 返回 null ⇒ **既无百分比也无进度条**），前排结算之后后排才起步 | 截图 `/tmp/shot_queue.png`；JVM 用例 `排队中的任务一行进度都不给` |
+| 通知授权 | 进转录页请求 `POST_NOTIFICATIONS`，模拟器实测到系统弹窗；ALLOW 之后转录期间前台通知可见（`dataSync` 类型） | 弹窗截图 + `dumpsys notification` |
+| 构建与测试（**同一份代码树**，21:00 那一轮） | `:app:assembleDebug` + `:app:testDebugUnitTest --rerun-tasks` **BUILD SUCCESSFUL in 17s**；XML 汇总 **19 个类 / 216 用例 / 0 failures / 0 errors / 0 skipped**（新增 `TranscriptDisplayTest` 13）。仪器化 `am instrument -w -e package` **OK (106 tests)**，`Time: 95.147`。逐类：`PlaybackRepositoryTest` 21、`TranscriptRepositoryTest` 19、`AudioBookDaoTest` 11、`AudioRepositoryImportTest` 9、`TranscriptCoordinatorTest` 9、`SherpaOnnxEngineTest` 9、`VadSegmenterTest` 6、`Migration_2_3_Test` 5、`PcmDecoderTest` 4、`ModelManagerNetworkTest` 4、`SubtitleRepositoryTest` 4、`Migration_1_2_Test` 3、`TranscriptForegroundServiceTypeTest` 2（合计 106）。⚠ 仍走 `am instrument` 而不是 `connectedDebugAndroidTest`：后者会 `deletePackageX` 把模型、素材连数据一起删（§2b） | 测试 XML 汇总 + instrument 尾行与逐类点号 |
+
+**这一轮没做 / 做不了**：
+
+- `TranscriptWorker.doWork` 主体、`isStopped` → 取消位、意外异常补 `FAILED(UNKNOWN)`、`cancelWorkById` 撤销路径**仍然没有自动化用例**（新增那 2 条只测清单属性）。它们这一轮有了**设备证据**（前台通知可见、worker 日志「跳过：任务 … 的状态是 Failed，不该再跑推理」、中途取消真的停下来），但那是人工点出来的，不是用例。
+- `schedule()` 现在有生产调用方了（转录页 ViewModel），但 `APPEND` 排队语义仍无用例。
+- **「转录与播放同时在界面上跑不卡顿」（FR-509）没测**：验证转录时播放器没在放；§7 那条 `dumpsys gfxinfo` 主线程无阻塞同样还是空白。
+- ~~重复入队缺仓储层去重~~ → **不缺（2026-10-15 复核修正，文档此前漏改）**：`enqueue` 的 `activeOf` 守卫在 16ee324 就已落地并有仪器化用例（`重复入队返回同一个活动任务而不是排两个队` / `已就绪的书再入队被拦住而force放行`），QUEUED/RUNNING 重复点击返回同一行不新建，READY 拦截 + force 放行也早有用例。
+- `OUT_OF_MEMORY` 分支、朗读型切句阈值标定、m4a/FLAC 容器仍然没动。
+
 ## 5. 待补的自动化测试清单（按阶段）
 
 | Phase | 用例 |
@@ -490,7 +622,7 @@ FR-707（只在当前句变化时更新）用**设备 + 单测两头**取证：�
 | 3 | **已覆盖**：递归 3 层子目录 + 扩展名白名单 + 深度/数量截断；连续扫描不产生新记录；同一 URI 重复出现只算一次；size/mtime 变化 → CHANGED 且字幕标 EXPIRED、手改标题不被覆盖；文件消失 → MISSING 且不删记录；文件原样回来 → MISSING 翻回 PRESENT；跨文件夹重复文件留在原文件夹；授权无法持久化 → 导入失败不写库；重扫跳过授权失效文件夹但继续其他文件夹；时长读取失败 → `duration_read_failed`；书架 tab/搜索状态与查询同源。**待补（依赖 Phase 4 的会话表）**：消失文件的收听历史仍然保留 |
 | 4 | **已覆盖**：4.9s 不计次 / 5.0s 计次；缓冲+暂停+焦点丢失不计时；2x 播 10min → `listened_ms=600000`、`consumed_audio_ms=1200000`；拖到末尾不完播；1.5x 听完 → 完播；两次听完 → 完播 2；崩溃恢复不重复累计（含幂等与「不结算之后的新会话」）；重算与增量一致；重算能修正被写坏的缓存；切歌结束旧会话；删书保留 `listening_session`；统计只算已结算行；倍速只落自己那一列；时长未知不覆盖已知时长。**待补（最大的一块）**：`Media3PlaybackController` 零测试——需要 Media3 `SimpleBasePlayer` 当 `Player` 替身才测得动，而「自动切歌不换倍速」这个真 bug 正是因为没有这层测试才只能在设备上撞见。另待补：消失文件的收听历史仍然保留 |
 | 5 | **已覆盖**：首句/中间/末句窗口与不补位；空字幕表与「位置还在首句之前」（`currentIndex=-1`）；gap 内不跳动、越过 `start-250ms` 才切；seek 后窗口更新；5000 句二分正确性；换曲后重挂字幕流；导入解析（SRT/VTT/TSV、缺小时格式、一位小数毫秒、乱序重排、`end ≤ start` 整份拒绝、空文件失败）；单事务整本替换；删书连带删字幕且历史留着。**待补**：真实 ASR 产出的时间重叠/倒退（要 Phase 6 的模型输出）、长句换行的高亮目视（fixture 每句都短）|
-| 6 | **已覆盖（2026-10-15，纯逻辑层 → 解码层 → VAD → 真推理 → 任务状态机）**：分段绝对偏移（第 N 段不从 0 开始、180 段零漂移、块间不重叠不留缝）；>20s 段均分且各块长度最多差 1 样本；空段/负起点段跳过；`msOf`/`samplesOf` 换算与取整；16-bit LE 字节序与 ±1 缩放；多声道均值下混（反相 → ≈0、单侧 → 减半）与尾字节如实报出；重采样恒等性/常数增益/通带与阻带频响/分块==一次性/生产调用形状/`reset()`/输出长度 `ceil(N·out/in)`；**设备上真 MP3 解码**（148s 立体声素材：样本数对账偏差 0.22%、581 块首尾相接、幅度落在 ±1、`peak=0.659`、单缓冲上界 4,608 B 与文件长度无关、取消只交付 3 块、非音频文件给人话异常、静音素材解出全零）；**设备上真 VAD**（9 段、起点=16k 样本下标且 `%16==0`、段不重叠、`maxSpeechDuration` 生效、不同喂入块长结果一致）；**设备上真推理**（逐字 `timestamps` 单位=秒、落在自己块内、跨块单调、`durations` 空所以 `endMs` 取下一字起点、>20s 与样本数不符被拒）；**转录任务状态机**（入队/重复入队/已有 ASR 字幕拦截/只有测试字幕不算/书不存在；RUNNING→进度→SUCCESS 与字幕归属互相对得上；重转录整本替换；空字幕拒收且不碰已有字幕；重复结算整体回滚；非法跃迁返回 false；重试新建一行保留旧错误上下文；取消按 NONE/READY/EXPIRED 推导；重启恢复标 INTERRUPTED 且幂等；VAD 段数为 0 时不画假百分比）。**待补**：无标点长文本切句、异常时间戳清洗（Phase 6 第 5 项 `SentenceSplitter`）、**把上面这套接口接到生产调用方**（4b：WorkManager + UI，`work_request_id` 目前无人写）、真 ASR 结果入库后的字幕时间对齐误差人工抽查（FR-506）、m4a/FLAC 容器 |
+| 6 | **已覆盖（2026-10-15，纯逻辑层 → 解码层 → VAD → 真推理 → 任务状态机）**：分段绝对偏移（第 N 段不从 0 开始、180 段零漂移、块间不重叠不留缝）；>20s 段均分且各块长度最多差 1 样本；空段/负起点段跳过；`msOf`/`samplesOf` 换算与取整；16-bit LE 字节序与 ±1 缩放；多声道均值下混（反相 → ≈0、单侧 → 减半）与尾字节如实报出；重采样恒等性/常数增益/通带与阻带频响/分块==一次性/生产调用形状/`reset()`/输出长度 `ceil(N·out/in)`；**设备上真 MP3 解码**（148s 立体声素材：样本数对账偏差 0.22%、581 块首尾相接、幅度落在 ±1、`peak=0.659`、单缓冲上界 4,608 B 与文件长度无关、取消只交付 3 块、非音频文件给人话异常、静音素材解出全零）；**设备上真 VAD**（9 段、起点=16k 样本下标且 `%16==0`、段不重叠、`maxSpeechDuration` 生效、不同喂入块长结果一致）；**设备上真推理**（逐字 `timestamps` 单位=秒、落在自己块内、跨块单调、`durations` 空所以 `endMs` 取下一字起点、>20s 与样本数不符被拒）；**转录任务状态机**（入队/重复入队/已有 ASR 字幕拦截/只有测试字幕不算/书不存在；RUNNING→进度→SUCCESS 与字幕归属互相对得上；重转录整本替换；空字幕拒收且不碰已有字幕；重复结算整体回滚；非法跃迁返回 false；重试新建一行保留旧错误上下文；取消按 NONE/READY/EXPIRED 推导；重启恢复标 INTERRUPTED 且幂等；VAD 段数为 0 时不画假百分比）。**已覆盖（2026-10-15，端到端 9 条仪器化 + 9 条 JVM）**：整首歌跑完整条链并**第一次把模型的字写进生产库**（24 段 → 24 块 → 丢弃 0 → 35 句入库，索引连续 / 时间升序 / 不越出容器时长）；三道守护（授权缺失、模型缺失、文件不在原位）都在装载模型之前返回且不写字幕；`markRunning` 抢不到行就收手；`recoverInterrupted` 之后复活的 worker 覆盖不掉 INTERRUPTED；**跨书并发抢不到第二行 RUNNING**（D36，两条用例并对「删掉闸门」的构建证过伪，见 §4 Phase 6c-4）；取消位为真时停手不写终态；静音素材 → `OUTPUT_UNRELIABLE` 而不是 SUCCESS；中途 `total_segments` 恒 0 的如实上报；质量闸门的阈值边界与零句判定（JVM）。**已覆盖（2026-10-15，Phase 6d 转录页，见 §4）**：进度文案的诚实性（排队中 → null；分母未知 → 「已识别 N 段」且**不含 `%`**；分母出来 → `已识别 3/10 段（30%）`；成功 → `共 7 段全部识别`）；五种状态标签互不重名；可取消/可重试矩阵；**每种失败都给得出一个动作**（8 个 `TranscriptFailure` 分支逐个断言含「重试」或等价动作）；`OutputUnreliable` 文案里的阈值来自 `AudioFormats.ASR_MAX_REJECTED_CHUNK_PERCENT`；`AlreadyTranscribed` 文案里嵌的按钮名与 `startButtonLabel(Ready)` 同源；只有 READY 需要 `force`；Expired 文案说清「旧字幕会被整本替换」且不含「覆盖重转」；**装好的包里 `SystemForegroundService` 声明了 `dataSync`**（仪器化，读已安装清单——这是「点开始转录直接崩」那条 bug 的回归闸门）。**待补**：`work/TranscriptWorker.doWork` 主体、`isStopped` → 取消位、意外异常补 `FAILED(UNKNOWN)`、`cancelWorkById` 撤销路径**仍无用例**（这一轮只有人工点出来的设备证据）；`APPEND` 排队语义无用例（`schedule()` 现在有生产调用方了）；~~重复入队没有仓储层去重~~ → **已修正（2026-10-15 复核）**：`activeOf` 守卫 16ee324 就有且有用例，「第二次点会新建一行」对 QUEUED/RUNNING 不成立；「一行卡在 RUNNING 把后面所有转录挡住」没有用例（要绕过协调器才能造出这种行）；`OUT_OF_MEMORY` 分支无用例；切句阈值的**朗读型真人语音标定**（500ms/×2/700ms 现在只有一份歌唱素材撑着，见 §4 Phase 6c-2）；`boundaryGuess` 落库（要 v3→v4 迁移）；真 ASR 结果入库后的字幕时间对齐误差人工抽查（FR-506）；m4a/FLAC 容器 |
 | 迁移 | **已覆盖 MIGRATION_1_2**：`MigrationTestHelper` 对导出 `2.json` 校验（`recreateTableOnMigrationError=false`）、已有书籍与收听历史保留、FK 与索引存在。**已覆盖 MIGRATION_2_3**：结构对 `3.json`、字幕逐句不丢且 `id` 原值保留、删书带走字幕与任务（CASCADE）、**删任务只把 `job_id` 置空不删字幕**（SET NULL）、两条 FK 与三条索引都在（断言时滤掉 `sqlite_autoindex_*`）。规则不变：每条新 Migration 都要有对应测试，`fallbackToDestructiveMigration` 保持不出现 |
 
 ## 6. 只能人工/真机验证的项（尚未执行，勿声称完成）
@@ -498,10 +630,11 @@ FR-707（只在当前句变化时更新）用**设备 + 单测两头**取证：�
 - [ ] 蓝牙耳机拔出/断开实际暂停（`ACTION_AUDIO_BECOMING_NOISY`）。**模拟器原理上做不到**：受保护广播 + `adb emu` 无耳机命令；代码路径存在但一行实测都没有。
 - [ ] 其他 App 长期占用焦点（`AUDIOFOCUS_LOSS`）时的表现。来电（`LOSS_TRANSIENT`）已在模拟器实测，长期占用没造出场景。
 - [ ] App 到后台 30 分钟持续播放不被系统杀（只验证了「切后台仍播 + 划掉任务后进程存活」，没有做长时间）。
-- [ ] 2–3 GB RAM 真机上模型加载峰值 RSS、转录 RTF。
+- [ ] 2–3 GB RAM 真机上模型加载峰值 RSS、转录 RTF。**已有一半**：这台 `drill36` AVD 的总内存就是 2,531,868K（≈2.42 GB），实测峰值 PSS 442 MB / RSS 559 MB（见 §7 与 §6b），量级落在目标机型范围内；**换手机、换 SoC 后的 RTF 仍未测**，243 MB 模型在低存储机型上的装载耗时与是否被 lowmemorykiller 杀掉也仍未测。
 - [ ] 飞行模式下：已导入音频播放 + 已有字幕阅读全部可用（MVP 验收 10）。
 - [ ] 撤销 SAF 授权后的降级提示与重新授权流程。**仍未做**：需要真机或 `appops`/系统设置里手动撤销。目前只有仪器化测试证明「授权缺失时：导入抛 `PermissionRevokedException` 且不写库、重扫把该文件夹标成 REVOKED 并跳过、其他文件夹照常扫」，以及 UI 提示「文件夹授权已失效，请重新授权」。
 - [ ] 大目录（≥500 个 mp3）扫描耗时与内存。
+- [ ] 播放中发起转录不卡顿（FR-509）与转录期间主线程无阻塞。**界面入口已经有了**（任务 #23），但这一轮验证转录时播放器没在放，也没采 `dumpsys gfxinfo`（上一轮在仪器化进程里采它回 `No process found`，这一轮 Activity 是在渲染的，能采——只是没采）。见 §7。
 
 ### 6b. 已在模拟器实测、不再列为「只能真机」的项
 
@@ -510,7 +643,11 @@ FR-707（只在当前句变化时更新）用**设备 + 单测两头**取证：�
 - [x] 七句窗口跟随播放/拖动/倍速/切歌，点句跳到该句 `start_ms`（FR-701/702/705/706）：`uiautomator dump` 行数与文本 + 截图 + `run-as sqlite3` 读 `playback_state.last_position_ms` 复核，见 §4 Phase 5。
 - [x] 冷启动续播位置与退出前差 ≤10s（FR-309）：真 `am force-stop` + 冷启动实测，差 3394 ms，见 §4 Phase 5。
 - [x] 每首独立倍速在重开与自动切歌后都跟着换（FR-303）：设备实测 `dumpsys media_session` 的 `speed` 与 `playback_state.playback_speed` 对齐（顺带修掉「自动切歌不换倍速」的 bug，见 §4 Phase 5）。
+- [x] 模型装载与转录期间的内存峰值（Phase 6）：仪器化端到端**边跑边采样** 37 次 `dumpsys meminfo com.xinchen.echomind`，PSS 曲线 `85 → 112 → 139 → 401 → 400 → 433 → …（此后 31 个点全在 414~442 之间）`——**一个 ~260 MB 的台阶 + 一条平线**，台阶对应 243 MB 的 `model.int8.onnx` 装载，平线对应 24 段逐个识别；峰值 PSS 442 MB、RSS 559 MB，进程结束后释放。做法：`am instrument -w -e class '<FQCN>#<方法名>'` 放后台，前台 `while kill -0 $PID; do adb shell dumpsys meminfo …; sleep 1.5; done`。
 - [x] 首次进播放页会弹通知授权（`POST_NOTIFICATIONS`）：模拟器实测到系统弹窗与 ALLOW 之后的通知栏控制。
+- [x] **从界面发起一次真转录**（书架 ⋮ →「转录这本书」→ 转录页「开始转录」→ 排队中/转录中/已完成，35 句 `source=ASR` 字幕进用户库、书变 READY、播放页七句窗口读到它）：见 §4 Phase 6d。
+- [x] 转录的前台服务通知（`dataSync` 类型）在 targetSdk 36 上真起来了、转录中途点取消真的停下：见 §4 Phase 6d（顺带修掉「一点开始转录就崩」的清单合并 bug）。
+- [x] 底部标签在带参数的转录页上仍能切走（去掉 `saveState`/`restoreState` 之后 navA→navE 逐步复核）：见 §4 Phase 6d。
 
 复现步骤：安装 debug 包 → 按 `requirements.md` 对应 FR 编号逐条操作，结果与截图追加到本节。
 
@@ -518,5 +655,5 @@ FR-707（只在当前句变化时更新）用**设备 + 单测两头**取证：�
 
 - 进度写库频率（应 ≤1 次/10s）：**已实测**（Phase 4）——采 App 自己的 `updated_at_ms`（`elapsedRealtime`）差值，稳定在 ~10s；500ms tick 只推 `StateFlow`，不碰库。
 - 字幕列表只在当前句变化时重组：**逻辑半边已证**（Phase 5：`PlayerViewModelTest.同一句内部的位置推进不重发窗口` 断言同一句内推进零次重发、跨句才发一次；链路上还有 `distinctUntilChanged` 与 `StateFlow` 的内容相等去重两道）。**帧重计数没测**：Compose recomposition 计数工具未接入，Phase 7 一并做。
-- 转录期间主线程无阻塞：`adb shell dumpsys gfxinfo com.xinchen.echomind` 看 jank。（Phase 6）
-- 不整本 PCM 进内存：`Debug.getRuntimeStat("mem.max")` 在转录中采样。（Phase 6）
+- 转录期间主线程无阻塞：**仍然没有数据**（Phase 6d）。这一轮转录终于是**从界面发起**的了（Activity 在渲染），但我没采 `dumpsys gfxinfo`；能说的只有观察级证据——转录跑的那 ~40 s 里底部标签还能切、卡片还能点取消、没有 ANR 弹窗。已有的间接证据仍是两条：`SherpaOnnxEngine.open()` 与 `VadSegmenter` 构造里各有 `check(Looper.myLooper() != Looper.getMainLooper())`（主线程调就直接抛，两条仪器化用例证过），以及 worker 全程 `withContext(Dispatchers.IO)`。要补的是一次「播放 + 转录同时跑」的 gfxinfo/掉帧采样。
+- 不整本 PCM 进内存：**采样做过，但要说清它能证明什么**（Phase 6，12:31 那一轮，37 次 `dumpsys meminfo`）：PSS 呈「~260 MB 台阶 + 之后一条平线」，24 段识别的 ~50 s 里在 414~442 MB 之间抖动，峰值 PSS 442 MB / RSS 559 MB（机器总内存 2.42 GB）。⚠ **平线本身不能证明「没整本载入」**——148 s @16 kHz 单声道 float 整本也只有 **9.5 MB**，淹在模型那点噪声里；这条结构性保证来自代码（VAD 流式、codec 单缓冲上界实测 4,608 B、同时驻留的只有当前一段 ≤20 s ≈ 1.28 MB，见 §4 Phase 6 各轮），采样只补充了「装载确实是那笔大头、且跑完会掉下去」。

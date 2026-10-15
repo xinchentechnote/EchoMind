@@ -9,12 +9,15 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.xinchen.echomind.core.conf.AudioFormats
 import com.xinchen.echomind.domain.asr.AsrChunkPlanner
+import com.xinchen.echomind.domain.asr.SentenceSplitter
 import com.xinchen.echomind.domain.asr.TokenTimingMapper
 import com.xinchen.echomind.domain.model.ChunkRecognition
 import com.xinchen.echomind.domain.model.PcmChunkPlan
+import com.xinchen.echomind.domain.model.RecognizedSegment
 import com.xinchen.echomind.domain.model.SpeechSpan
 import java.io.File
 import org.junit.AfterClass
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.BeforeClass
 import org.junit.Test
@@ -36,6 +39,12 @@ class SherpaOnnxEngineTest {
 
     companion object {
         private const val TAG = "SherpaEngineTest"
+
+        /**
+         * 摘字时用掉的标点到集合：比 [com.xinchen.echomind.domain.asr.SentenceSplitter] 实际会补的「。」宽，
+         * 宽出来没关系——反面检查两边都摘，只要不漏摘就行。
+         */
+        private val PUNCT_FOR_TEST: Set<Char> = "。！？；，、：!?,;:.".toSet()
 
         private val context: Context = ApplicationProvider.getApplicationContext()
 
@@ -200,6 +209,78 @@ class SherpaOnnxEngineTest {
             InstrumentationRegistry.getInstrumentation().runOnMainSync { SherpaOnnxEngine.open(modelsRoot) }
         }
         assertTrue("主线程竟然能打开引擎：${outcome.exceptionOrNull()}", outcome.exceptionOrNull() is IllegalStateException)
+    }
+
+    @Test
+    fun `真模型的逐字时间喂进切句器得到能读的句子`() {
+        // 端到端第四环：解码 → VAD → 识别 → **切句**。JVM 那 22 条用的是手搓 token，
+        // 这条用模型真给的字与时间，专门证明两件事：字幕里没有一个字是造出来的，时间没有一句是负的或重叠的
+        val segmenter = VadSegmenter(DeviceAsrFixtures.vadModel(context))
+        val groups = mutableListOf<List<ChunkRecognition>>()
+        try {
+            PcmDecoder(context).decode(Uri.fromFile(DeviceAsrFixtures.fixture(context = context))) { samples, startSample ->
+                for (utterance in segmenter.push(samples)) {
+                    if (groups.size < 6) groups += chunksOf(utterance)
+                }
+                startSample + samples.size < 60L * AudioFormats.ASR_SAMPLE_RATE
+            }
+            for (utterance in segmenter.finish()) {
+                if (groups.size < 6) groups += chunksOf(utterance)
+            }
+        } finally {
+            segmenter.release()
+        }
+
+        // 一个 VAD 段 = 一个 RecognizedSegment（§6 第 1 条：段边界是切句的主要依据）
+        val recognized = groups.mapNotNull { chunks ->
+            val tokens = chunks.flatMap { it.tokens }
+            if (tokens.isEmpty()) return@mapNotNull null
+            val first = chunks.first().chunk
+            val last = chunks.last().chunk
+            RecognizedSegment(
+                startMs = AsrChunkPlanner.msOf(first.startSample, AudioFormats.ASR_SAMPLE_RATE),
+                endMs = AsrChunkPlanner.msOf(last.startSample + last.sampleCount, AudioFormats.ASR_SAMPLE_RATE),
+                tokens = tokens,
+            )
+        }
+        val drafts = SentenceSplitter.split(recognized)
+        Log.i(
+            TAG,
+            "切句：${recognized.size} 段 / ${recognized.sumOf { it.tokens.size }} 字 → ${drafts.size} 句，" +
+                "其中按长度硬切 ${drafts.count { it.boundaryGuess }} 句",
+        )
+        drafts.forEachIndexed { index, draft ->
+            Log.i(TAG, "  句$index ${draft.startMs}~${draft.endMs}「${draft.text}」硬切=${draft.boundaryGuess}")
+        }
+
+        assertTrue("真模型一个字都没给，切句无从谈起", drafts.isNotEmpty())
+        for (draft in drafts) {
+            assertTrue("句时长必须为正：$draft", draft.endMs > draft.startMs)
+            assertTrue(
+                "句末必须收在句号或模型自己给的标点上：「${draft.text}」",
+                draft.text.last() in "。！？；，、：!?,",
+            )
+            assertTrue("单句不许超过 ${AudioFormats.ASR_MAX_SENTENCE_CHARS} 字（加一个展示句号）：" + draft.text.length
+                , draft.text.length <= AudioFormats.ASR_MAX_SENTENCE_CHARS + 1)
+        }
+        assertTrue("字幕必须按时间升序", drafts.zipWithNext().all { (a, b) -> b.startMs >= a.startMs })
+        assertTrue("字幕之间不许重叠", drafts.zipWithNext().all { (a, b) -> a.endMs <= b.startMs })
+
+        // 可读性下限。这条是设备实测逼出来的：把「相邻起点差 ≥300 ms」当停顿判据时，
+        // 同一份素材给出 53 句 / 58 字（平均每句 1.1 字，几乎全是单字字幕），断言却全绿——
+        // 因为「时长为正、不重叠、逐字相等」这三条对单字字幕同样成立。改成「比本段中位字距明显更慢」后
+        // 实测 9 句 / 58 字（平均 6.4 字）。取 3 当门槛：低于它就不是切句，是逐字打字。
+        val contentChars = drafts.sumOf { draft -> draft.text.count { it !in PUNCT_FOR_TEST && !it.isWhitespace() } }
+        val average = contentChars.toDouble() / drafts.size
+        Log.i(TAG, "平均每句 ${"%.1f".format(average)} 字（$contentChars 字 / ${drafts.size} 句）")
+        assertTrue("平均每句只有 ${"%.1f".format(average)} 字：这是逐字字幕不是句子", average >= 3.0)
+
+        // 反面检查（FR-604）：把两边的标点都摘掉之后，字幕里的字必须与模型输出逐字相等——
+        // 切句只许重排与断开，不许补字、删字
+        fun strip(text: String) = text.filter { !it.isWhitespace() && it !in PUNCT_FOR_TEST }
+        val modelChars = strip(recognized.flatMap { it.tokens }.joinToString("") { it.token })
+        val draftChars = strip(drafts.joinToString("") { it.text })
+        assertEquals("字幕文本不是模型输出的重排", modelChars, draftChars)
     }
 
     @Test

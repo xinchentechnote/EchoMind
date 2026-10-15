@@ -3,6 +3,7 @@ package com.xinchen.echomind.asr
 import com.xinchen.echomind.core.time.TimeSource
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
@@ -16,6 +17,9 @@ import kotlinx.coroutines.withContext
 
 /** 取回失败：候选源全试过，仍拿不到一份校验通过的文件。 */
 class ModelDownloadException(message: String, cause: Throwable? = null) : IOException(message, cause)
+
+/** 本地导入失败：文件拿得到，但对不上清单（大小或 SHA-256），或者读不出来。 */
+class ModelImportException(message: String, cause: Throwable? = null) : IOException(message, cause)
 
 /** 正在下载的那个文件（一个模型包内串行取文件，所以同时只有一个）。 */
 data class FileDownload(
@@ -31,9 +35,11 @@ data class ModelStatus(
     /** null 表示还没核对过（进程刚起来时就是 null） */
     val verification: ModelVerification?,
     val isDownloading: Boolean = false,
+    /** 正在从本地文件导入。与下载分开标，因为界面上这两句话不能说成同一件 */
+    val isImporting: Boolean = false,
     val download: FileDownload? = null,
     /**
-     * 上一次**操作**（下载/删除）失败的原因；就绪与否一律看 [verification]，
+     * 上一次**操作**（下载/导入/删除）失败的原因；就绪与否一律看 [verification]，
      * 这里不重复放核对结论，免得两个来源的说法不一致。
      */
     val error: String? = null,
@@ -106,6 +112,106 @@ class ModelManager(
             updateStatus(spec.id) { it.copy(isDownloading = false, download = null, error = e.message) }
             throw e
         }
+    }
+
+    /**
+     * 从本地文件导入一个模型文件（FR-510 的「本地文件导入」那半边）。
+     *
+     * 规矩与下载**完全一致**：先落 `.part`、比大小、算整份 SHA-256、都过了才改名，任何失败都删掉半截文件。
+     * 这条不能松——导入进来的文件下一步就会被 `SherpaOnnxEngine.open()` 装载，
+     * 「名字对但内容坏」的模型比没有模型更糟（它会跑出看起来合理的错字幕）。
+     *
+     * [open] 由调用方给（Android 侧是 `contentResolver.openInputStream(uri)`），
+     * 这个类因此不碰任何 `android.*`，导入路径也能在 JVM 单测里跑。
+     * [source] 只用于写来源记录（如 SAF 的 uri），不参与任何判定。
+     *
+     * 与 [download] 的一处有意差别：**按单个文件结算**。导入成功一个就算成功，
+     * 即使这个包还缺别的文件也不抛——用户可能就是把两个文件分两次从电脑拷过来。
+     * 返回的 [ModelVerification] 里如实写着还缺什么。
+     */
+    suspend fun importFile(
+        spec: ModelSpec,
+        fileName: String,
+        source: String,
+        open: () -> InputStream,
+    ): ModelVerification = withContext(ioDispatcher) {
+        val fileSpec = spec.files.firstOrNull { it.fileName == fileName }
+            ?: throw ModelImportException("清单 ${spec.id} 里没有文件 $fileName，不能往这个包里塞别的东西")
+        val dir = ModelVerifier.dirOf(modelsRoot, spec)
+        if (!dir.exists() && !dir.mkdirs()) throw ModelImportException("无法创建模型目录：$dir")
+        val part = File(dir, "$fileName.part")
+        val target = File(dir, fileName)
+        updateStatus(spec.id) { it.copy(isImporting = true, download = null, error = null) }
+        try {
+            copyAndCheck(spec, dir, fileSpec, part, target, source, open)
+            val verification = ModelVerifier.verify(spec, modelsRoot, timeSource.wallMs())
+            applyVerifications(listOf(verification), clearError = true)
+            verification
+        } catch (e: CancellationException) {
+            part.delete()
+            updateStatus(spec.id) { it.copy(isImporting = false, download = null) }
+            throw e
+        } catch (e: IOException) {
+            part.delete()
+            updateStatus(spec.id) { it.copy(isImporting = false, download = null, error = e.message) }
+            throw e
+        }
+    }
+
+    private suspend fun copyAndCheck(
+        spec: ModelSpec,
+        dir: File,
+        fileSpec: ModelFileSpec,
+        part: File,
+        target: File,
+        source: String,
+        open: () -> InputStream,
+    ) {
+        val context = currentCoroutineContext()
+        part.delete()
+        var copied = 0L
+        var lastPublishAtMs = Long.MIN_VALUE
+        try {
+            open().use { input ->
+                val buffer = ByteArray(COPY_BUFFER_BYTES)
+                part.outputStream().use { output ->
+                    while (true) {
+                        context.ensureActive()
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        output.write(buffer, 0, read)
+                        copied += read
+                        val now = timeSource.monotonicMs()
+                        if (lastPublishAtMs == Long.MIN_VALUE || now - lastPublishAtMs >= PROGRESS_PUBLISH_INTERVAL_MS) {
+                            lastPublishAtMs = now
+                            updateStatus(spec.id) {
+                                it.copy(download = FileDownload(fileSpec.fileName, copied, fileSpec.expectedBytes))
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: IOException) {
+            throw ModelImportException("读不出这个文件（${fileSpec.fileName}）：${e.message}", e)
+        }
+        if (copied != fileSpec.expectedBytes) {
+            throw ModelImportException(
+                "${fileSpec.fileName} 大小不符：清单要求 ${fileSpec.expectedBytes} B，这个文件是 $copied B。" +
+                    "多半是选错了文件，或者拷贝时被截断",
+            )
+        }
+        val actualSha256 = ModelVerifier.sha256(part)
+        if (!actualSha256.equals(fileSpec.expectedSha256, ignoreCase = true)) {
+            throw ModelImportException(
+                "${fileSpec.fileName} SHA-256 不符：清单 ${fileSpec.expectedSha256}，这个文件 $actualSha256" +
+                    if (fileSpec.hasOfficialChecksum) "" else "（清单值是本机钉住的，非官方）",
+            )
+        }
+        target.delete()
+        if (!part.renameTo(target)) throw ModelImportException("无法把 ${part.name} 改名为 ${target.name}：$target")
+        appendProvenance(dir, spec, fileSpec, originKey = "local_import", origin = source)
     }
 
     /** 删掉整个模型包目录：只动 `filesDir/models/` 下这个包，字幕与收听历史一律不碰（FR-508）。 */
@@ -186,21 +292,22 @@ class ModelManager(
             if (!part.renameTo(target)) {
                 throw ModelDownloadException("无法把 ${part.name} 改名为 ${target.name}：$target")
             }
-            appendProvenance(dir, spec, fileSpec, url)
+            appendProvenance(dir, spec, fileSpec, originKey = "url", origin = url)
         } finally {
             part.delete()
         }
     }
 
     /**
-     * 追加来源记录，`key=值` 平铺。
+     * 追加来源记录，`key=值` 平铺。[originKey] 是 `url`（下载）或 `local_import`（本地导入）——
+     * 两者不能写成同一个键，否则事后在设备上分不清这份文件是从哪来的。
      * 不用 `java.util.Properties.store`：它的 Writer 重载与 `%02x` 之类 API 有 minSdk 坑，
-     * 而这里写的全是 ASCII，直接 `appendText`（UTF-8）最省事也最好核对。
+     * 直接 `appendText`（UTF-8）最省事也最好核对。
      */
-    private fun appendProvenance(dir: File, spec: ModelSpec, fileSpec: ModelFileSpec, url: String) {
+    private fun appendProvenance(dir: File, spec: ModelSpec, fileSpec: ModelFileSpec, originKey: String, origin: String) {
         val name = fileSpec.fileName
         val line = buildString {
-            append("$name.url=").append(url).append('\n')
+            append("$name.$originKey=").append(origin).append('\n')
             append("$name.bytes=").append(fileSpec.expectedBytes).append('\n')
             append("$name.sha256=").append(fileSpec.expectedSha256).append('\n')
             append("$name.checksum=").append(if (fileSpec.hasOfficialChecksum) "official" else "pinned-by-first-download").append('\n')
@@ -245,6 +352,9 @@ class ModelManager(
 
         /** 243 MB 按 64 KB 分块会有 ~3700 次回调，全推给 StateFlow 会让订阅者疯狂重组 */
         private const val PROGRESS_PUBLISH_INTERVAL_MS = 250L
+
+        /** 本地导入时的拷贝缓冲：与哈希计算同宽，243 MB 走内存流也只是一趟 */
+        private const val COPY_BUFFER_BYTES = 64 * 1024
 
         fun describeFailure(failure: FileFailure): String = when (failure) {
             is FileFailure.Missing -> "${failure.fileName} 不存在"

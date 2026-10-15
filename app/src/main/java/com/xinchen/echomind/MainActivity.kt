@@ -19,6 +19,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.NavGraph.Companion.findStartDestination
+import androidx.navigation.NavController
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -29,6 +30,7 @@ import com.xinchen.echomind.ui.nav.Destinations
 import com.xinchen.echomind.ui.player.PlayerScreen
 import com.xinchen.echomind.ui.shelf.ShelfScreen
 import com.xinchen.echomind.ui.stats.StatsScreen
+import com.xinchen.echomind.ui.transcript.TranscriptScreen
 import com.xinchen.echomind.ui.theme.EchoMindTheme
 
 class MainActivity : ComponentActivity() {
@@ -62,12 +64,16 @@ private fun RootScreen() {
             NavigationBar {
                 tabs.forEach { tab ->
                     NavigationBarItem(
-                        selected = currentRoute?.hierarchy?.any { it.route == tab.route } == true,
+                        // 转录页还有一条带查询参数的路由（`transcript?audioId=…`），比对只看 `?` 之前那一段，
+                        // 否则从书架跳过去之后底部「转录」标签就不亮了
+                        selected = currentRoute?.hierarchy?.any { it.route?.substringBefore('?') == tab.route } == true,
                         onClick = {
+                            // 刻意不用 saveState/restoreState：带参数的转录页被 pop 掉之后，
+                            // restoreState 会把它连同「转录这本书？」卡片一起复活，实测点「书架」根本切不走。
+                            // 标签页的滚动位置记忆不值得换这个 bug
                             navController.navigate(tab.route) {
-                                popUpTo(navController.graph.findStartDestination().id) { saveState = true }
+                                popUpTo(navController.graph.findStartDestination().id)
                                 launchSingleTop = true
-                                restoreState = true
                             }
                         },
                         alwaysShowLabel = false,
@@ -83,8 +89,21 @@ private fun RootScreen() {
             startDestination = Destinations.SHELF,
             modifier = Modifier.padding(padding),
         ) {
-            composable(Destinations.SHELF) { ShelfScreen(onOpenPlayer = { audioId -> navController.navigate(Destinations.player(audioId)) }) }
-            composable(Destinations.TRANSCRIPT) { Placeholder("转录任务", "Phase 6") }
+            composable(Destinations.SHELF) {
+                ShelfScreen(
+                    onOpenPlayer = { audioId -> navController.navigate(Destinations.player(audioId)) },
+                    onTranscribe = { audioId -> navController.navigate(Destinations.transcript(audioId)) },
+                )
+            }
+            composable(
+                route = Destinations.TRANSCRIPT_WITH_AUDIO,
+                arguments = listOf(navArgument("audioId") { type = NavType.StringType; nullable = true; defaultValue = null }),
+            ) { entry ->
+                TranscriptScreen(
+                    onOpenShelf = { navController.navigateToShelfTab() },
+                    pendingAudioId = entry.arguments?.getString("audioId"),
+                )
+            }
             composable(Destinations.STATS) { StatsScreen() }
             composable(Destinations.SETTINGS) { Placeholder("设置", "Phase 7") }
             composable(
@@ -98,6 +117,12 @@ private fun RootScreen() {
             }
         }
     }
+}
+
+/** 底部标签的导航规矩（singleTop + 回到起点），转录页的「去书架」与标签点击共用同一套 */
+private fun NavController.navigateToShelfTab() = navigate(Destinations.SHELF) {
+    popUpTo(graph.findStartDestination().id)
+    launchSingleTop = true
 }
 
 /** 各 Phase 落地前如实标注未实现，避免用假界面冒充功能 */

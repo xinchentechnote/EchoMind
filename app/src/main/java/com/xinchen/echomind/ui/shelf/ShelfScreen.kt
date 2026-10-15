@@ -57,6 +57,7 @@ import com.xinchen.echomind.ui.common.progressFraction
 @Composable
 fun ShelfScreen(
     onOpenPlayer: (String) -> Unit,
+    onTranscribe: (String) -> Unit,
     modifier: Modifier = Modifier,
     viewModel: ShelfViewModel = viewModel(factory = ShelfViewModel.Factory),
 ) {
@@ -134,6 +135,7 @@ fun ShelfScreen(
                             onToggleFavorite = { viewModel.toggleFavorite(row.id, !row.isFavorite) },
                             onRename = { renaming = row },
                             onRemove = { viewModel.removeBook(row.id) },
+                            onTranscribe = { onTranscribe(row.id) },
                         )
                     }
                 }
@@ -190,6 +192,7 @@ private fun ShelfRowItem(
     onToggleFavorite: () -> Unit,
     onRename: () -> Unit,
     onRemove: () -> Unit,
+    onTranscribe: () -> Unit,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     val missing = row.fileStatus == AudioBookEntity.FileStatus.Missing
@@ -215,6 +218,9 @@ private fun ShelfRowItem(
                 }
                 DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                     DropdownMenuItem(text = { Text("重命名") }, onClick = { menuOpen = false; onRename() })
+                    // 转录不在这里入队，只把书带到转录页去确认：那一页才是唯一能发起转录的地方，
+                    // 「同一时刻只跑一本」的说明也就只需要写一份
+                    DropdownMenuItem(text = { Text("转录这本书") }, onClick = { menuOpen = false; onTranscribe() })
                     DropdownMenuItem(text = { Text("从书架移除") }, onClick = { menuOpen = false; onRemove() })
                 }
             }

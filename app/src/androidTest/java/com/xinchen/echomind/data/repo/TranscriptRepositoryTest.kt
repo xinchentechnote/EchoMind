@@ -72,16 +72,17 @@ class TranscriptRepositoryTest {
 
     /** 书的默认状态可变：`fileLastModifiedMs` 与转录状态要按每个用例的场景摆 */
     private fun upsertBook(
+        audioId: String = "a",
         lastModifiedMs: Long = 1L,
         transcriptionState: String = AudioBookEntity.TranscriptionState.None,
     ) = runBlocking {
         db.audioBookDao().upsert(
             AudioBookEntity(
-                id = "a",
-                uri = "uri://a",
+                id = audioId,
+                uri = "uri://$audioId",
                 folderId = "folder-1",
-                relativePath = "a.mp3",
-                fileName = "a.mp3",
+                relativePath = "$audioId.mp3",
+                fileName = "$audioId.mp3",
                 title = "第一首",
                 sizeBytes = 1_000,
                 fileLastModifiedMs = lastModifiedMs,
@@ -253,6 +254,33 @@ class TranscriptRepositoryTest {
         assertEquals(AudioBookEntity.TranscriptionState.Failed, bookState())
     }
 
+    /**
+     * D36：一份 int8 模型 243 MB，两本书同时开就是 OOM 而不是慢。
+     * 这道闸写在**一条 SQL 语句里**而不是「先查有没有 RUNNING 再改」——查与改之间正是并发窗口，
+     * 两次并发的「查」都能看见空车道，然后两个都改成功。
+     */
+    @Test
+    fun 别的任务正在跑时第二本书的任务抢不到运行中的行() = runBlocking {
+        upsertBook(audioId = "b")
+        val first = (repo.enqueue("a", model) as EnqueueOutcome.Created).jobId
+        val second = (repo.enqueue("b", model) as EnqueueOutcome.Created).jobId
+
+        assertTrue(repo.markRunning(first, totalSegments = 4))
+        assertFalse("第二本书竟然也拿到了运行中的行", repo.markRunning(second, totalSegments = 4))
+
+        val blocked = job(second)
+        assertEquals(TranscriptJobEntity.Status.Queued, blocked.status)
+        assertNull("抢不到车道就不该有开始时间：$blocked", blocked.startedAtMs)
+        // 入队本来就会把那本书标成 QUEUED（第一个用例守的就是这件事），关键是它没被翻成 RUNNING
+        assertEquals(AudioBookEntity.TranscriptionState.Queued, db.audioBookDao().getById("b")!!.transcriptionState)
+        // 同一行自己撞第二次还是老理由（不是 QUEUED），不是被这条新闸挡的
+        assertFalse(repo.markRunning(first, totalSegments = 4))
+
+        // 第一轮结算完让出车道，第二轮才抢得到
+        repo.commitSubtitles(first, segments("第一轮的"))
+        assertTrue(repo.markRunning(second, totalSegments = 4))
+    }
+
     @Test
     fun 重试新建一行并保住旧行的错误上下文() = runBlocking {
         val failed = (repo.enqueue("a", model) as EnqueueOutcome.Created).jobId
@@ -352,5 +380,34 @@ class TranscriptRepositoryTest {
         assertEquals(TranscriptJobStatus.Queued, row.status)
         assertNull(row.progress)
         assertTrue(row.status.isActive)
+    }
+
+    /**
+     * worker 只拿到 jobId，得先查回这一行才能找到书；WorkManager 的请求 id 也要写回同一行，
+     * 取消按钮才有东西可 cancel（`TranscriptWorkScheduler`）。
+     */
+    @Test
+    fun 按id取行并把工作请求id写回活动任务() = runBlocking {
+        val jobId = (repo.enqueue("a", model) as EnqueueOutcome.Created).jobId
+
+        val loaded = repo.jobById(jobId)
+        assertEquals(jobId, loaded!!.id)
+        assertEquals("a", loaded.audioId)
+        assertNull(loaded.workRequestId)
+
+        assertTrue(repo.attachWorkRequest(jobId, "3f6c2a1e-0000-4000-8000-111122223333"))
+        assertEquals("3f6c2a1e-0000-4000-8000-111122223333", repo.jobById(jobId)!!.workRequestId)
+
+        assertNull(repo.jobById("没有这个任务"))
+    }
+
+    /** 行已经结束了就别再写请求 id：写了也没人读，返回 false 让调度方去收掉那个请求 */
+    @Test
+    fun 已结束的任务写不回工作请求id() = runBlocking {
+        val jobId = (repo.enqueue("a", model) as EnqueueOutcome.Created).jobId
+        repo.markFailed(jobId, TranscriptFailure.ModelMissing, "模型没准备好")
+
+        assertFalse(repo.attachWorkRequest(jobId, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"))
+        assertNull(repo.jobById(jobId)!!.workRequestId)
     }
 }

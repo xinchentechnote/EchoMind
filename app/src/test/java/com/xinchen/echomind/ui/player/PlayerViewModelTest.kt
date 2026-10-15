@@ -18,6 +18,7 @@ import com.xinchen.echomind.domain.model.PlaybackProgress
 import com.xinchen.echomind.domain.playback.PlaybackController
 import com.xinchen.echomind.domain.playback.PlaybackUiState
 import com.xinchen.echomind.domain.model.SubtitleSegment
+import com.xinchen.echomind.domain.model.TranscriptionTarget
 import com.xinchen.echomind.domain.playback.QueueItem
 import com.xinchen.echomind.domain.subtitle.SubtitleWindow
 import kotlinx.coroutines.Dispatchers
@@ -77,6 +78,7 @@ class PlayerViewModelTest {
         override fun shelf(tab: ShelfTab, query: String): Flow<List<ShelfRow>> = shelfFlow
         override fun lastPlayed(): Flow<ShelfRow?> = MutableStateFlow(null)
         override fun folders(): Flow<List<ImportedFolderEntity>> = MutableStateFlow(emptyList())
+        override suspend fun transcriptionTarget(audioId: String): TranscriptionTarget? = unsupported()
         override suspend fun setFavorite(audioId: String, favorite: Boolean) {
             favorites += audioId to favorite
         }

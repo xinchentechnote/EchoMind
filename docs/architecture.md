@@ -37,11 +37,12 @@ app/src/main/java/com/xinchen/echomind/
 │   ├── text/TitleDeriver.kt       // ✅ 文件名→默认标题
 │   ├── subtitle/SubtitleSynchronizer.kt // ✅ 当前句二分查找 + 七句窗口 + gap 迟滞
 │   ├── subtitle/TestSubtitleParser.kt   // ✅ SRT/VTT/TSV → 带时间的句（只服务调试导入通道）
-│   ├── text/SentenceSplitter.kt     // — Phase 6（切句对象是模型输出的整段文本）
+│   ├── asr/SentenceSplitter.kt      // ✅ 逐字时间 → 句级字幕：标点/停顿断句 + 过度切分合并 + 超长回退 + 时间清洗（FR-602/603）
 │   ├── asr/PcmConversion.kt         // ✅ 16-bit LE 字节 → 单声道 float（均值下混），纯 Kotlin
 │   ├── asr/SincResampler.kt         // ✅ 源采样率 → 16k 的抗混叠流式重采样（窗口 sinc，33 抽头）
 │   ├── asr/AsrChunkPlanner.kt       // ✅ >20s 语音段均分成 ≤20s 块 + 绝对毫秒偏移（FR-505）
 │   ├── asr/TokenTimingMapper.kt     // ✅ 模型逐字「秒」→ 绝对毫秒；数量不符/越界/倒序一律抛 Mismatch，不猜
+│   ├── asr/TranscriptQuality.kt     // ✅ 质量闸门：丢弃块占比 > 阈值就不算一份字幕（纯 Kotlin，9 条 JVM 单测，见 D34）
 │   └── model/AsrModels.kt           // ✅ SpeechSpan / PcmChunkPlan / TokenTiming / ChunkRecognition（不暴露任何 native 类型）
 ├── data/
 │   ├── db/                        // ✅ Entity / DAO / EchoMindDatabase / Migrations
@@ -53,18 +54,21 @@ app/src/main/java/com/xinchen/echomind/
 │   ├── Media3PlaybackController.kt// ✅ 实现 + Player.Listener + 统计事件翻译 + 串行落库通道
 │   ├── PlayerHolder.kt            // ✅ 单例 ExoPlayer 持有（同进程共享给 Service；不提供 release()）
 │   └── EchoMindMediaService.kt    // ✅ MediaSessionService + addSession + 前台通知 + onTaskRemoved
-├── asr/                           // 模型准备 ✅ + 解码 ✅ + VAD ✅ + 推理 ✅（端到端串联还没有；入库的状态机与事务在 data/repo）
+├── asr/                           // 模型准备 ✅ + 解码 ✅ + VAD ✅ + 推理 ✅ + **端到端编排 ✅**（入库的状态机与事务在 data/repo）
 │   ├── ModelCatalog.kt            // ✅ 清单唯一出处：URL/字节数/SHA-256 全部实测，无官方校验值标 null 并本机钉住
 │   ├── ModelVerifier.kt           // ✅ 存在 → 大小 → SHA-256 三步核对 + 流式哈希（纯 JVM，可单测）
 │   ├── ModelFetcher.kt            // ✅ `fun interface ModelFetcher`（测试接缝）+ `HttpFetcher`（HttpURLConnection，手工跟 Location）
 │   ├── ModelManager.kt            // ✅ statuses/download/delete/refresh：`.part` → 校验 → 改名 → 记来源，多源回退、文件级跳过、250ms 进度限流
 │   ├── PcmDecoder.kt              // ✅ MediaExtractor+MediaCodec 同步模式流式解码 → 16k 单声道定长块；4 条仪器化在真 MP3 上跑过
 │   ├── VadSegmenter.kt            // ✅ silero VAD 流式封装：push 块 → 出段（绝对样本下标 + 段内样本），6 条仪器化
-│   ├── SherpaOnnxEngine.kt        // ✅ 离线 Paraformer 封装：open 前按清单核对，recognize(块) → 逐字绝对毫秒；8 条仪器化
-│   └── TranscriptCoordinator      // — Phase 6 第 4 项（把上面三层串起来；取消/重试/入库的仓储接口已经就绪，等它来调）
+│   ├── SherpaOnnxEngine.kt        // ✅ 离线 Paraformer 封装：open 前按清单核对，recognize(块) → 逐字绝对毫秒；9 条仪器化
+│   └── TranscriptCoordinator.kt   // ✅ 六环串起来 + 守护顺序（含跨书单行 RUNNING 闸门）+ 取消只停手 + 质量闸门 + 单事务入库；9 条仪器化（148 s 整首歌 → 35 句入库）
 │       （`PcmResampler` 这个名字不再需要：采样率转换落在 `domain/asr/SincResampler`）
-├── work/                          // TranscriptWorker / FolderRescanWorker — Phase 6
-│   └──（当前无 WorkManager：重扫是 appScope 里的 `Dispatchers.IO` 协程）
+├── work/                          // ✅ TranscriptWorker + TranscriptWorkScheduler（WorkManager 2.12.0，`implementation(libs.androidx.work.runtime.ktx)`）
+│   ├── TranscriptWorker.kt        // ✅ 已在设备上真跑（前台通知可见、中途取消停下、守卫拒绝复活）；**主体逻辑仍无用例**：setForeground(dataSync) + 通知 + 结局→Result + 意外异常兜 UNKNOWN
+│   ├── TranscriptWorkScheduler.kt // ✅ 有生产调用方（转录页 ViewModel）；`APPEND` 排队**无用例**（跨书单一唯一名的串行化见 D36）
+│   └──（`androidTest` 侧有 `work/TranscriptForegroundServiceTypeTest`：2 条，断言**合并后清单**里 `SystemForegroundService` 带 `dataSync` + 权限齐，是 D37 的回归闸门）
+│   └──（文件夹重扫**没有** Worker：仍是 appScope 里的 `Dispatchers.IO` 协程 — Phase 7）
 └── ui/
     ├── theme/Theme.kt             // ✅ Material 3
     ├── nav/Destinations.kt        // ✅ 路由
@@ -73,7 +77,8 @@ app/src/main/java/com/xinchen/echomind/
     ├── shelf/                     // ✅ ShelfScreen + ShelfViewModel
     ├── player/                    // ✅ PlayerScreen + PlayerViewModel
     ├── stats/                     // ✅ StatsScreen + StatsViewModel
-    └── settings/ transcript/      // — Phase 7 / 6（底部导航当前是「书 / 转 / 统 / 设」四个入口）
+    ├── transcript/                // ✅ TranscriptScreen + TranscriptViewModel + TranscriptDisplay（纯 Kotlin 文案，13 条 JVM 用例）
+    └── settings/                  // — Phase 7（底部导航当前是「书 / 转 / 统 / 设」四个入口）
 ```
 
 测试目录同结构镜像（`app/src/test/...` 纯 JVM，`app/src/androidTest/...` 仪器化）。
@@ -229,22 +234,33 @@ EchoMindMediaService(MediaSessionService) ── addSession(MediaSession.Builder
 
 ### 5.3 转录
 ```
-TranscriptRepository.enqueue ✅ ─► WorkManager(前台类型 mediaPlayback? 见下) 
-  ─► TranscriptCoordinator(代码里还没有，Phase 6 第 4 项):
+TranscriptRepository.enqueue ✅ ─► TranscriptWorkScheduler ✅ ─► WorkManager（前台类型 **dataSync**，`TranscriptWorker.setForeground`）
+  ─► TranscriptCoordinator ✅(asr/TranscriptCoordinator.kt，已挂进 AppGraph):
+       守护：job/书还在 → 状态是 QUEUED → 文件在 → **树** uri 有授权 → VAD 模型合格 → markRunning（抢不到就 Skipped）
        PcmDecoder ✅(MediaExtractor+MediaCodec 同步流式 → PcmConversion 均值下混 → SincResampler 到 16k → 定长块回调)
        ─► VadSegmenter ✅(silero VAD，float 块 → VadUtterance(绝对样本下标 + 段内样本)，段与段不重叠，≤20 s 强制切段)
        ─► AsrChunkPlanner ✅(>20s 段均分成 ≤20s 块，用全局样本下标算绝对 startMs/endMs)
-       ─► SherpaOnnxEngine ✅.recognize(块) ─► ChunkRecognition(text + tokens[绝对毫秒])
-       ─► SentenceSplitter(标点切句 + 时间清洗 — 还没有，Phase 6 第 5 项)
+       ─► SherpaOnnxEngine ✅.recognize(块) ─► ChunkRecognition(text + tokens[绝对毫秒])；Mismatch → 整块丢弃并计数
+       ─► SentenceSplitter ✅(标点/停顿断句 + 跨段合并 + 超长句回退 + 时间清洗 → List<SubtitleDraft>)
+       ─► TranscriptQuality ✅(丢弃占比 > 20% 或零句 → FAILED(OUTPUT_UNRELIABLE)，不入库)
+       ─► sortedBy{startMs} + mapIndexed ✅(FR-601 的排序责任在编排层，见 D35)
        ─► TranscriptRepository.commitSubtitles ✅(Room 单事务：删旧字幕 + 插新字幕(source=ASR, job_id) + job=SUCCESS + audio.transcriptionState=READY)
-  ─► 进度每块更新一次（内存节流 ≥1s 写库）
+  ─► 进度：每段一次，≥1s 节流写库；**中途 total 恒为 0**（VAD 没跑完就数不出段数，见 `asr-design.md` §5 第 8 步）
 ```
-前三步已在 emulator-5554 上真串起来跑过（`VAD段逐块识别出来的时间是全局单调的`：60 s 素材 → 9 段 → 6 块 → 58 个逐字时间，
-跨块单调、全部落块内），但**串联代码在测试里，不在生产代码里**：`TranscriptCoordinator` 与 WorkManager 还没写。
-任务这一侧 v3 已经落地（`transcript_job` 表 + `TranscriptRepository` 全套跃迁 + 16 条仪器化用例），
-也就是说图上最后那两格是**能跑的、有人测过的**，只是现在还没有调用方——模型识别出的字句至今一次都没进过生产数据库。
+**这一串现在是生产代码，不再是测试里的拼接**（2026-10-15，Phase 6 第 4b 项）。设备端到端实测：148 s 整首歌 →
+`解码 2378188 样本（44100 Hz/2 ch → 16000 Hz，容器时长 148303 ms），语音段 24 个，块 24 个，丢弃 0 个；句子 35（硬切边界 0 句）`，
+墙钟 42,965 ms（同一条用例两次独立再跑：33,453 ms 与 63,714 ms——**三次产出逐项相同，耗时差 1.9 倍**），35 句落库（`TranscriptCoordinatorTest`，9 条仪器化）。
+⚠ **端到端用例落的是用例进程里的 in-memory Room**：路径是生产的（真解码 + 真模型 + 真 `TranscriptRepositoryImpl` + 真 DAO/schema v3）。
+✅ **用户点得到的那一半在 Phase 6d 补上了**（2026-10-15）：转录页（书架 ⋮ →「转录这本书」→ 确认卡片 →「开始转录」）是 `schedule()` 的生产调用方，
+用户机上那份 `echomind.db` 里现在有 **35 行 `source=ASR` 字幕**（`segment_index` 0~34 连续、`start_ms` 14,134 ~ `end_ms` 145,766，都在容器时长 148,304 ms 内），
+`那些花儿` 是 `READY`，播放页七句窗口读的就是它（`docs/testing.md` §4 Phase 6d）。
+仍缺的自动化测试：`TranscriptWorker.doWork` 主体、`isStopped` → 取消位、意外异常补 `FAILED(UNKNOWN)`、`cancelWorkById` 撤销**无用例**
+（`work/` 现在有的 2 条只断言合并后清单里的前台服务类型与权限），这些只有人工点出来的设备证据。两本书并发入队会各开一个引擎这条（D36）**已修**：`markRunning` 的 SQL 里加了
+「已有 RUNNING 就抢不到」的闸门（有设备用例并做过证伪），调度器同时改成全局单一唯一名 + `APPEND`（无用例，但界面上看得见：同屏「转录中 + 排队中」）。
+任务这一侧 v3 已落地（`transcript_job` 表 + 全套跃迁 + **19** 条仪器化用例），协调器的「抢不到行就收手」完全靠那些 `WHERE status` 守卫。
 一条实测到的坑：块的边界不等于句子的边界——同一段歌词整块 20 s 识别出「那片笑声让我想起我的那些年」，
-被 VAD 切成两块后给出「偏笑声让」+「想起我的那些话」。逐字时间依然有效，但文本要靠 `SentenceSplitter` 收拾，不能拿块文本直接当字幕。
+被 VAD 切成两块后给出「偏笑声让」+「想起我的那些话」。逐字时间依然有效，但文本要靠 `SentenceSplitter` 收拾，不能拿块文本直接当字幕
+（收拾之后第一句仍是「偏笑声让想起我的那些话。」——**切句修的是断句，不是识别错误**，那半句白字是模型在 2 s 的碎块上听出来的）。
 前台服务用于长任务通知：转录用 `ForegroundInfo`（WorkManager 支持在 worker 返回 `Result` 前 `setForeground`），不额外起 Service。
 
 ### 5.4 字幕同步（Phase 5 已实现，名字与代码一致）
@@ -265,12 +281,14 @@ controller.state.map { it.positionMs }        // 500ms tick，即 PlaybackPolicy
 | 播放事件的落库 | 控制器内 `Channel<suspend () -> Unit>(UNLIMITED)`，单个 IO 协程按序消费：Media3 回调并发进来，串行才不会有两个写对同一行「读-改-写」。每个 op 用 `runCatching` 包住，失败只 `Log.w` 后跳过（不重试、不崩播放），所以**统计落库失败会静默丢这一笔**，见 §10 D13 |
 | 目录扫描 | `Dispatchers.IO`（WorkManager 或 appScope 协程） |
 | 播放器回调 | Media3 应用线程（主线程），只做轻量状态搬运 |
-| PCM 解码/重采样/VAD | **设计**：转录 worker 的协程/线程池，`Dispatchers.Default`（`PcmDecoder`/`VadSegmenter` 代码已就绪，worker 还没写，目前只在仪器化测试的调用线程上跑） |
-| ASR 推理 | **设计（代码里还没有）**：单线程串行（`asrDispatcher = newSingleThreadContext`），避免多模型实例并存；同一时刻只一个引擎句柄。当前只有仪器化测试在调用线程上直接 `SherpaOnnxEngine.open()`，两个类里的 `check(Looper… != getMainLooper())` 是这条约束目前唯一的执行者 |
+| PCM 解码/重采样/VAD | **实测（2026-10-15）**：`TranscriptWorker` 里 `withContext(Dispatchers.IO)` → `TranscriptCoordinator.run` 全程阻塞在该线程（解码回调直接驱动 VAD 与识别，**故意不用协程并发**：识别必须紧跟解码，攒着一本书的 PCM 就是 230 MB，NFR-05）。仪器化用例直接调协调器，跑在 `InstrumentationRegistry` 的调用线程上 |
+| ASR 推理 | **实测**：同一条 IO 线程上串行，`SherpaOnnxEngine.open()` 只在该线程调用（装载 3.0~4.9 s）。⚠ 原设计的 `asrDispatcher = newSingleThreadContext` **没有实现**，取而代之的是**引擎生命周期绑在 `run()` 的一次调用上**（`try/finally` 里 `release()`），所以「一次运行只一个句柄」成立。**「同一进程只一个句柄」现在也成立**——原本唯一名按书分开时两本书同时入队就是两个 worker、两份模型，D36 修成了「SQL 单行闸门 + 全局唯一名 `APPEND`」两处；有设备用例的是前者，后者只有结构论证。主线程拒绝执行由 `SherpaOnnxEngine`/`VadSegmenter` 里的 `check(Looper… != getMainLooper())` 兜，两条 `runOnMainSync` 用例证过 |
 | UI | Compose + `collectAsStateWithLifecycle` |
 
 约束：
-- 全 App 只有 1 个 ExoPlayer 实例；只有 1 个 ASR 引擎句柄；转录与播放可并行但互不共享线程。
+- 全 App 只有 1 个 ExoPlayer 实例；转录与播放可并行但互不共享线程。
+- 「只有 1 个 ASR 引擎句柄」现在跨书也成立：协调器在 `open()` **之前**过 `markRunning` 那道单行闸门（D36），抢不到就一行不写地收手；
+  这一半有设备用例（`别的书正在跑时第二个协调器收手且不写字幕`，并对证伪构建变红），WorkManager 那一半（全局唯一名 + `APPEND`）没有用例。
 - 播放位置的持久化节流（10s）与 UI 刷新（200ms~1s）分离，避免 DB 写放大。
 
 ## 7. 依赖注入与可测试性
@@ -286,10 +304,11 @@ controller.state.map { it.positionMs }        // 500ms tick，即 PlaybackPolicy
   反过来 `asr/PcmDecoder` 是**必须上设备**的那一层：
   它吃 `Context`/`Uri`，只能测「这台机器的解码器实际给什么」——4 条仪器化用例（真 MP3 时长对账、块连续性、幅度、取消、非音频），
   接缝是 `fun interface PcmChunkSink`：解码逻辑与「拿到块以后干什么」在测试里被分开。
-  `asr/VadSegmenter`（6 条）与 `asr/SherpaOnnxEngine`（8 条）同属必须上设备的一层，而且**比解码更贵**：它们要真模型（243 MB）才动得起来，
+  `asr/VadSegmenter`（6 条）与 `asr/SherpaOnnxEngine`（9 条）同属必须上设备的一层，而且**比解码更贵**：它们要真模型（243 MB）才动得起来，
   所以引擎侧的可测性做法是「一个类共用一个句柄」（`@BeforeClass` 装、`@AfterClass` 释放）+ 把单位判据写成断言而不是日志。
-  这也意味着没有 `AsrEngine` 接口就没有假引擎：JVM 侧只能测到 `TokenTimingMapper` 与 `AsrChunkPlanner` 这一层，端到端必须真跑。
-  `text/SentenceSplitter` **目前代码里还没有**（Phase 6 第 5 项）。
+  这也意味着没有 `AsrEngine` 接口就没有假引擎：JVM 侧只能测到 `TokenTimingMapper`、`AsrChunkPlanner` 与 `SentenceSplitter` 这一层，端到端必须真跑。
+  `asr/SentenceSplitter`（25 条 JVM 单测）**已经在设备上被真模型的逐字时间喂过一遍**（`SherpaOnnxEngineTest.真模型的逐字时间喂进切句器得到能读的句子`），
+  这一轮的价值正在这里：纯逻辑用例全绿的情况下，设备那一条仍然挖出了「绝对毫秒门槛把慢唱当停顿」这个错（`docs/testing.md` §4 Phase 6c-2）。
 
 ## 8. 错误处理与降级
 
@@ -300,16 +319,19 @@ controller.state.map { it.positionMs }        // 500ms tick，即 PlaybackPolicy
 | 播放器报错 `onPlayerError` | **Phase 4 已实现**：`Log.w("EchoMindPlayback")` + 先 `flushNow()` 结算这场（已经听过的时间要落账），再把 `无法播放（<errorCodeName>）` 透出到 `PlaybackUiState.error`，播放页红字显示。不做自动重试、不自动跳下一首 |
 | 无字幕 / 字幕表为空 | **Phase 5 已实现**：七句窗口不渲染，卡片里如实写「还没有字幕。本地转录（Phase 6 的 sherpa-onnx）接入后这里会自动出现，之前不会放任何假字幕。」；没有「生成字幕」入口（那是 Phase 6）。debug 包多一个「导入测试字幕」按钮，release 包按 `FLAG_DEBUGGABLE` 判掉 |
 | 测试字幕文件解析失败 | 整份拒绝并把**行号 + 原因**回给用户（`导入失败：第 N 行的开始时间无法解析…`），绝不退化成补零或按字数均分（AGENTS.md §5） |
-| 模型缺失/损坏 | **引擎侧已实现（Phase 6 第 3 项）**：`SherpaOnnxEngine.open()` 先按 `ModelCatalog` 走 `ModelVerifier`（存在 → 大小 → SHA-256），任一步不合格抛 `AsrModelNotReadyException`，消息里点名缺哪个文件、目录在哪（用例 `模型不合格时引擎拒绝装载并把原因写清楚`）。**没有「文件在就用」**。设置页的下载/导入入口与「禁用转录入口」还没做（Phase 6 第 6 项）；**播放不受影响**（播放路径不加载模型） |
-| 推理 OOM | — **还没做**（Phase 6 第 4 项）。现在只有两条前置拒绝：单块 ≤20 s、样本数与块描述一致。装载 243 MB 模型在 2 GB RAM 真机上的峰值 RSS 未实测（模拟器上装载 ~4.9 s、识别 RTF 0.083~0.143，两轮同一素材差 1.6 倍，只能当量级看） |
-| 进程被杀 | 启动时 `recoverCrashedSessions`（幂等，任何写之前自动先跑）把残留 `ACTIVE` 行按最后一次 flush 结算为 `CRASHED` |
+| 模型缺失/损坏 | **引擎侧已实现（Phase 6 第 3 项）**：`SherpaOnnxEngine.open()` 先按 `ModelCatalog` 走 `ModelVerifier`（存在 → 大小 → SHA-256），任一步不合格抛 `AsrModelNotReadyException`，消息里点名缺哪个文件、目录在哪（用例 `模型不合格时引擎拒绝装载并把原因写清楚`）。**没有「文件在就用」**。**编排侧也已接上（Phase 6 第 4b 项）**：协调器在 `markRunning` **之前**先按清单预检 VAD（`vadModelFile()` 走 `ModelVerifier`），Paraformer 则由 `SherpaOnnxEngine.open()` 自己先核对再装载，任一步不合格就 `FAILED(MODEL_MISSING)` 并带上具体缺哪个文件，**不付那 243 MB 的钱**（设备证据：`转录失败（ModelMissing）：VAD 模型缺失或与清单不符（silero-vad），请先在模型页准备好`）。设置页的下载/导入入口与「禁用转录入口」还没做（任务 #24）；**播放不受影响**（播放路径不加载模型） |
+| 推理 OOM | **代码已写、没有用例**（Phase 6 第 4b 项）：协调器 `catch (OutOfMemoryError)` → `FAILED(OUT_OF_MEMORY)` 并打印收口摘要；前置拒绝有两条——单块 ≤20 s、样本数与块描述一致（后者不符直接丢块，见 D34）。⚠ 这条分支要真把堆撑爆才走得到，模拟器上没造出来，所以只能说「有兜底代码」不能说「测过」。原稿的「每 200 段 `release()+reload()`」一行都没做：没有可参照的内存实测，不做假兜底。装载 243 MB 模型在 2 GB RAM 真机上的峰值 RSS 未实测（模拟器上装载 3.4~4.9 s、识别 RTF 0.083~0.29，同一素材两轮差近一倍，只能当量级看） |
+| 转录跑完但结果不可用 | `TranscriptQuality` 判定：丢弃块占比 > `ASR_MAX_REJECTED_CHUNK_PERCENT`(20%) **或** 一句都没有 ⇒ `FAILED(OUTPUT_UNRELIABLE)`，`transcription_state` 保持原样、**不写任何字幕**。设备证据（静音负例）：`转录失败（OutputUnreliable）：模型没有给出任何带时间的字（识别 0 块，丢弃 0 块）。如果这段音频本来就没有语音，这是正常结果` |
+| 进程被杀 | 启动时 `recoverCrashedSessions`（幂等，任何写之前自动先跑）把残留 `ACTIVE` 行按最后一次 flush 结算为 `CRASHED`；`EchoMindApp.onCreate` 同时调 `recoverInterrupted()`（`:122`）把挂着的 `transcript_job` 标 `FAILED(INTERRUPTED)`，复活后的 worker 靠 `WHERE status IN (...)` 守卫覆盖不掉这个结论（用例 `重启后复活的worker不再覆盖中断结论`）。⚠ 但这只在仪器化里验过，**真被系统杀掉后 WorkManager 与 `onCreate` 谁先跑没有设备证据** |
 | Room 迁移失败 | 不做 destructive 兜底；崩溃前记录并提示（正式版策略：修复迁移） |
 
 ## 9. UI 结构
 
-**现状（Phase 6 第 1-3 项之后，UI 未变）**：单 Activity + Compose Navigation，5 个目的地：`shelf`（全部/最近/收藏 tab + 搜索）✅ → `player/{audioId}`（播放/暂停、±15s、拖动、倍速 5 档、上下曲、收藏、停止、本首统计、**七句字幕窗口**：当前句高亮、点一句跳到该句起点、数量与来源常驻标注、无字幕时如实说明）✅ → `transcript`（**placeholder，标注 Phase 6**）→ `stats`（总时长/次数/完播 + 最近收听 + 规则说明）✅ → `settings`（**placeholder，标注 Phase 7**）。底部导航固定 4 个：书 / 转 / 统 / 设。主题 Material 3，Android 12+ 走 dynamic color（`dynamicColor=true`），深浅色由系统决定（App 内切换在 Phase 7）。
+**现状（Phase 6d 之后）**：单 Activity + Compose Navigation，5 个目的地：`shelf`（全部/最近/收藏 tab + 搜索 + 行尾 ⋮ 菜单里的「转录这本书」）✅ → `player/{audioId}`（播放/暂停、±15s、拖动、倍速 5 档、上下曲、收藏、停止、本首统计、**七句字幕窗口**：当前句高亮、点一句跳到该句起点、数量与来源常驻标注、无字幕时如实说明）✅ → `transcript`（**已实装**：任务列表 + 从书架带参进来的确认卡片 `transcript?audioId=…`）✅ → `stats`（总时长/次数/完播 + 最近收听 + 规则说明）✅ → `settings`（**placeholder，标注 Phase 7**）。底部导航固定 4 个：书 / 转 / 统 / 设。主题 Material 3，Android 12+ 走 dynamic color（`dynamicColor=true`），深浅色由系统决定（App 内切换在 Phase 7）。
 
-**尚未实现的目标（别当现状读）**：播放页从上往下滑出迷你条；设置页改字号与深浅色；「重算统计」入口；按文件夹的重新授权入口。这些都在 Phase 7。
+转录页的三条硬约束（都由 `ui/transcript/TranscriptDisplay.kt` 这一个纯 Kotlin 文件渲染，13 条 JVM 用例钉住）：①**进度不许说谎**——`progress == null`（VAD 没跑完、分母未知）时只写「已识别 N 段（总段数要等解码跑完才知道）」，既不画进度条也不给百分比；②**每种失败都给得出一个动作**，8 个 `TranscriptFailure` 分支各有文案，`error_message` 原文照登成「原始信息：…」，不加工；③文案里出现的阈值（如 `OUTPUT_UNRELIABLE` 的 20%）一律从 `AudioFormats` 常量渲染，不写死字符串。Room 的 `transcription_state` 常量在 ViewModel 里翻成 UI 的三态 `ExistingAsr { None, Ready, Expired }`，页面不碰 Room 类型（也因此 `TranscriptDisplay` 能在 JVM 里测）。
+
+**尚未实现的目标（别当现状读）**：模型状态页与下载/本地导入入口（任务 #24）；播放页从上往下滑出迷你条；设置页改字号与深浅色；「重算统计」入口；按文件夹的重新授权入口。这些都在 Phase 6e/7。
 
 遵循用户偏好：菜单优先于按钮排、tooltip 优先于外露路径文本、行内编辑标题（当前重命名仍是对话框 → Phase 7 换）、支持键盘快捷键（有实体键盘时）。
 
@@ -349,3 +371,12 @@ controller.state.map { it.positionMs }        // 500ms tick，即 PlaybackPolicy
 | D30 | `VadSegmenter` 是**流式**的（`push(FloatArray)` → 段列表，`finish()` 收尾），并且把**段内样本一起带回来**（`VadUtterance(startSample, samples)`），而不是只报区间让调用方回头再读一遍音频 | 内存账：1 小时书解 = 3.6×10⁷ 样本 = 144 MB float（还有解码中间态），而实测最长语音段 118,720 样本 ≈ 0.48 MB → 峰值只需 1 个输入块 + 512 样本窗 + 已出段。只报区间的写法要么整章进内存，要么解码两遍（这台设备 148 s 素材单趟解码就 8.9 s，RTF 0.15，两遍直接翻倍）。副作用实测：喂入块长（4096/1024/3000/整串一次）不影响分段结果——同一批样本吐出完全相同的 `(startSample, len)` 列表，这条已做成用例，就是「攒不满一窗的尾巴要留住」的实现契约。另外**不给 `AsrEngine` 套接口**：目前只有一个实现、没有假引擎可注入，代价是推理层只能上设备测（JVM 侧退到 `TokenTimingMapper`/`AsrChunkPlanner`），等真需要第二个引擎时再抽 |
 | D31 | `subtitle_segment.job_id` 的外键在 **v3 用整表重建补上**（建 `_new` → 显式列名 `INSERT..SELECT` 搬数据（含主键 `id` 原值）→ DROP → RENAME → 重建三条索引），而不是「长期不建 FK」或「为挂 FK 新建一张关联表」 | 不建 FK 的代价是「字幕指向一个不存在的任务」这种行永远写得出、也没人会发现；用关联表绕开则是把一次 join 变成常态。SQLite 只有整表重建这一条正路，而它真正危险的地方是**搬丢数据**：所以 `Migration_2_3_Test` 不只要 `runMigrationsAndValidate` 与 `3.json` 对账，还要逐句比对字幕文本/时间/id，并在这台迁移后的库上真跑一次「删任务行只把 `job_id` 置空、不删字幕」——SET NULL 写在 DDL 里不等于生效过。另有一条有意的严格：搬数据时外键已开着，指向不存在任务的 `job_id` 会让整条迁移失败而不是被吞掉（v2 的代码写不出这种值，真出现就是库被外部改过，必须让人看见） |
 | D32 | 任务状态跃迁写成**带 `WHERE status IN (...)` 守卫的 UPDATE**、返回受影响行数，由 `TranscriptRepositoryImpl` 把 0 行翻译成 `false`；而不是「先 SELECT 判断再 UPDATE」，也不给 `AsrEngine`/任务表加乐观锁版本号 | 转录这件事天然会有两个写者（UI 协程取消 + worker 结算 + WorkManager 重试），先读后写中间的窗口足够把 SUCCESS 改回 RUNNING。守卫式 UPDATE 把判定交给 SQLite 的单语句原子性，重复结算第二次就是 0 行，看得见也改不动；加版本号列则是为同一件事付双倍复杂度。例外是 `commitSubtitles`：那条路径只有成功分支，跃迁失败说明这批字幕不该落库，所以用 `check` 抛出、事务整体回滚——用例 `重复结算第二次整体失败并回滚字幕` 就是断言「第二次写完字幕又被回滚干净」。另外 `transcript_job` 的历史**只追加不覆盖**（重试新建一行），否则「上次为什么失败」就没有东西可查 |
+| D33 | 段内断句的判据是「起点差 ≥ 绝对下限 500 ms **且** ≥ 本段起点差中位数 × 2」，而不是设计稿原写的「间隔 ≥ 300 ms 就断」；同时**删掉**超长句里「在最大 token 间隔处再切」那一档 | 设备实测逼出来的修正（`docs/testing.md` §4 Phase 6c-2）。`durations` 长度为 0 → 相邻**起点**差 = 前一字的发音长度 + 静音，发音长度减不掉，所以**任何绝对门槛都无法区分「慢」与「停顿」**：歌唱素材按 300 ms 硬切得到 58 字 → 53 句（平均每句 1.6 字，就是逐字打字），而当时三条断言（时长为正 / 不重叠 / 摘标点逐字相等）全绿——这个错在纯逻辑测试里是**测不出来**的。中位数（不是平均值）作为本段基准，偶数取靠下值，只有一个差时必然断不开。补的 `平均每句 ≥3 字` 断言验证过非常设：阈值临时改回 300/×1 就红。「最大间隔档」删除的理由是它变得不可能被命中：段内断句用的判据与它完全相同，而跨段合并来的句子有 60 字上限、进不了超长分支——留着只会让一次硬切冒充成有证据的切分。代价：500/×2/700 三个数**尚未标定**，只有一份歌唱素材撑着，朗读型真人语音 fixture 仍缺 |
+| D34 | 模型输出不合格（`TokenTimingMapper.Mismatch`）的块**整块丢弃、只记账**，丢弃比例超 `AudioFormats.ASR_MAX_REJECTED_CHUNK_PERCENT`（20%）或一句都产不出时整本判 `FAILED(OUTPUT_UNRELIABLE)`；**不**降级成「按段时长均分时间」，也**不**「有几句算几句」地提交部分字幕（`domain/asr/TranscriptQuality` 是这道闸门的纯 Kotlin 实现） | 设计稿在这里原本写着「取舍还没定」，两个候选都被否了：均分时间是 AGENTS.md §5 明令伪造时间戳；而部分提交会让一本坏掉 15% 的书在书架上显示「已有字幕」，用户读到第 16% 段才发现是空的——**假完整的字幕比明确的失败更贵**。阈值定 20% 不是算出来的，是「宁缺不造」与「别因一两段噪声整本重来」之间的工程直觉，它唯一的实证支撑是：148 s 素材 24 块**丢弃 0**，所以这道闸门到现在没被真素材触发过（只有 9 条 JVM 单测 + `没有语音的素材标成结果不可用而不是成功` 那条设备用例）。附带后果：静音素材走的是同一扇门（`drafts.isEmpty()`），消息里如实写「如果这段音频本来就没有语音，这是正常结果」，不写成错误也不写成成功 |
+| D35 | 「句边界是猜的」（`SubtitleDraft.boundaryGuess`，只在 60 字硬切时为 true）**不进数据库**，只写日志与 `TranscriptOutcome` 计数；同时**由协调器负责 FR-601 的时间排序**（提交前 `sortedBy { startMs }` + `mapIndexed` 编号），仓储层不排 | `boundaryGuess` 落库要动 v3→v4 迁移，而 MVP 里没有任何 UI 行为读它——为「以后可能标注」付迁移与测试成本不值。代价如实记在 `asr-design.md` §5 第 6 步：硬切出来的句子在库里和证据充分的句子长得一样。排序这一半则相反，它是**必须有人做、只做一处**的事：`subtitle_segment` 的读法按 `(audio_id, segment_index)`，`SubtitleSynchronizer` 在其上二分查找，一旦时间乱序二分就给错答案；而 `commitSubtitles()` 刻意信任调用方（它是通用批量写，加排序等于把编排层的责任藏进 DAO），所以这根轴只在 `TranscriptCoordinator` 一处钉住，端到端用例断言 `segmentIndex == 0..n-1` 且 `startMs` 升序 |
+| D36 | **同一时刻只跑一个转录**由两处保证：①`markRunning` 的跃迁 SQL 里加 `AND NOT EXISTS (SELECT 1 FROM transcript_job WHERE status='RUNNING' AND id <> :id)`；②`TranscriptWorkScheduler` 用**全局单一唯一名** `transcript-series` + `ExistingWorkPolicy.APPEND`。这条是修缺陷不是防噪声：原实现唯一名是**每本书一个**（`transcript-$audioId`），两本书同时入队 = 两个 worker 并发 = 同一进程两份 `SherpaOnnxEngine`（各 243 MB 模型 + `numThreads=2`），违反 AGENTS.md §3，2 GB RAM 上是 OOM 而不是慢 | 两处各管一半，不能省任何一个：**①管的是断言能到达的那一层**——WorkManager 的排队发生在它自己的进程内状态里，仪器化测试直接调协调器时根本不经过它，而 `Skipped` 的语义（一行都不写、在 `open()` 之前收手）必须能被断言；写在 SQL 里而不是「先查再改」，因为查与改之间正是并发窗口。**②管的是真并发**——同一唯一名下 WorkManager 严格串行（这是官方文档语义，**本机没有实测**），顺带天然得到 FR-507「排队」要的先后次序。不选进程内 `Mutex`：两个 worker 会各自 `setForeground`，通知栏出现两条，而且 `Mutex` 挡不住 WorkManager 跨进程重启后的重跑。`APPEND` 而非 `REPLACE`：`REPLACE` 在单一唯一名下会**取消正在跑的那本书**，把「排队」变成「插队杀任务」。新闸门带来的代价要如实写：
+**一行卡在 RUNNING 就会把后面所有转录一起挡住**（原来按书分开的唯一名不会），释放车道靠三处——协调器 `settle`、
+`TranscriptWorker` 的 `FAILED(UNKNOWN)` 兜底、应用启动的 `recoverInterrupted()`；而 worker 的兜底只 `catch Exception`，
+`UnsatisfiedLinkError` 这类 `Error` 会绕过它，那时只能等下次进程启动才恢复。留下的没做到：`APPEND` 排队语义**仍无用例**——Phase 6d 之后它在界面上看得见了（两本书先后入队时同屏「转录中 + 排队中」，后排没有进度条），但那是人工点出来的观察，不是断言；`work/` 现在有的 2 条仪器化用例只覆盖合并后清单里的前台服务类型与权限。发现路径见 `docs/requirements.md` FR-507，证伪过程见 `docs/testing.md` §4 Phase 6c-4 |
+| D37 | WorkManager 的前台服务类型**在自己的清单里合并出来**（`<service android:name="androidx.work.impl.foreground.SystemForegroundService" android:foregroundServiceType="dataSync" tools:node="merge" />`），而不是「只声明 `FOREGROUND_SERVICE_DATA_SYNC` 权限就以为够了」；并配一条读**已安装清单**的仪器化用例当闸门 | 实测代价：不加这一行，转录页点「开始转录」当场崩——`IllegalArgumentException: foregroundServiceType 0x00000001 is not a subset of foregroundServiceType attribute 0x00000000 in service element of manifest file`，栈顶在 `androidx.work.impl.foreground.SystemForegroundService.startForeground`。Android 14+ 查的是**起服务那个组件**的类型，而 work-runtime 2.12.0 自带的这个 service 元素类型是空的，合并进 App 后仍是空；权限齐不齐是另一回事。为什么用例读 `PackageManager.getServiceInfo` 而不是读源码：**这条 bug 的本质就是「源码里权限齐、合并后的组件属性没齐」**，读源码的测试抓不到它，只有装好的包（或 `merged_manifests`）能作证。代价：把 work-runtime 的内部类名写进了我们的清单，升级 WorkManager 时若该类改名，合并会静默失效——所以那条用例是**回归闸门**，不是可选的 |
+| D38 | 底部导航**不用** `popUpTo(saveState=true)` + `restoreState=true`，只留 `popUpTo(startDestination)` + `launchSingleTop` | Compose Navigation 的这对 flag 会把被 pop 掉的返回栈**存下来再恢复**；本项目 4 个标签里有一个是带查询参数的路由（`transcript?audioId=…`），恢复时把「转录这本书？」确认卡片连同 ViewModel 状态一起复活，实测表现是**点底部「书架」标签毫无反应**（不是慢，是不切）。官方样例之所以推荐这对 flag，是为了「切回来还停在原来的滚动位置」，而那个收益在这里等于负数：它让带参数的页面变成一个切不走的陷阱。代价：切走再切回来不保留列表滚动位置与页内状态（转录页的任务列表是 Flow，重新收集即可）。`MainActivity.kt` 里留了注释写明不许加回来 |

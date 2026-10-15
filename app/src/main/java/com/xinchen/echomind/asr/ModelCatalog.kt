@@ -55,6 +55,12 @@ object ModelCatalog {
     const val PARAFORMER_ID = "paraformer-zh-2023-09-14-int8"
     const val SILERO_VAD_ID = "silero-vad"
 
+    /**
+     * App 私有目录下模型根目录的名字：`filesDir/<这里>/spec.id/<fileName>`（`docs/asr-design.md` §7）。
+     * 生产（`AppGraph`）与仪器化测试（`DeviceAsrFixtures`）共用这一处，路径不该有两个说法。
+     */
+    const val MODELS_DIR_NAME = "models"
+
     /** 包内文件名也是清单的一部分：引擎按名字取文件，别处不许再抄一遍字符串。 */
     const val PARAFORMER_MODEL_FILE = "model.int8.onnx"
     const val PARAFORMER_TOKENS_FILE = "tokens.txt"

@@ -26,6 +26,14 @@ enum class TranscriptFailure {
     DecodeFailed,
     OutOfMemory,
     PermissionRevoked,
+
+    /**
+     * 模型跑完了但结果不可信：要么一个带时间的字都没给，要么不合格而被丢掉的块超过了
+     * `AudioFormats.ASR_MAX_REJECTED_CHUNK_PERCENT`（`docs/asr-design.md` §8 第一行）。
+     * 与 [Unknown] 的区别是这条有明确的可执行动作：换一段有语音的素材、或重试，
+     * 而「补一份时间」不在选项里（AGENTS.md §5）。
+     */
+    OutputUnreliable,
     Cancelled,
     Interrupted,
     Unknown,
@@ -47,6 +55,8 @@ data class TranscriptJobRow(
     val createdAtMs: Long,
     val startedAtMs: Long?,
     val finishedAtMs: Long?,
+    /** WorkManager 那一侧的请求 id；没进队列（或写入失败）时 null，取消就只能改库 */
+    val workRequestId: String? = null,
 ) {
     /** 进度显示用：分母还没出来时不显示百分比，而不是显示 0%（那是假进度） */
     val progress: Float?
@@ -80,3 +90,25 @@ sealed interface EnqueueOutcome {
     /** retry 传的 jobId 查不到（多半是库被清了），建新行没处可抄 */
     data object JobNotFound : EnqueueOutcome
 }
+
+/**
+ * 协调器跑一本书所需的最小信息（`docs/asr-design.md` §5 第 1 步的输入）。
+ *
+ * [uri] 是字符串而不是 `android.net.Uri`——`domain` 不许 import `android.*`（AGENTS.md §3），
+ * 换算由 `asr/TranscriptCoordinator` 在 Android 侧做。
+ * [needsTreeGrant] 标记这是 SAF 树授权下的 `content://` 路径：只有这种才谈得上「授权被撤销」，
+ * `file://` 的测试素材不需要授权，拿它去查 grant 会得出「没授权」的假结论。
+ * [treeUri] 是这本书所在**文件夹的树 uri**，查授权只能用它：SAF 的可持久化授权发在树上，
+ * `grantedTreeUris()` 列出的也是树。而 [uri] 是 `DocumentFile.fromTreeUri(...).listFiles()` 给出的
+ * **文档 uri**（`.../tree/primary%3AMusic` 底下另有 `.../document/primary%3AMusic%2F01.mp3`，
+ * 两者 authority 与 path 都不同），拿文档 uri 去比必然得 false——真机上每一本 SAF 的书都会被误报
+ * 「授权已失效」。树 uri 由所属文件夹查出（`imported_folder.tree_uri`）。
+ */
+data class TranscriptionTarget(
+    val audioId: String,
+    val uri: String,
+    val title: String,
+    val isFilePresent: Boolean,
+    val needsTreeGrant: Boolean,
+    val treeUri: String?,
+)

@@ -160,9 +160,9 @@ v3 补 FK 的做法（`Migrations.MIGRATION_2_3`）：
 | `status` | TEXT | | `QUEUED`/`RUNNING`/`SUCCESS`/`FAILED`/`CANCELLED` |
 | `total_segments` | INTEGER | | 分段总数（规划后才知道，初始 0） |
 | `done_segments` | INTEGER | | 进度分子（≥1s 节流写库） |
-| `error_code` | TEXT | | `MODEL_MISSING`/`DECODE_FAILED`/`OUT_OF_MEMORY`/`PERMISSION_REVOKED`/`CANCELLED`/`INTERRUPTED`/`UNKNOWN`。`INTERRUPTED` = 进程被杀/重启时还挂着，不是模型或文件出了问题 |
+| `error_code` | TEXT | | `MODEL_MISSING`/`DECODE_FAILED`/`OUT_OF_MEMORY`/`PERMISSION_REVOKED`/`OUTPUT_UNRELIABLE`/`CANCELLED`/`INTERRUPTED`/`UNKNOWN`。`INTERRUPTED` = 进程被杀/重启时还挂着，不是模型或文件出了问题。`OUTPUT_UNRELIABLE` = **模型跑完了但字不够格当字幕**（时间戳不合格的块超过 `AudioFormats.ASR_MAX_REJECTED_CHUNK_PERCENT`，或一句都产不出，含「这段音频本来就没有语音」）；判它的是 `domain/asr/TranscriptQuality`，取舍见 `architecture.md` D34——**不给 SUCCESS、也不写空字幕**，因为空字幕会让书在书架上显示「已有字幕」 |
 | `error_message` | TEXT | | 面向用户的说明，直接取异常原文，不做二次加工 |
-| `work_request_id` | TEXT | | WorkManager 请求 ID，用于取消与重启对账。**列在 v3 建好了但还没人写**：入队方是下一步的 `TranscriptCoordinator`，那一版才需要它 |
+| `work_request_id` | TEXT | | WorkManager 请求 ID，用于取消与重启对账。**v3 建列，写入方是 `TranscriptRepositoryImpl.attachWorkRequest()`（2026-10-15 落地）**：只认还没结束的行，写不回返回 `false`，由 `TranscriptWorkScheduler` 翻译成「刚入队的请求立刻 `cancelWorkById` 撤掉」（用例 `按id取行并把工作请求id写回活动任务` / `已结束的任务写不回工作请求id`）。⚠ 这条写入路径**只有仓储用例、没有 worker 级证据**——真正的入队方还没有生产调用方 |
 | `created_at_ms` / `started_at_ms` / `finished_at_ms` | INTEGER | | |
 
 索引：`(audio_id)`、`(status)`、`(audio_id, created_at_ms)`。
@@ -170,9 +170,15 @@ v3 补 FK 的做法（`Migrations.MIGRATION_2_3`）：
 历史按版本保留（不做「一书一行」覆盖），失败重试会产生新行，旧行保留错误上下文——`retry()` 是「再入队一次」，不是把旧行改回 `QUEUED`。
 
 **实现现状（v3）**：DAO 是 `TranscriptJobDao`，每条跃迁语句都带 `WHERE status IN (...)` 守卫并返回受影响行数，所以重复结算第二次是 0 行、已取消的任务被 worker 写回 RUNNING 在 SQL 层面就改不动；0 行由 `TranscriptRepositoryImpl` 翻译成 `false` 交给调用方，而不是抛异常打断 worker。
+**这套守卫现在是生产代码的承重墙**：`asr/TranscriptCoordinator` 的「抢不到行就收手」完全建在上面——`markRunning` 除了 `WHERE status='QUEUED'`
+还带一条 `AND NOT EXISTS (SELECT 1 FROM transcript_job WHERE status='RUNNING' AND id <> :id)`，一条语句挡住三种情况：第二个 worker 抢跑、
+进程被杀后 WorkManager 复活 worker 而库里那行早已被 `recoverInterrupted()` 标成 `FAILED(INTERRUPTED)`、以及**另一本书正在跑时的并发转录**
+（全机同时只允许一行 RUNNING，见 `architecture.md` D36）。三条设备用例分别对应：`正在跑的行不会被第二个worker重复跑` /
+`重启后复活的worker不再覆盖中断结论` / `别的任务正在跑时第二本书的任务抢不到运行中的行`。
 唯一的例外是 `commitSubtitles()`：那条路径只有成功分支，跃迁失败意味着这批字幕不该落库，于是 `check` 抛出、事务回滚——宁可一句都不写，也不能留下「字幕是新的、任务还在 RUNNING」的账。
-状态跃迁与 `audio_book.transcription_state` 的写在同一个 `withTransaction` 里（§9），行为由 `TranscriptRepositoryTest`（16 条仪器化用例）覆盖。
+状态跃迁与 `audio_book.transcription_state` 的写在同一个 `withTransaction` 里（§9），行为由 `TranscriptRepositoryTest`（**19 条**仪器化用例）覆盖。
 `total_segments` 存的是 **VAD 段数**而不是句数：一句字幕可能来自多个块，把分母改成句数会让进度条倒退，所以 SUCCESS 时也只把 `done_segments` 追平到入库前那个 `total_segments`。
+⚠ **中途 `total_segments` 恒为 0，是刻意的而不是没写**：VAD 是流式的，读到最后一段之前没人知道总段数，而写「N/N」会画出一条永远 100% 的假进度。所以 `TranscriptJobRow.progress` 在分母为 0 时给 **null**（用例 `分段数未知时没有百分比`），UI 那侧的契约是 `progress == null` → 显示「已识别 N 段」而不是百分比（FR-507；通知栏已经按这个写，见 `TranscriptWorker.notification`）。
 
 ## 7. settings（键值）
 

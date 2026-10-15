@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!-- 后台播放（docs/playback-design.md） -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -45,5 +46,15 @@
                 <action android:name="androidx.media3.session.MediaSessionService" />
             </intent-filter>
         </service>
+
+        <!-- 转录任务的前台通知不是我们自己起服务，而是 WorkManager 的 SystemForegroundService 代发。
+             Android 14+ 要求 service 元素上写明 foregroundServiceType，而 work-runtime 2.12.0 的清单里
+             这一项是空的（实测合并结果：`<service android:name="androidx.work.impl.foreground.SystemForegroundService" … />`
+             没有 type），于是 `setForeground()` 一调就 IllegalArgumentException 把进程打死。
+             这里用 tools:node="merge" 把 type 补进它那条声明，与上面的 FOREGROUND_SERVICE_DATA_SYNC 权限配对。 -->
+        <service
+            android:name="androidx.work.impl.foreground.SystemForegroundService"
+            android:foregroundServiceType="dataSync"
+            tools:node="merge" />
     </application>
 </manifest>

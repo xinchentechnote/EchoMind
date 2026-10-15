@@ -1,4 +1,8 @@
 <resources>
     <string name="app_name">EchoMind</string>
     <string name="notification_channel_playback">播放控制</string>
+    <string name="notification_channel_transcript">转录任务</string>
+    <string name="transcript_notification_title">正在转录</string>
+    <string name="transcript_notification_preparing">准备模型与解码…</string>
+    <string name="transcript_notification_progress">已识别 %1$d 段（总段数要等解码跑完才知道）</string>
 </resources>

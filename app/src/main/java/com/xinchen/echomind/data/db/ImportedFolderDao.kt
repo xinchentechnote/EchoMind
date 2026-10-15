@@ -21,6 +21,10 @@ interface ImportedFolderDao {
     @Query("SELECT * FROM imported_folder WHERE tree_uri = :treeUri LIMIT 1")
     suspend fun byTreeUri(treeUri: String): ImportedFolderEntity?
 
+    /** 转录前查这本书所在文件夹的树 uri：授权发在树上，文档 uri 查不出授权（见 `TranscriptionTarget.treeUri`） */
+    @Query("SELECT * FROM imported_folder WHERE id = :folderId LIMIT 1")
+    suspend fun byId(folderId: String): ImportedFolderEntity?
+
     @Query("UPDATE imported_folder SET last_scan_at_ms = :nowMs WHERE id = :folderId")
     suspend fun markScanned(folderId: String, nowMs: Long)
 

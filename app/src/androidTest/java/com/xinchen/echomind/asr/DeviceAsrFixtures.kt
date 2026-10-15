@@ -23,11 +23,17 @@ internal const val PACKAGE = "com.xinchen.echomind"
 internal object DeviceAsrFixtures {
 
     /** 与 `AppGraph` 的 `modelsRoot` 同一个位置（AGENTS.md §3：路径也只许一处定义）。 */
-    const val MODEL_DIR = "models"
+    val MODEL_DIR: String = ModelCatalog.MODELS_DIR_NAME
     const val FIXTURE_DIR = "asr-fixtures"
 
     /** 真人的歌（用户素材 `那些花儿.mp3`，44.1 kHz 立体声，148,303 ms，峰值 0.99）。静音占位素材不用。 */
     const val REAL_MP3 = "pcm-fixture-real.mp3"
+
+    /** 那批《三体》占位素材（帧体 99% 是 0x00，也就是**静音**）：只当「这段音频没有语音」的负例用 */
+    const val SILENT_MP3 = "pcm-fixture-01.mp3"
+
+    /** [REAL_MP3] 的容器时长，宿主机数出来的（字幕时间越界检查要用它当上界） */
+    const val REAL_MP3_DURATION_MS = 148_303L
 
     private const val TAG = "DeviceAsrFixtures"
 

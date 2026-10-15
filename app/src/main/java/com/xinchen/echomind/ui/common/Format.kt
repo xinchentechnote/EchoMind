@@ -40,3 +40,22 @@ fun progressFraction(positionMs: Long, durationMs: Long): Float? {
     if (durationMs <= 0) return null
     return (positionMs.toFloat() / durationMs).coerceIn(0f, 1f)
 }
+
+/**
+ * 字节数展示（模型包大小、下载/导入进度）。
+ *
+ * 刻意不用 `String.format("%.1f")`：它跟默认 Locale 走，中文环境下没问题但换成用逗号当小数点的
+ * 语言就会读出「232,1 MB」，而这一行的数字要和清单里的字节数对得上。
+ */
+fun formatBytes(bytes: Long): String {
+    if (bytes < 0) return "未知"
+    if (bytes < 1024) return "$bytes B"
+    val kb = bytes / 1024.0
+    if (kb < 1024) return "${oneDecimal(kb)} KB"
+    val mb = kb / 1024.0
+    if (mb < 1024) return "${oneDecimal(mb)} MB"
+    return "${oneDecimal(mb / 1024.0)} GB"
+}
+
+private fun oneDecimal(value: Double): String =
+    if (value >= 100) (value.toLong()).toString() else ((value * 10).toLong() / 10.0).toString()

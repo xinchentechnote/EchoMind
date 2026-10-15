@@ -67,6 +67,9 @@ data class TranscriptJobEntity(
         const val DecodeFailed = "DECODE_FAILED"
         const val OutOfMemory = "OUT_OF_MEMORY"
         const val PermissionRevoked = "PERMISSION_REVOKED"
+
+        /** 模型跑完了但结果不可用：没给出任何带时间的字，或不合格块超过阈值（`asr-design.md` §8） */
+        const val OutputUnreliable = "OUTPUT_UNRELIABLE"
         const val Cancelled = "CANCELLED"
 
         /** 进程被杀 / 系统重启时任务还挂在 RUNNING，恢复时标这个（不是模型或文件出了问题） */

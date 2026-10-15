@@ -3,7 +3,9 @@ package com.xinchen.echomind
 import android.app.Application
 import android.content.Intent
 import androidx.room.Room
+import com.xinchen.echomind.asr.ModelCatalog
 import com.xinchen.echomind.asr.ModelManager
+import com.xinchen.echomind.asr.TranscriptCoordinator
 import com.xinchen.echomind.core.time.AndroidTimeSource
 import com.xinchen.echomind.core.time.TimeSource
 import com.xinchen.echomind.data.db.EchoMindDatabase
@@ -23,6 +25,7 @@ import com.xinchen.echomind.domain.transcript.TranscriptRepository
 import com.xinchen.echomind.playback.EchoMindMediaService
 import com.xinchen.echomind.playback.Media3PlaybackController
 import com.xinchen.echomind.playback.PlayerHolder
+import com.xinchen.echomind.work.TranscriptWorkScheduler
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -44,6 +47,9 @@ class AppGraph(
     val transcriptRepository: TranscriptRepository,
     val playbackController: PlaybackController,
     val modelManager: ModelManager,
+    val modelsRoot: File,
+    val transcriptCoordinator: TranscriptCoordinator,
+    val transcriptWork: TranscriptWorkScheduler,
     val appScope: CoroutineScope,
     val playbackScope: CoroutineScope,
 )
@@ -62,26 +68,40 @@ class EchoMindApp : Application() {
         val timeSource = AndroidTimeSource()
         val playbackScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
         val playbackRepository = PlaybackRepositoryImpl(db, timeSource)
+        val grants = SafTreeGrantStore(this)
+        val audioRepository = AudioRepositoryImpl(
+            audioBookDao = db.audioBookDao(),
+            folderDao = db.importedFolderDao(),
+            shelfDao = db.shelfDao(),
+            treeBrowser = SafTreeBrowser(this),
+            metadataReader = SystemAudioMetadataReader(this),
+            grants = grants,
+            nowMs = timeSource::wallMs,
+        )
+        val transcriptRepository = TranscriptRepositoryImpl(db, timeSource)
+        val modelsRoot = File(filesDir, ModelCatalog.MODELS_DIR_NAME)
         graph = AppGraph(
             database = db,
             timeSource = timeSource,
-            audioRepository = AudioRepositoryImpl(
-                audioBookDao = db.audioBookDao(),
-                folderDao = db.importedFolderDao(),
-                shelfDao = db.shelfDao(),
-                treeBrowser = SafTreeBrowser(this),
-                metadataReader = SystemAudioMetadataReader(this),
-                grants = SafTreeGrantStore(this),
-                nowMs = timeSource::wallMs,
-            ),
+            audioRepository = audioRepository,
             playbackRepository = playbackRepository,
             subtitleRepository = SubtitleRepositoryImpl(db, timeSource),
-            transcriptRepository = TranscriptRepositoryImpl(db, timeSource),
+            transcriptRepository = transcriptRepository,
             modelManager = ModelManager(
                 // 模型放内部 filesDir：不需要任何运行时权限，卸载即清干净，也不出现在别的 App 的读写范围里
-                modelsRoot = File(filesDir, "models"),
+                modelsRoot = modelsRoot,
                 timeSource = timeSource,
             ),
+            modelsRoot = modelsRoot,
+            transcriptCoordinator = TranscriptCoordinator(
+                context = this,
+                audioRepository = audioRepository,
+                grants = grants,
+                repository = transcriptRepository,
+                modelsRoot = modelsRoot,
+                clock = timeSource,
+            ),
+            transcriptWork = TranscriptWorkScheduler(this, transcriptRepository),
             playbackController = Media3PlaybackController(
                 player = PlayerHolder.get(this),
                 repository = playbackRepository,
@@ -96,5 +116,9 @@ class EchoMindApp : Application() {
         )
         // 上次进程被杀留下的 ACTIVE 会话在这里结算，否则它会永远占着「正在听」的位置
         playbackScope.launch { graph.playbackRepository.recoverCrashedSessions() }
+        // 同一条规矩管转录：挂着的任务行标成 INTERRUPTED，用户在转录页看到它并点重试（FR-507）。
+        // WorkManager 可能会自己把 worker 重跑一遍，那一轮会在 markRunning 的守卫前收手——
+        // 这里刻意**不**去 cancelAllWorkByTag：那个调用是异步的，会连用户刚点的「转录」一起取消。
+        graph.appScope.launch { graph.transcriptRepository.recoverInterrupted() }
     }
 }

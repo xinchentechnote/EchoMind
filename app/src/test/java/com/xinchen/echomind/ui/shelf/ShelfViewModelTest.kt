@@ -6,6 +6,7 @@ import com.xinchen.echomind.data.db.ShelfRow
 import com.xinchen.echomind.data.repo.AudioRepository
 import com.xinchen.echomind.data.repo.ImportOutcome
 import com.xinchen.echomind.data.repo.ShelfTab
+import com.xinchen.echomind.domain.model.TranscriptionTarget
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
@@ -45,6 +46,7 @@ class ShelfViewModelTest {
 
         override fun lastPlayed(): Flow<ShelfRow?> = MutableStateFlow(null)
         override fun folders(): Flow<List<ImportedFolderEntity>> = MutableStateFlow(emptyList())
+        override suspend fun transcriptionTarget(audioId: String): TranscriptionTarget? = unsupported()
         override suspend fun importFolder(treeUri: Uri): ImportOutcome = unsupported()
         override suspend fun rescanAll(): List<ImportOutcome> = unsupported()
         override suspend fun rename(audioId: String, title: String) = unsupported()

@@ -35,10 +35,17 @@ interface TranscriptJobDao {
     @Insert
     suspend fun insert(job: TranscriptJobEntity)
 
-    /** QUEUED → RUNNING。分段总数此时才由 VAD 的结果填进去 */
+    /**
+     * QUEUED → RUNNING。分段总数此时才由 VAD 的结果填进去。
+     *
+     * `NOT EXISTS (... status = 'RUNNING')` 是**全机同时只跑一个转录**的那道闸：模型句柄一份 243 MB，
+     * 两本书同时开就是 OOM（AGENTS.md §3，`docs/architecture.md` D36）。守卫写在 SQL 里而不是「先查再改」，
+     * 因为查与改之间正是并发窗口；0 行由仓储翻成 `false`，协调器据此在装载模型之前就收手。
+     */
     @Query(
         "UPDATE transcript_job SET status = 'RUNNING', started_at_ms = :startedAtMs, total_segments = :totalSegments " +
-            "WHERE id = :id AND status = 'QUEUED'",
+            "WHERE id = :id AND status = 'QUEUED' " +
+            "AND NOT EXISTS (SELECT 1 FROM transcript_job WHERE status = 'RUNNING' AND id <> :id)",
     )
     suspend fun markRunning(id: String, startedAtMs: Long, totalSegments: Int): Int
 
@@ -67,6 +74,13 @@ interface TranscriptJobDao {
     /** 进度节流写库（≥1s，AGENTS.md §4），只在 RUNNING 时有效 */
     @Query("UPDATE transcript_job SET done_segments = :doneSegments, total_segments = :totalSegments WHERE id = :id AND status = 'RUNNING'")
     suspend fun updateProgress(id: String, doneSegments: Int, totalSegments: Int): Int
+
+    /**
+     * 写回 WorkManager 的请求 id（取消要用）。同样只许改还没结束的行：
+     * 一行已经 SUCCESS/FAILED 之后再挂个 work id，取消按钮就会去 cancel 一个不相干的请求。
+     */
+    @Query("UPDATE transcript_job SET work_request_id = :workRequestId WHERE id = :id AND status IN ('QUEUED', 'RUNNING')")
+    suspend fun setWorkRequestId(id: String, workRequestId: String): Int
 
     /** 还挂在 QUEUED/RUNNING 的行全部标 FAILED(INTERRUPTED)，返回处理了几行（FR-507 重启恢复） */
     @Query(

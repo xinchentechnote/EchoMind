@@ -87,6 +87,11 @@ class TranscriptRepositoryImpl(
         return enqueue(audioId, model, force = true)
     }
 
+    override suspend fun attachWorkRequest(jobId: String, workRequestId: String): Boolean =
+        jobDao.setWorkRequestId(jobId, workRequestId) > 0
+
+    override suspend fun jobById(jobId: String): TranscriptJobRow? = jobDao.getById(jobId)?.toDomain()
+
     override suspend fun markRunning(jobId: String, totalSegments: Int): Boolean = db.withTransaction {
         val job = jobDao.getById(jobId) ?: return@withTransaction false
         val now = clock.wallMs()
@@ -178,6 +183,7 @@ private fun TranscriptJobEntity.toDomain() = TranscriptJobRow(
     createdAtMs = createdAtMs,
     startedAtMs = startedAtMs,
     finishedAtMs = finishedAtMs,
+    workRequestId = workRequestId,
 )
 
 private fun String.toDomainStatus(): TranscriptJobStatus = when (this) {
@@ -194,6 +200,7 @@ private fun String.toDomainFailure(): TranscriptFailure? = when (this) {
     TranscriptJobEntity.ErrorCode.DecodeFailed -> TranscriptFailure.DecodeFailed
     TranscriptJobEntity.ErrorCode.OutOfMemory -> TranscriptFailure.OutOfMemory
     TranscriptJobEntity.ErrorCode.PermissionRevoked -> TranscriptFailure.PermissionRevoked
+    TranscriptJobEntity.ErrorCode.OutputUnreliable -> TranscriptFailure.OutputUnreliable
     TranscriptJobEntity.ErrorCode.Cancelled -> TranscriptFailure.Cancelled
     TranscriptJobEntity.ErrorCode.Interrupted -> TranscriptFailure.Interrupted
     TranscriptJobEntity.ErrorCode.Unknown -> TranscriptFailure.Unknown
@@ -205,6 +212,7 @@ private fun TranscriptFailure.toDbString(): String = when (this) {
     TranscriptFailure.DecodeFailed -> TranscriptJobEntity.ErrorCode.DecodeFailed
     TranscriptFailure.OutOfMemory -> TranscriptJobEntity.ErrorCode.OutOfMemory
     TranscriptFailure.PermissionRevoked -> TranscriptJobEntity.ErrorCode.PermissionRevoked
+    TranscriptFailure.OutputUnreliable -> TranscriptJobEntity.ErrorCode.OutputUnreliable
     TranscriptFailure.Cancelled -> TranscriptJobEntity.ErrorCode.Cancelled
     TranscriptFailure.Interrupted -> TranscriptJobEntity.ErrorCode.Interrupted
     TranscriptFailure.Unknown -> TranscriptJobEntity.ErrorCode.Unknown

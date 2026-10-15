@@ -108,9 +108,21 @@ asr/VadSegmenter                          ← silero VAD：float 块 → VadUtte
 domain/asr/AsrChunkPlanner                ← 绝对时间偏移计算 + ≤20s 分块，纯 Kotlin          ✅ DONE + 14 条 JVM 单测
 domain/asr/TokenTimingMapper              ← 模型的逐字**秒** → 绝对毫秒；不符就抛 Mismatch    ✅ DONE + 14 条 JVM 单测
 domain/model/AsrModels                    ← SpeechSpan / PcmChunkPlan / TokenTiming / ChunkRecognition（不带任何 native 类型）✅ DONE
-asr/SherpaOnnxEngine                      ← OfflineRecognizer：open 前按清单核对、单块 ≤20s、release 成对   ✅ DONE + 8 条仪器化（**真模型已在设备产出逐字时间**）
-TranscriptCoordinator                     ← 编排：解码→VAD→逐块识别→偏移合并→切句→入库      TODO（Phase 6 第 4 项）
+asr/SherpaOnnxEngine                      ← OfflineRecognizer：open 前按清单核对、单块 ≤20s、release 成对   ✅ DONE + 9 条仪器化（**真模型已在设备产出逐字时间**）
+domain/asr/SentenceSplitter               ← 逐字时间 → 候选句（§6 六条规则），纯 Kotlin                     ✅ DONE + 25 条 JVM 单测
+domain/asr/TranscriptQuality              ← 「丢弃块占比是否还能算一份字幕」的质量闸门，纯 Kotlin            ✅ DONE + 9 条 JVM 单测
+asr/TranscriptCoordinator                 ← 编排：解码→VAD→逐块识别→偏移合并→切句→质量闸门→单事务入库        ✅ DONE + 9 条仪器化（真模型跑完整首歌，生产代码第一次把 35 句写进字幕表；用例落的是 in-memory Room，**用户那份库现在也有 35 行 ASR 字幕了**——Phase 6d 从界面点出来的）
+work/TranscriptWorker                     ← CoroutineWorker（FGS dataSync）+ 通知进度，把协调器搬到后台       ⚠ `doWork` 主体**仍无用例**（9 条仪器化直接调协调器）；有设备证据：前台通知可见、中途取消真的停下、守卫日志「跳过：任务 … 的状态是 Failed」
+work/TranscriptWorkScheduler              ← 入队 / 唯一性 / 取消（先改库再 cancelWorkById）                   ⚠ `APPEND` 排队**无用例**，但**已有生产调用方**（转录页 ViewModel）；界面上看得见「转录中 + 排队中」同屏
+ui/transcript/                            ← 转录页：任务列表 + 确认卡片 + 取消/重试 + 失败降级文案            ✅ DONE + 13 条 JVM 用例（`TranscriptDisplayTest`）+ 设备实测（§10）
 ```
+
+⚠ **`work/` 这两个类的主体逻辑仍然没有自动化用例**，不是「测得少」。`TranscriptCoordinatorTest` 造的是 `TranscriptCoordinator` 本身，
+`setForeground` / `ForegroundInfo` / `enqueueUniqueWork(全局唯一名, ExistingWorkPolicy.APPEND)` / `attachWorkRequest` 的写不回撤销，全都在 worker 与调度器里，
+一条都没被断言过。`work/` 目前唯一有的 2 条仪器化用例（`TranscriptForegroundServiceTypeTest`）只查**合并后清单**里前台服务的类型与权限——
+那是「点开始转录直接崩」那条 bug 的回归闸门（D37），不是行为测试。
+Phase 6d 之后这些行为有了**设备证据**（人工从界面点出来：前台通知可见、中途取消停下、重启后守卫拒绝复活、排队不并发），
+但那是观察，不是用例。
 
 **为什么没有 `AsrEngine` 接口**：这一段原本写的是设计稿（`EngineReadiness` / `RecognizedSegment` / `FakeAsrEngine`），
 用意是「模型还没到手时也能推进」。2026-10-15 真模型已经在 emulator-5554 上跑出结果，那层垫片就失去了存在理由：
@@ -172,29 +184,100 @@ TranscriptCoordinator                     ← 编排：解码→VAD→逐块识�
      所以 `TokenTiming.endMs` 取**下一个 token 的 `startMs`**（末字收到块 `endMs`）：起点是模型原值，不是均分伪造
    ─ 换算与不合格判定（数量不等 / 负值 / NaN / 越界 / 倒序）全在 `domain/asr/TokenTimingMapper`（DONE，14 条 JVM 单测），
      它**不裁剪不补齐不夹回块内**，一律抛 `Mismatch`；设备侧另有一条反向对照测试：把已换算的毫秒再当秒喂进去 → 立刻 `Mismatch`
-   ─ 实测 RTF **0.131 / 0.083**（两轮；58 个 token / 6 块 / 29,864 ms 语音，`decodeMs=3,922` → `2,467`；单块另测 2,749 / 2,564 ms = 0.143 / 0.134。同一素材差 1.6 倍 → 模拟器 RTF 只当量级），
-     `OfflineRecognizer` 装载 **4,906 / 4,914 ms**（后台线程）
+   ─ 实测 RTF **0.131 / 0.083 / 0.133**（三轮；58 个 token / 6 块 / 29,864 ms 语音，`decodeMs=3,922` → `2,467` → `3,973`；单块另测 2,749 / 2,564 / 2,202 / 2,362 ms = 0.143 / 0.134 / 0.115 / 0.123。同一素材差 1.6 倍 → 模拟器 RTF 只当量级），
+     `OfflineRecognizer` 装载 **4,906 / 4,914 / 3,398 / 3,060 ms**（后台线程；同一天四次，冷/热差别没测过，只当「秒级」看）
    ─ **切块边界会影响文本**（如实记在这里）：同一段歌词，整块 20 s 给「那片笑声让我想起我的那些年」，
      按 VAD 切成 13,994~15,942 / 16,234~20,166 ms 两块则给「偏笑声让」+「想起我的那些话」。
      逐字时间依然成立（各自在块内、跨块单调），但**块边界不等于句子边界** → 拼句是 §6/第 5 项 `SentenceSplitter` 的活
-   ⚠ 时间戳为空的块记录 tokenCountMismatch，按 §8 降级处理（目前只会从 `Mismatch` 这条路径抛出，尚未接进协调器）
-6. 段结果 → SentenceSplitter（§6）→ List<SubtitleSegment>
+   ─ **时间戳不合格的块：丢弃，不补时间**（2026-10-15 定稿，`docs/architecture.md` §10 D34）。`TranscriptCoordinator` 捕获 `Mismatch` 后
+     只记一笔 `rejectedChunks`，该块的一个字都不进字幕。全本丢弃比例 > `AudioFormats.ASR_MAX_REJECTED_CHUNK_PERCENT`（20%）
+     或去重后句子数为 0 → 任务 `FAILED(OUTPUT_UNRELIABLE)`，**不写 SUCCESS、不写字幕**。
+     148 s 整首歌实测 **24 块 / 丢弃 0 块**，所以这条闸门到今天仍只有仪器化用例（`TranscriptCoordinatorTest`）走过，没有真素材触发过
+6. 段结果（`List<RecognizedSegment>`，一个 VAD 段一组逐字时间）→ `SentenceSplitter`（§6，DONE）→ `List<SubtitleDraft>`
+   ─ 2026-10-15 设备实测：60 s 素材前 6 段 / 58 字 → **9 句**，平均每句 6.4 字，硬切 0 句；
+     字幕内容与《那些花儿》歌词对得上（「在我生命每一个角落。」/「静静为我开着。」/「他们都老了吧。」），
+     逐字时间与模型输出逐字相等（反面检查：摘掉两边标点后的字符序列必须完全相同）
+   ─ **整首歌（148 s）实测**：24 段 → 24 块 → **35 句**，**硬切 0 句**（`boundaryGuess` 全 false）。
+     维度不同的第二份素材仍是歌唱，所以 §6 第 2、3 条的两个阈值**还是没被朗读型语音标定过**
+   ─ ⚠ **`boundaryGuess` 不落库**（2026-10-15 决定，D35）：`SubtitleDraft` 有这一列，`subtitle_segment` 表没有，落库即丢，
+     只在收口日志里给数量。理由：加一列要走 v3→v4 迁移，而 MVP 里没有任何 UI 行为依赖它——为「以后可能标注」预付迁移费用不值得。
+     代价如实记在这里：「60 字硬切出来的句子」在库里和证据充分的句子长得一样，读库的人分不出来
 7. 全部段完成后单事务：DELETE 旧字幕 + INSERT 新字幕 + job=SUCCESS + book.transcription_state=READY
+   ─ 2026-10-15 第一次真的走通：`TranscriptCoordinatorTest.真模型跑完整首歌后字幕第一次进了数据库`
+     （⚠ 「进了数据库」= **用例进程里的 in-memory Room**，跑的是生产 `TranscriptRepositoryImpl` + 生产 DAO/entity，
+     但不是用户机上那份 `echomind.db`——那里面到现在还是 0 句 ASR 字幕，见 §10）
+     断言 35 句全部落库、`segment_index` 连续从 0 起、时间升序、`source=ASR`、`job_id` 指向这一行、
+     末句 `end_ms ≤ 容器时长 148,303 + 1,000 ms`、job SUCCESS 且 `progress == 1.0`、书 `READY`
+   ─ **写入方负责排序**（FR-601）：协调器在提交前 `sortedBy { startMs }` 再 `mapIndexed` 编号。
+     仓储层（`commitSubtitles`）信任调用方给的是时间升序，它不排——所以这根轴只在协调器这一处钉住
 8. 进度：done_segments/total_segments，≥1s 节流写库（不逐段 fsync）
+   ─ **边跑边数不出 total**：VAD 是流式的，读到最后一段之前没人知道总段数，所以 `TranscriptRepository.updateProgress` 收到
+     `totalSegments = 0` 表示「分母未知」，字段原样写 0。UI 因此**不许画百分比**，只能显示「已识别 N 段」
+     （设备用例 `真模型跑完整首歌后字幕第一次进了数据库` 断言了所有上报的 total 恒为 0、done 单调不减）
+   ─ 收口时 `done = total = 实际段数`、`progress = 1.0`
 ```
 
 分段策略说明：为什么「先 VAD 再识别」而不是「固定 15s 硬切」——硬切会把词切断、时间戳错位且需要跨段合并 token；VAD 段本身就是句读线索，与 §6 的切句一致。代价：VAD 静音判定本身有 ±0.2–0.5s 误差（§1 已声明）。
 
+### 5.1 编排层的生命周期与守护（`asr/TranscriptCoordinator.kt` + `work/`，2026-10-15 落地）
+
+编排不是「把六步串起来」这么轻，因为它的上游是 WorkManager——**同一个 job 可能被第二个 worker 拿到**（进程被杀后重启、
+`recoverInterrupted()` 已把该行标成 `FAILED(INTERRUPTED)` 之后 work 又跑了一轮）。所以顺序与守卫都是契约的一部分：
+
+1. `markRunning(jobId, 0)` 先行。它的跃迁语句是 `WHERE status = 'QUEUED' AND NOT EXISTS (… status = 'RUNNING' AND id <> :id)`，
+   **抢不到行就立刻 `Skipped` 收手**——一条守卫同时挡住三种情况：第二个 worker 抢跑、进程被杀后复活的 worker 覆盖中断结论
+   （`recoverInterrupted()` 已把那行标成 `FAILED(INTERRUPTED)`）、以及**另一本书占了模型句柄时的并发转录**（D36）。
+   第三档必须写在 SQL 里：「先 SELECT 看有没有 RUNNING 再 UPDATE」在查与改之间就是并发窗口，两个 worker 都能读到「没有」，
+   于是各自开一份 243 MB 的引擎。用例 `别的任务正在跑时第二本书的任务抢不到运行中的行` / `别的书正在跑时第二个协调器收手且不写字幕`。
+2. 三道守护在**装载引擎之前**返回，避免为注定失败的活儿付 3~5 秒 native 装载 + 一份内存：
+   文件状态（`isFilePresent=false` → `DECODE_FAILED`）、**SAF 授权**（→ `PERMISSION_REVOKED`）、模型清单核对（→ `MODEL_MISSING`）。
+3. ⚠ **授权查的是所属文件夹的树 uri，不是书的文档 uri**。可持久化授权只发在树上（`imported_folder.tree_uri`），
+   `audio_book.uri` 是 `DocumentFile.fromTreeUri().listFiles()` 给出的文档 uri，两者不相等；
+   用文档 uri 调 `hasReadGrant` 必然 false，等于**每一本 SAF 书都被判成「授权已失效」**。
+   `TranscriptionTarget.treeUri` + `ImportedFolderDao.byId` 就是为了把树的地址送到协调器手里（用例 `授权查的是所属文件夹的树而不是文档uri`）。
+4. 解码→VAD→分块→识别→切句是**一条流**：`PcmChunkSink.onChunk` 返回 false 就是取消信号（同时断开解码器），
+   每次 `push` 前检查取消位。取消**只停手，不写终态**——谁把 `isCancelled` 变成 true 的（`TranscriptRepository.cancel`）谁负责写 `CANCELLED`，
+   协调器写第二份终态就是把状态机的归属权抢过来（用例 `取消位为真时立刻停手且不写终态`）。
+5. 引擎在 `try/finally` 里 `release()`，主线程构造由 `SherpaOnnxEngine.open` 自己的 `check` 拒绝（§4）。
+6. WorkManager 侧只做两件事：`TranscriptWorker`（`doWork` → `setForeground(FGS dataSync)` → `coordinator.run(jobId, isCancelled = { isStopped })`，
+   把 `TranscriptOutcome` 翻成 `Result`；进度回调里同时写库和刷通知）与 `TranscriptWorkScheduler`
+   （`enqueueUniqueWork(UNIQUE_NAME, APPEND)`，唯一名**全局一个**（`transcript-series`）而不是每本书一个——按 WorkManager 的官方语义，
+   同一唯一名下的工作不会并发运行（**这是引用文档，不是本机实测**）。把 `work_request_id` 写回活动任务，写不回就立刻 `cancelWorkById` 撤销；
+   取消是**先改库再 `cancelWorkById`**，见 `database-design.md` §6）。
+   D36 的串行化分两处落：这里的唯一名（**没有用例**，但 Phase 6d 之后界面上看得见：两本书先后入队时同屏「转录中 + 排队中」）与 §5.1 第 1 条的 SQL 单行闸门（**有设备用例，并对「去掉闸门」的构建证过伪**）；
+   要说「一个进程只一个引擎句柄」被验过，验的是后者。
+   ⚠ **这两个类的主体逻辑仍无用例**（§4 末的说明）：前台通知、`APPEND` 的排队、`work_request_id` 的写回与撤销，都只有代码 + 人工点出来的设备证据。
+   ✅ **入口已经有了**（Phase 6d，任务 #23）：转录页 ViewModel 是 `schedule()` 的生产调用方，书架行尾 ⋮ →「转录这本书」→ 转录页确认卡片 →「开始转录」这条用户路径在 emulator-5554 上跑通，
+   35 行 `source=ASR` 字幕进了用户库（`docs/testing.md` §4 Phase 6d）。
+   另外 `dataSync` 类型在 Android 14+ 有 **6 小时**累计上限（`TranscriptWorker` 类注释里记着），长书面前没有实测依据。
+
 ## 6. 切句与标点（FR-602 / FR-604 的现实约束）
 
-模型产出的中文文本**不含标点**（A7）。切句规则因此以「时间」而不是「标点」为主，且必须有明确降级：
+模型产出的中文文本**不含标点**（A7）。切句规则因此以「时间」而不是「标点」为主，且必须有明确降级。
+下面六条是 `domain/asr/SentenceSplitter` 的实现口径（2026-10-15 定稿，第 2、4 条被设备实测改过两次，改动理由记在每条后面）：
 
-1. 一个 VAD 段 = 一个候选句。
-2. 段内 token 间隔 ≥ `INTRA_SEGMENT_PAUSE_MS`（默认 300ms）→ 断句（这是真实静音，不是人为均分）。
-3. 相邻候选句：文本合并后 ≤ `MAX_SENTENCE_CHARS`（默认 60）且间隔 ≤ `SENTENCE_MERGE_GAP_MS`（默认 250ms）→ 合并（消掉 VAD 过度切分）。
-4. 超过 `MAX_SENTENCE_CHARS` 的长句：在**最大 token 间隔**处再切；没有可用间隔时按空白/半角空格切；仍无法切的连续中文长串才允许按长度切，并把该句标记为 `low_confidence_timing`（字幕 UI 不特殊标记，但记录在日志与本文的误差说明里）。
+1. 一个 VAD 段 = 一组候选字，段边界是最主要的断句依据。
+2. 段内断句：相邻两字**起点差**同时满足「≥ `ASR_INTRA_SEGMENT_PAUSE_MS`（500ms）」且「≥ 本段起点差**中位数** × `ASR_PAUSE_MEDIAN_RATIO`（2）」→ 断句。
+   ─ 为什么不是原稿的「间隔 ≥ 300ms 就断」：**起点差里混着前一个字自己的发音长度**（Paraformer 的 `durations` 实测长度 0，减不掉）。
+     唱歌时每个字本就占 400~600ms，绝对门槛等于逐字打字 —— 同一份素材第一次跑出来是 **58 字 → 53 句**，平均每句 1.6 字，
+     而「时长为正 / 不重叠 / 逐字与模型输出相等」三条断言当时**全绿**（`SherpaOnnxEngineTest.真模型的逐字时间喂进切句器得到能读的句子`，
+     那条「平均每句 ≥3 字」的断言就是补上的，把门槛改回 300/倍数 1 会立刻红）。改成相对判据后同一素材 **58 字 → 9 句**，平均每句 6.4 字。
+   ─ 基准取中位数不取平均值：一段里只有一个大间隔时平均值会被它自己抬上去，反而断不开。
+   ─ 两个条件各管一头：**倍数**管「慢不是停顿」（550ms 均匀字距照样越过 500ms 下限，靠倍数才不断）；
+     **绝对下限**管另一头（语速极快的段中位数只有 100ms，×2 = 200ms 的跳跃不值得换一行）。
+3. 相邻候选句：文本合并后 ≤ `ASR_MAX_SENTENCE_CHARS`（60 字）且间隔 ≤ `ASR_SENTENCE_MERGE_GAP_MS`（700ms）→ 合并（消掉 VAD 过度切分）。
+   ─ 只有**本段最后一句**允许跨段合并；段内因停顿断开的两句不再合回去，否则第 2 条白做。
+   ─ 原稿写的是 250ms，形同虚设：`VAD_MIN_SILENCE_SEC` 就是 0.25s，VAD 能断成两段说明中间静音必然 ≥250ms。
+     改成 700ms（约 250 的三倍，取「句内换气」量级），**尚未用真人朗读标定**。
+4. 超过 60 字的长句按「弱标点 → 空白 → 字数上限处硬切」三档回退（FR-602 的「超出按标点或空格回退切分」），
+   只有落到最后一档才把该句标 `SubtitleDraft.boundaryGuess = true`（写日志，**不落库**：`subtitle_segment` 没有这一列）。
+   ─ 原稿在这里还有一档「在最大 token 间隔处再切」，已删：能走到这一层的句子说明段内（第 2 条，判据完全相同）没有可断的停顿，
+     而跨段合并来的句子字数必然 ≤ 上限、进不了超长分支——「本集合里最大」不再携带任何信息，留着只会让硬切冒充证据。
 5. 收尾：句末追加「。」作为展示符号（明确记录：**这是展示层补的，不是模型判的句读**）；不猜逗号和问号。
-6. `SentenceSplitter` 是纯 Kotlin，输入 `List<RecognizedSegment>`，输出 `List<SubtitleDraft>`，含时间清洗（负值、end<start、重叠、零长度）—— FR-603 的单测全部落在这里。
+   中文 token 直接连排，两侧都是字母/数字时补一个空格（模型给英文分词时不留空格）。
+6. `SentenceSplitter` 是纯 Kotlin，输入 `List<RecognizedSegment>`，输出 `List<SubtitleDraft>`；
+   进门先做时间清洗（乱序重排、上一字压到下一字头上时以起点为准夹住、零长句并进相邻句或如实丢掉），FR-603 的单测全部落在这里。
+   ─ 丢弃是允许的：给不出正时长又并不进邻居的句子（比如整篇只剩一个孤立零长字）不进字幕，宁缺不造。
 
 后续可选改进（roadmap，不进 MVP）：接入中文标点恢复模型（ sherpa-onnx 侧无现成 Kotlin API，需自行集成 `punc_ct-transformer` ONNX，成本较高），或换用自带标点的模型。
 
@@ -228,14 +311,23 @@ TranscriptCoordinator                     ← 编排：解码→VAD→逐块识�
 
 ## 8. 降级与失败处理
 
+**这一节的判定与写入方都接进了 `asr/TranscriptCoordinator`（2026-10-15，Phase 6 第 4b 项）**：错误码不再只是仓储里的字段——
+`DECODE_FAILED` / `PERMISSION_REVOKED` / `MODEL_MISSING` / `OUTPUT_UNRELIABLE` / `OUT_OF_MEMORY` 都有生产写入方，
+`TranscriptCoordinatorTest` 9 条用例逐条走过（`文档里不许出现代码没有的能力`，反过来说也一样：写入了但没验过的路径要标出来）。
+**UI 那一半在 Phase 6d 补上了**：`ui/transcript/TranscriptDisplay.failureGuide` 把 8 个 `TranscriptFailure` 逐个翻成「发生了什么 + 你能做什么」，
+卡片同时把 `error_message` 原文照登成「原始信息：…」（不加工、不美化），文案里出现的阈值一律从 `AudioFormats` 常量渲染（13 条 JVM 用例钉住，
+含 `每种失败都给得出一个动作`）。**仍缺**：`OUT_OF_MEMORY` 分支既无用例也无设备证据；`MODEL_MISSING` 文案里的「请先在模型页准备好」指向**还不存在的页面**（任务 #24）。
+
 | 触发 | 行为 |
 | --- | --- |
-| `timestamps` 为空或与 tokens 数量不一致（A6 的硬条件） | 该段标记 `no_token_timing`；整本比例 > 20% 时任务仍 SUCCESS，但字幕以 VAD 段级时间戳为准（段起点 + 段时长均分**仅用于段内**，并在转录任务记录与本文里标明为降级），UI 顶部提示「字幕时间为段级估计」；否则不产出该句 |
-| 实际使用的模型不支持时间戳（用户误导入 zh-2024-03-09 等，A4） | `verify()` 阶段就比对清单 modelId 与文件哈希，不匹配直接拒绝并提示正确模型 |
-| 解码失败 / 不支持的编码 | job `FAILED(DECODE_FAILED)`，文案指向「该文件可能不是 MP3 或已损坏」；不改 `transcription_state` 以外的数据 |
-| 授权被撤销 | `FAILED(PERMISSION_REVOKED)`，任务列表给「重新授权」快捷入口 |
-| OOM / native crash 风险 | `numThreads=1`、段 ≤20s、单引擎串行、每 200 段主动 `release()+reload()` 释放累积内存（防泄漏兜底）；OOM → `FAILED(OUT_OF_MEMORY)` 且下次自动用更小段长 |
-| GitHub 不可达（A10） | 下载源按 hf-mirror → huggingface → GitHub 顺序重试，全部失败则提示用本地导入路径 |
+| `timestamps` 为空或与 tokens 数量不一致（A6 的硬条件） | `TokenTimingMapper` 抛 `Mismatch`，协调器**抓住它、只把这一块丢掉**——不裁剪、不补齐、不均分（AGENTS.md §5 禁止「段起点 + 段时长按字数均分」，本节原稿写过那种做法，已删）。丢弃数记进 `rejectedChunks`，由 `domain/asr/TranscriptQuality` 判整本还能不能算一份字幕：丢弃占比 > `AudioFormats.ASR_MAX_REJECTED_CHUNK_PERCENT`（20%）→ `FAILED(OUTPUT_UNRELIABLE)`，**不提交任何字幕**。取舍理由与反例见 `docs/architecture.md` §10 D34：宁可这本书这次没有字幕，也不给它一份时间造假的字幕。148 s 素材实测丢弃 0/24 块，所以闸门本身只有 `TranscriptQualityTest`（9 条）和 `没有语音的素材标成结果不可用而不是成功` 这条设备用例证过 |
+| 一段音频根本没有语音（或识别不出任何带时间的字） | `drafts.isEmpty()` → `FAILED(OUTPUT_UNRELIABLE)`，消息里如实写「如果这段音频本来就没有语音，这是正常结果」。**不给 SUCCESS、不给空字幕**——空字幕会让书在书架上显示「已有字幕」，那是假话（设备用例 `没有语音的素材标成结果不可用而不是成功`，用的正是那批静音占位《三体》MP3） |
+| 实际使用的模型不支持时间戳（用户误导入 zh-2024-03-09 等，A4） | `verify()` 阶段就比对清单 modelId 与文件哈希，不匹配直接拒绝并提示正确模型（**已实现**，`ModelVerifier` + `SherpaOnnxEngine.open` 装载前复核；协调器把装载期的 `AsrModelNotReadyException` 落成 `MODEL_MISSING`） |
+| 解码失败 / 不支持的编码 / 文件已不在原位置 | `FAILED(DECODE_FAILED)`，消息带书名。**两条路径都有写入方**：进引擎之前就查 `fileStatus`（`文件已不在原位置时报解码失败且不启动推理`，这条用例断言它连引擎都不装），以及 `PcmDecodeException`（解码中途挂） |
+| 授权被撤销 | `FAILED(PERMISSION_REVOKED)`，消息带上那个树 uri。「重新授权」快捷入口**仍然没有**（转录页只显示文案，设置页的按文件夹入口属 Phase 7）。⚠ 判定本身此前是错的：拿书的**文档** uri 去查授权必然 false，会把每本 SAF 书都标成「授权已失效」——现在查 `imported_folder.tree_uri`（§5.1 第 3 条） |
+| OOM / native crash 风险 | **实测配置**：`numThreads=2`（`AudioFormats.ASR_NUM_THREADS`，不是原稿写的 1）、单段 ≤20s、单引擎句柄串行、装载只在后台线程；协调器 `catch (OutOfMemoryError)` → `FAILED(OUT_OF_MEMORY)` 并带回收口摘要。**未实现**：原稿的「每 200 段主动 `release()+reload()`」一行都没做——目前没有可参照的内存实测，先不做假兜底。⚠ `OUT_OF_MEMORY` 这条分支**没有用例**（要真把堆撑爆才走得到），只有代码 |
+| Worker 层面意外崩（Room 挂了 / native 抛 RuntimeException） | `TranscriptWorker` 兜一条 `FAILED(UNKNOWN)`，否则那行会永远显示 RUNNING。**⚠ 仍无用例**：Phase 6d 之后转录能从界面入队了，但这条兜底路径要造出「协调器之外抛异常」才走得到，没造。设备上有证据的是**相邻那条**守卫：重启后复活的 worker 撞在已结算的行上，日志打出「跳过：任务 … 的状态是 Failed，不该再跑推理」 |
+| GitHub 不可达（A10） | **部分实现**：`ModelFetcher`/`HttpFetcher` 按 `candidateUrls` 顺序（首选 → 备用）逐个试，全失败才抛 `ModelDownloadException` 并带上每个地址各自的失败原因（多源回退的代码是有的，`ModelManagerTest` 覆盖了）；但**本地导入路径仍未实现**，所以「全部失败则提示用本地导入」这半句在 UI 上兑现不了（任务 #24） |
 
 ## 9. Phase 6 的验证计划（可复现）
 
@@ -247,10 +339,20 @@ TranscriptCoordinator                     ← 编排：解码→VAD→逐块识�
    三份文件在 2026-10-15 由 `adb push` + `run-as` 搬进 `filesDir/models/<id>/` 并用 `ModelVerifier` 在设备侧核对通过（大小 + SHA-256 逐项一致），
    **推理用的就是那份搬运来的文件**——所以「设备能自己下模型」这件事仍然没有证据，只有 `tokens.txt` 一条有。
 4. 准备真实素材：一段 3–10 分钟中文书解 MP3（本机自行生成或用用户提供的样本），跑转录，人工抽查 10 处字幕时间对齐误差（记录 ±ms 分布）。
-   **2026-10-15 更新**：这一条现在有了具体阻塞——设备上 `/sdcard/Music/EchoMind/` 那批素材经逐字节核对是**静音占位 MP3**（帧体 99% 为 0x00），
-   宿主机也没有 MP3 编码器（无 ffmpeg/lame/sox），所以「真实语音」要么由用户提供，要么等 App 能录音/从其他来源取。在此之前转录精度**无从测量**，不要声称测过。
+   **部分完成（2026-10-15）**：**整本跑通了**（148 s 真人演唱《那些花儿》→ 24 段 → 24 块 → 35 句 → 全部落库，§5 第 6~7 步有数字），
+   但**人工抽查时间对齐误差这一条没做**，因为素材是歌唱、不是书解：歌词与字幕内容能逐字对上（用例里就是这么断言的），
+   「这句该在几秒」需要人耳判断，而歌唱的对齐结论搬不到朗读上。
+   另外 `/sdcard/Music/EchoMind/` 那批「《三体》」素材经逐字节核对是**静音占位 MP3**（帧体 99% 为 0x00），
+   宿主机也没有 MP3 编码器（无 ffmpeg/lame/sox），所以**朗读型真实语音要么由用户提供，要么等 App 能录音**。
+   在此之前**转录精度（字错率、时间对齐 ±ms）无从测量，不要声称测过**。静音那批现在只当负例用（`FAILED(OUTPUT_UNRELIABLE)` 那条用例）。
 5. 仪器化测试覆盖「分段偏移合并」「切句」「重转替换」「任务取消/重试」，JVM 单测覆盖纯逻辑。
-6. 真机（≥2GB RAM）实测峰值 RSS 与 RTF；未做则明确标注未完成。
+   **DONE（2026-10-15）**：偏移合并 = `SherpaOnnxEngineTest`（跨块时间单调）+ `TranscriptCoordinatorTest`（端到端首次入库）；
+   切句 = 25 条 JVM + 1 条设备端到端用例；重转替换 = `TranscriptRepositoryTest`（整本替换 + 重复结算回滚）；
+   取消 = `TranscriptRepositoryTest`（状态机）+ `TranscriptCoordinatorTest.取消位为真时立刻停手且不写终态`（编排层真的停在解码中间）；
+   重试 = 仓储层用例（新建一行、旧行留错误上下文）。**全套 JVM 203 / 仪器化 104 全绿**（`docs/testing.md` §4）。
+   ⚠ 唯一没覆盖的是 `work/` 那两个类（§4 末）。
+6. 真机（≥2GB RAM）实测峰值 RSS 与 RTF；**未做**（则明确标注未完成）。目前所有数字都来自 emulator-5554，
+   且同一素材两轮 RTF 差 1.6 倍 → 这些只能当量级，不能当性能结论。
 
 ## 10. 当前状态（诚实标注）
 
@@ -259,9 +361,15 @@ TranscriptCoordinator                     ← 编排：解码→VAD→逐块识�
   模型管理这层已有代码：`asr/ModelCatalog.kt`（清单，数值由 `ModelCatalogTest` 钉住）、`asr/ModelVerifier.kt`（存在/大小/SHA-256 三步核对）、
   `asr/ModelManager.kt` + `asr/ModelFetcher.kt`（下载 → `.part` → 校验 → 改名 → 记来源，含多源回退、文件级跳过、删除、按单调时钟限流的进度），
   已挂进 `AppGraph`（`modelsRoot = filesDir/models`），35 条 JVM 单测覆盖（`docs/testing.md` §4）。
-- **尚未实现**：`TranscriptCoordinator` 与 `work/`（`transcript_job` 表还没建），`SentenceSplitter`（§6）也没写。
-  **所以「点一下就能转录出字幕」仍然未完成**：`VadSegmenter`/`SherpaOnnxEngine`/`TokenTimingMapper` 都只有测试在调，
-  `AppGraph` 里没有它们，识别结果一行都没进过数据库。链路的下一环是第 4 项（任务表 + 协调器 + WorkManager）。
+- **编排层（2026-10-15 新增，Phase 6 第 4b 项，本节原来说它「尚未实现」）**：`asr/TranscriptCoordinator.kt` + `domain/asr/TranscriptQuality.kt`
+  + `work/TranscriptWorker.kt` / `work/TranscriptWorkScheduler.kt`，全部挂进 `AppGraph`，`EchoMindApp.onCreate` 里调 `recoverInterrupted()`。
+  **生产代码第一次把模型的字写进字幕表**：`TranscriptCoordinatorTest`（现 9 条仪器化）里那条端到端用例在 emulator-5554 上把 148 s 整首歌跑完——
+  收口日志 `解码 2378188 样本（44100 Hz/2 ch → 16000 Hz，容器时长 148303 ms），语音段 24 个，块 24 个，丢弃 0 个；句子 35（硬切边界 0 句）`，
+  墙钟 42,965 ms（含装载 ~5 s，≈ RTF 0.29；同一条用例两次独立进程再跑给出 33,453 ms ≈ 0.23 与 63,714 ms ≈ 0.43，**三次产出逐项相同、耗时差 1.9 倍** → RTF 只报区间），35 句全部落 `subtitle_segment`（`source=ASR`、`job_id` 指向那一行、索引连续、时间升序、
+  末句不越出容器时长）。⚠ 那条用例落的**是用例进程里的 in-memory Room**：被验证的是「生产仓储 + 生产 DAO + 真模型 + 真解码」这条完整路径。
+  ✅ **Phase 6d 之后用户机上那份 `echomind.db` 里也有了**：从界面点出来的 **35 行 `source=ASR` 字幕**（`segment_index` 0~34 连续、`start_ms` 14,134 ~ `end_ms` 145,766，都在容器时长 148,304 ms 内）+ 7 行 `transcript_job`（SUCCESS / FAILED(INTERRUPTED) / FAILED(OUTPUT_UNRELIABLE) / CANCELLED 各态都有），`那些花儿` 是 `READY`，播放页七句窗口读的就是这批（`docs/testing.md` §4 Phase 6d）。守护顺序、取消归属、SAF 树 uri 那条坑见 §5.1。
+- **仍然没交付的**：①`work/` 两个类的主体逻辑**仍无自动化用例**（§4 末）——前台通知、`APPEND` 排队、`FAILED(UNKNOWN)` 兜底、`cancelWorkById` 撤销都只有代码 + 人工点出来的设备证据；②模型准备 UI + 本地导入（任务 #24），因此 `MODEL_MISSING` 文案里那句「请先在模型页准备好」目前指向不存在的页面；③「设备自己能下载 243 MB 模型」仍然没有证据（§9 第 3 条）；④「播放 + 转录同时跑不卡顿」（FR-509）没测。
+  ✅ **「点一下就能转录出字幕」这句话在 Phase 6d 成立了**：书架 ⋮ →「转录这本书」→ 转录页「开始转录」→ 排队中/转录中/「共 24 段全部识别」，字幕进用户库、播放页能读到。
 - **推理层（2026-10-15 新增，Phase 6 第 3 项终，`docs/testing.md` §4 有全部数字）**：
   `asr/VadSegmenter.kt`（silero VAD 流式封装：512 样本窗缓冲、`push/finish/release`、`VadUtterance` 带全局样本起点与该段音频）、
   `asr/SherpaOnnxEngine.kt`（`OfflineRecognizer` + `assetManager = null` 走文件系统绝对路径；`open()` 先过 `ModelVerifier`；
@@ -271,12 +379,15 @@ TranscriptCoordinator                     ← 编排：解码→VAD→逐块识�
   `result.timestamps` = **秒**（`durations` 长度 0）。真模型在 emulator-5554 上跑出过 58 个 token 的逐字时间，
   装载 ~4.9 s、识别 RTF 0.083~0.143（模拟器两轮抖动）、VAD RTF 0.017~0.020；模型文件是 `adb push` + `run-as` 搬进 `filesDir/models/` 的，
   **设备至今没能自己从 HTTP 取回 `model.int8.onnx` 与 `silero_vad.onnx`**（前者没试过 243 MB，后者 GitHub 不通）。
-  仍未做的：转录精度的人工抽查（缺真人语音素材）、整章内存峰值、以及「块边界影响文本」这件事的收口（§5 第 5 步已如实记录）。
+  仍未做的：转录精度的人工抽查（缺真人语音素材，§9 第 4 条）、整章内存峰值（只有模拟器数字）。
+  ~~「块边界影响文本」的收口~~ → **已由 `SentenceSplitter` 承担并接进协调器（2026-10-15，第 4b 项）**：
+  跨 VAD 段/跨块的过度切分靠 §6 第 3 条的合并窗口收拾，148 s 素材实测 35 句、硬切 0 句（§10 编排层那条有原始日志）。
 - **音频数学层（2026-10-15 新增，Phase 6 第 3 项前半）**：`domain/asr/PcmConversion`（16-bit LE → 单声道 float，多声道取均值）、
   `domain/asr/SincResampler`（窗口 sinc / Blackman、每侧 16 抽头、整数相位系数表、每相位归一直流增益；实测 12 kHz 折进输出 4 kHz 的成分压到 −69 dB，
   见 `docs/architecture.md` D26）、`domain/asr/AsrChunkPlanner` + `domain/model/AsrModels`（>20s 均分、绝对毫秒偏移，见 D27）。
-  36 条 JVM 单测，`grep` 确认 `domain/` 无 Android/Media3/Room import。当时这些类**没有生产调用方**（只有测试在调），
-  下一环 `PcmDecoder` 已在同一天落地（见下面「解码层」），`VadSegmenter`/`SherpaOnnxEngine` 见「推理层」。
+  36 条 JVM 单测，`grep` 确认 `domain/` 无 Android/Media3/Room import。**它们现在有生产调用方了**（2026-10-15 第 4b 项之后）：
+  `PcmDecoder` 内部调 `PcmConversion` + `SincResampler`，而 `TranscriptCoordinator` 调 `PcmDecoder`/`AsrChunkPlanner`/`TokenTimingMapper`
+  与 `SentenceSplitter`；写下来之前那一版确实只有测试在调，这句话留着是为了说明「谁来调」这条链路是本轮才接上的。
 - **解码层（2026-10-15 新增，Phase 6 第 3 项后半）**：`asr/PcmDecoder.kt`（框架 `MediaExtractor` + `MediaCodec` 同步模式，
   贪心喂入/非阻塞排空，`PcmConversion` 均值下混 → `SincResampler` → `BlockAccumulator` 定长块回调）+
   `androidTest/asr/PcmDecoderTest.kt` 4 条，在 emulator-5554 上真解过 148 秒 MP3：44100 Hz/2 声道、单缓冲 ≤4,608 B、
