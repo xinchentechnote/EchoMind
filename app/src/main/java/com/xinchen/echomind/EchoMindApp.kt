@@ -15,9 +15,11 @@ import com.xinchen.echomind.data.repo.PlaybackRepositoryImpl
 import com.xinchen.echomind.data.repo.SubtitleRepository
 import com.xinchen.echomind.data.repo.SubtitleRepositoryImpl
 import com.xinchen.echomind.data.repo.SafTreeGrantStore
+import com.xinchen.echomind.data.repo.TranscriptRepositoryImpl
 import com.xinchen.echomind.data.scan.SafTreeBrowser
 import com.xinchen.echomind.data.scan.SystemAudioMetadataReader
 import com.xinchen.echomind.domain.playback.PlaybackController
+import com.xinchen.echomind.domain.transcript.TranscriptRepository
 import com.xinchen.echomind.playback.EchoMindMediaService
 import com.xinchen.echomind.playback.Media3PlaybackController
 import com.xinchen.echomind.playback.PlayerHolder
@@ -39,6 +41,7 @@ class AppGraph(
     val audioRepository: AudioRepository,
     val playbackRepository: PlaybackRepository,
     val subtitleRepository: SubtitleRepository,
+    val transcriptRepository: TranscriptRepository,
     val playbackController: PlaybackController,
     val modelManager: ModelManager,
     val appScope: CoroutineScope,
@@ -73,6 +76,7 @@ class EchoMindApp : Application() {
             ),
             playbackRepository = playbackRepository,
             subtitleRepository = SubtitleRepositoryImpl(db, timeSource),
+            transcriptRepository = TranscriptRepositoryImpl(db, timeSource),
             modelManager = ModelManager(
                 // 模型放内部 filesDir：不需要任何运行时权限，卸载即清干净，也不出现在别的 App 的读写范围里
                 modelsRoot = File(filesDir, "models"),

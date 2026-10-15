@@ -1,0 +1,78 @@
+package com.xinchen.echomind.data.db
+
+import androidx.room.Dao
+import androidx.room.Insert
+import androidx.room.Query
+import kotlinx.coroutines.flow.Flow
+
+/**
+ * 转录任务的读写。
+ *
+ * 每条状态跃迁都带 `WHERE status IN (...)` 守卫并返回受影响行数，所以：
+ * - 重复结算（协程与 WorkManager 的重试撞上同一行）第二次是 0 行，不会把 SUCCESS 改回 RUNNING；
+ * - 非法跃迁（已 CANCELLED 的任务被 worker 写回 RUNNING）在 SQL 层面就失败，调用方看得见。
+ *
+ * 事务由 `TranscriptRepositoryImpl` 包（状态跃迁 + `audio_book.transcription_state` 必须一起提交），DAO 自己不开事务。
+ */
+@Dao
+interface TranscriptJobDao {
+
+    @Query("SELECT * FROM transcript_job ORDER BY created_at_ms DESC")
+    fun observeAll(): Flow<List<TranscriptJobEntity>>
+
+    @Query("SELECT * FROM transcript_job WHERE audio_id = :audioId AND status IN ('QUEUED', 'RUNNING') ORDER BY created_at_ms DESC LIMIT 1")
+    fun observeActiveOf(audioId: String): Flow<TranscriptJobEntity?>
+
+    @Query("SELECT * FROM transcript_job WHERE audio_id = :audioId AND status IN ('QUEUED', 'RUNNING') ORDER BY created_at_ms DESC LIMIT 1")
+    suspend fun activeOf(audioId: String): TranscriptJobEntity?
+
+    @Query("SELECT audio_id FROM transcript_job WHERE status IN ('QUEUED', 'RUNNING')")
+    suspend fun activeAudioIds(): List<String>
+
+    @Query("SELECT * FROM transcript_job WHERE id = :id")
+    suspend fun getById(id: String): TranscriptJobEntity?
+
+    @Insert
+    suspend fun insert(job: TranscriptJobEntity)
+
+    /** QUEUED → RUNNING。分段总数此时才由 VAD 的结果填进去 */
+    @Query(
+        "UPDATE transcript_job SET status = 'RUNNING', started_at_ms = :startedAtMs, total_segments = :totalSegments " +
+            "WHERE id = :id AND status = 'QUEUED'",
+    )
+    suspend fun markRunning(id: String, startedAtMs: Long, totalSegments: Int): Int
+
+    /** RUNNING → SUCCESS。done 一并写终值，免得最后一块的进度没来得及节流写库 */
+    @Query(
+        "UPDATE transcript_job SET status = 'SUCCESS', finished_at_ms = :finishedAtMs, " +
+            "done_segments = :doneSegments, total_segments = :totalSegments " +
+            "WHERE id = :id AND status = 'RUNNING'",
+    )
+    suspend fun markSuccess(id: String, finishedAtMs: Long, doneSegments: Int, totalSegments: Int): Int
+
+    @Query(
+        "UPDATE transcript_job SET status = 'FAILED', finished_at_ms = :finishedAtMs, " +
+            "error_code = :errorCode, error_message = :errorMessage " +
+            "WHERE id = :id AND status IN ('QUEUED', 'RUNNING')",
+    )
+    suspend fun markFailed(id: String, finishedAtMs: Long, errorCode: String, errorMessage: String?): Int
+
+    @Query(
+        "UPDATE transcript_job SET status = 'CANCELLED', finished_at_ms = :finishedAtMs, " +
+            "error_code = 'CANCELLED', error_message = :errorMessage " +
+            "WHERE id = :id AND status IN ('QUEUED', 'RUNNING')",
+    )
+    suspend fun markCancelled(id: String, finishedAtMs: Long, errorMessage: String?): Int
+
+    /** 进度节流写库（≥1s，AGENTS.md §4），只在 RUNNING 时有效 */
+    @Query("UPDATE transcript_job SET done_segments = :doneSegments, total_segments = :totalSegments WHERE id = :id AND status = 'RUNNING'")
+    suspend fun updateProgress(id: String, doneSegments: Int, totalSegments: Int): Int
+
+    /** 还挂在 QUEUED/RUNNING 的行全部标 FAILED(INTERRUPTED)，返回处理了几行（FR-507 重启恢复） */
+    @Query(
+        "UPDATE transcript_job SET status = 'FAILED', finished_at_ms = :finishedAtMs, " +
+            "error_code = 'INTERRUPTED', error_message = '任务被中断（进程退出或系统重启）' " +
+            "WHERE status IN ('QUEUED', 'RUNNING')",
+    )
+    suspend fun markInterrupted(finishedAtMs: Long): Int
+}

@@ -13,9 +13,9 @@ import androidx.room.PrimaryKey
  * 对齐结果，**禁止**按字数均分、复制文本凑时间。所以来源记在 `source` 列里，UI 按它标注，
  * 测试字幕永远不会被当成 ASR 产物显示。
  *
- * `job_id` 这一版**不加外键**：`transcript_job` 表要 Phase 6 才存在，SQLite 后补 FK 得整表重建
- * （建新表→拷贝→改名→重建索引）。现在建成可空 TEXT，Phase 6 建任务表时用一次 v2→v3 的重建补上 FK，
- * 理由记在 `docs/database-design.md` §5。
+ * `job_id` 从 v3 起带外键（`docs/database-design.md` §5.1）：指向产出它的那次任务，
+ * `ON DELETE SET NULL`——清理任务历史不能把已生成的字幕一起带走。
+ * 手工导入的测试字幕这一列恒为 null（它没有任务）。
  */
 @Entity(
     tableName = "subtitle_segment",
@@ -26,10 +26,17 @@ import androidx.room.PrimaryKey
             childColumns = ["audio_id"],
             onDelete = ForeignKey.CASCADE,
         ),
+        ForeignKey(
+            entity = TranscriptJobEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["job_id"],
+            onDelete = ForeignKey.SET_NULL,
+        ),
     ],
     indices = [
         Index(value = ["audio_id", "segment_index"], unique = true),
         Index(value = ["audio_id", "start_ms"]),
+        Index(value = ["job_id"]),
     ],
 )
 data class SubtitleSegmentEntity(
@@ -40,7 +47,7 @@ data class SubtitleSegmentEntity(
     @ColumnInfo(name = "end_ms") val endMs: Long,
     @ColumnInfo(name = "text") val text: String,
     @ColumnInfo(name = "source") val source: String = Source.ASR,
-    /** 产出这一批的字段的行，Phase 6 才有真值；可空且暂无 FK（见类注释） */
+    /** 产出这一批字幕的任务行；手工导入的测试字幕为 null（v3 起有外键，见类注释） */
     @ColumnInfo(name = "job_id") val jobId: String? = null,
     @ColumnInfo(name = "created_at_ms") val createdAtMs: Long,
 ) {

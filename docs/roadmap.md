@@ -13,7 +13,7 @@
 | 3 | 文件夹导入 + 书架 | **PARTIAL** | `assembleDebug` + 31 项 JVM 单测 + 20 项仪器化测试全绿；`emulator-5554` 真实 SAF 导入 6 首、连续重扫不重复建记录、移走→MISSING、原样移回→PRESENT、手改标题不被覆盖、force-stop 后书架不丢，DB 查询与截图为证（`testing.md` §4）。缺口见下「Phase 3 遗留」 |
 | 4 | Media3 播放 + 播放记忆与统计 | **PARTIAL** | `assembleDebug` + 59 项 JVM 单测 + 41 项仪器化测试全绿（2026-10-15）；`emulator-5554` 实测：前台中媒体通知、通知栏控制、媒体键、瞬时焦点丢失暂停且不自动续播、自动切歌逐首分账、崩溃恢复标 `CRASHED`、重算==增量、统计页与 DB 对账一致。缺口见下「Phase 4 遗留」 |
 | 5 | 字幕基础设施与七句窗口 | **PARTIAL** | `assembleDebug` + 83 项 JVM 单测 + 48 项仪器化测试全绿（2026-10-15）；`emulator-5554` 实测：v2 建表、七句窗口 3+1+3、末句不补位、当前句高亮、点句跳 `start_ms`（DB 复核 12000/15000/24000）、拖动与倍速后跟手、切歌后换成另一套字幕、测试字幕常驻标注「非 ASR 产物」。缺口见下「Phase 5 遗留」 |
-| 6 | 本地 ASR（sherpa-onnx） | **PARTIAL**（**端到端仍未完成**） | 已实装并在 `emulator-5554` 上真跑过：模型清单/下载/校验（35 JVM + 4 仪器化）、PCM 解码（4 仪器化，148 s 真素材）、VAD 分段（6 仪器化，RTF 0.017~0.020）、SherpaOnnx 推理（8 仪器化，装载 ~4.9 s，识别 RTF 0.083~0.143 —— 模拟器两轮差 1.6 倍）、逐字时间换算（14 JVM）。JVM 169 / 仪器化 70 全绿。**缺口**：`work/` 包还是空的，没有 `TranscriptCoordinator`/任务表/WorkManager，**模型识别出的字句一次都没进过数据库**；当前播放页能看到的字幕全部来自 debug 通道导入的测试字幕文件。模型是 `adb push` 搬进设备的，App 自己下载 243 MB 那条路还没验过。见下「Phase 6 待办」 |
+| 6 | 本地 ASR（sherpa-onnx） | **PARTIAL**（**端到端仍未完成**） | 已实装并在 `emulator-5554` 上真跑过：模型清单/下载/校验（35 JVM + 4 仪器化）、PCM 解码（4 仪器化，148 s 真素材）、VAD 分段（6 仪器化，RTF 0.017~0.020）、SherpaOnnx 推理（8 仪器化，装载 ~4.9 s，识别 RTF 0.083~0.143 —— 模拟器两轮差 1.6 倍）、逐字时间换算（14 JVM）、**任务表与状态机（schema v3：`transcript_job` + `subtitle_segment.job_id` 外键整表重建；5 条迁移仪器化 + 16 条仓储仪器化）**。JVM 169 / 仪器化 **91** 全绿。**缺口**：`work/` 包还是空的，没有 `TranscriptCoordinator`/WorkManager，v3 那套任务接口**一个生产调用方都没有**，**模型识别出的字句一次都没进过数据库**；当前播放页能看到的字幕全部来自 debug 通道导入的测试字幕文件。模型是 `adb push` 搬进设备的，App 自己下载 243 MB 那条路还没验过。见下「Phase 6 待办」 |
 | 7 | UI 完整化与端到端验收 | **TODO** | — |
 | 8 | 交付文档与总结 | **TODO** | — |
 
@@ -79,9 +79,9 @@
 1. **字幕内容全部来自手工导入的测试文件**：没有模型、没有 ASR 产物，`transcription_state` 一条都没变过。FR-6xx 里「字幕从哪来」这件事仍然 0 分，属 Phase 6。
 2. **FR-602 中文标点切句未实现**：切句的对象是模型输出的整段文本，`SentenceSplitter` 连文件都没有。测试字幕自带时间，绕过了这一步，所以**不能拿它当切句已验证**。
 3. **FR-603 只做了一半**：导入解析器会拒绝 `end ≤ start` 并按时间重排重编号，但模型输出的负值/重叠/零长度清洗未实现。
-4. **真实用户升级路径没走过**：v1→v2 迁移是在仪器化测试里造 v1 文件再迁移验证的；本机从未安装过 v1 版本的 App，所以「旧包覆盖安装」这条路径没有实测数据（`MigrationTestHelper` 已覆盖 SQL 层面）。
-5. **书架那一格仍显示「未转录」**：它描述的是转录任务状态，有测试字幕的书也不会变（D21）。Phase 6 任务表落地后这一格才有真意义。
-6. **`job_id` 可空且暂无外键**：Phase 6 建 `transcript_job` 时要走一次 v2→v3 整表重建补上 FK（`database-design.md` §5.1）。
+4. **真实用户升级路径没走过**：v1→v2 与 v2→v3 迁移都是在仪器化测试里造旧版本文件再迁移验证的；本机从未安装过 v1/v2 版本的 App，所以「旧包覆盖安装」这条路径没有实测数据（`MigrationTestHelper` 已覆盖 SQL 层面，包括 v3 那次整表重建）。
+5. ~~**书架那一格仍显示「未转录」**~~ → **状态机已就绪但界面仍无变化（2026-10-15）**：`transcript_job` 与 `TranscriptionState` 的跃迁已经实现（v3），可它没有生产调用方，所以真机上书架那一格还是「未转录」——有测试字幕的书也不会变（D21）。要等 4b 的协调器接上才有真数字。
+6. ~~**`job_id` 可空且暂无外键**~~ → **已解决（2026-10-15）**：v2→v3 用整表重建补上了 `job_id → transcript_job` 的 SET NULL 外键，行为（置空不删字幕）在迁移后的库上实测过（`database-design.md` §5.1）。
 7. 长句换行时的高亮可辨识性（FR-708）只做了目视，字号调节（FR-902）在 Phase 7。
 
 ## 远端 CI（2026-10-15 建好）
@@ -126,8 +126,22 @@ CI **不覆盖**：仪器化测试（没有模拟器）、真机验证、ASR 端
    逐字时间仍有效，但**块文本不能直接当字幕**，这是第 5 项 `SentenceSplitter` 的活。
    **还缺**：把这三层接进生产编排（现在只有测试在串它）、`transcript_job` 表与 WorkManager、入库事务、模型的设备端 HTTP 取回（现在这两个模型是 `adb push` + `run-as` 搬进 `filesDir/models/` 的，
    与「App 能自己下载」是两件事）。
-4. `transcript_job` 表（v2→v3，顺带给 `subtitle_segment.job_id` 补 FK）+ `TranscriptCoordinator` + WorkManager 任务与重启恢复。
-5. FR-602/603 的切句与时间戳清洗（这次才是真需要 `SentenceSplitter` 的地方）。
+4. ~~`transcript_job` 表（v2→v3，顺带给 `subtitle_segment.job_id` 补 FK）~~ → **DONE（2026-10-15）**：
+   `EchoMindDatabase` 升到 `version = 3`，`Migrations.MIGRATION_2_3` 建 `transcript_job`（13 列 + 3 索引 + 指向 `audio_book` 的 CASCADE 外键），
+   并**整表重建** `subtitle_segment` 补上 `job_id → transcript_job` 的 SET NULL 外键（SQLite 不能 ALTER ADD CONSTRAINT，做法与取舍见 `database-design.md` §5.1 / `architecture.md` D31）；
+   `3.json` 已导出入库，DDL 与 Room 生成语句逐条对过（TEXT 主键落成表级 `PRIMARY KEY(\`id\`)`，SQLite 因此自带一个 `sqlite_autoindex_*`，不是 Room 的索引）。
+   `TranscriptJobDao` + `domain/transcript/TranscriptRepository` + `data/repo/TranscriptRepositoryImpl`：
+   enqueue / cancel / retry / markRunning / updateProgress / commitSubtitles / markFailed / recoverInterrupted 全部实现，
+   每条跃迁与 `audio_book.transcription_state` 同事务提交，跃迁语句带 `WHERE status IN (...)` 守卫（重复结算第二次是 0 行 → `false`）。
+   测试：**新增 5 条迁移仪器化 + 16 条仓储仪器化**，整套件 **91 条全绿**（`OK (91 tests)`，80.7 s，emulator-5554，08:04 复跑）。
+   迁移测试不只对账结构，还在这台迁移后的库上真跑了「删任务行只把 `job_id` 置空、不删字幕」和「删书连带带走字幕与任务」；
+   仓储测试覆盖了空字幕拒绝提交、重复结算整体回滚、取消后按「库里还有没有 ASR 字幕 / 字幕比文件新还是旧」回退到 NONE/READY/EXPIRED。
+   **仍然 0 分的那半**：这套接口**一个生产调用方都没有**，模型识别出的字句至今没进过数据库。
+4b. `TranscriptCoordinator` + WorkManager 任务与重启恢复的**接线**（`enqueue` 进队列、worker 里跑解码→VAD→识别→切句→`commitSubtitles`、
+   `EchoMindApp.onCreate` 调 `recoverInterrupted()`、`ForegroundInfo` 通知、`work_request_id` 写回）。
+   ⚠ **顺序调整（2026-10-15）**：原计划第 5 项（切句）排在本项之后，实际**提前**了——理由是 `SentenceSplitter` 是纯 Kotlin、可 JVM 单测，
+   而实测已经证明「块文本不能直接当字幕」，这块逻辑不写完，协调器接上去也只是把碎的文本存进库。先做能测的那半，再做要设备的那半。
+5. FR-602/603 的切句与时间戳清洗（这次才是真需要 `SentenceSplitter` 的地方）——**当前在做**，见上一条的顺序调整。
 6. 转录页（现在是 placeholder）+ 失败降级文案。
 
 ## Phase 7 待办要点
@@ -151,6 +165,6 @@ CI **不覆盖**：仪器化测试（没有模拟器）、真机验证、ASR 端
 | 占位页面 | 书架/播放/统计已实装；**转录页与设置页仍是 placeholder** | Phase 6 / 7 逐个替换，替换前不宣称完成 |
 | 文件夹管理 UI | 只有全局重扫；FR-102/904 要求的按文件夹授权/重扫没有入口 | Phase 7 |
 | `connectedDebugAndroidTest` 会清掉被测 App 的数据 | 实测：跑完仪器化测试后 `dumpsys package` 显示 `notLaunched=true`、databases 目录消失、持久化授权一并失效，需要重装 APK 并重新走一遍 SAF 导入 | 设备验证放在仪器化测试**之后**做，或接受重导入成本 |
-| v1 schema 曾在开发期就地扩表 | Phase 3/4 往 `version = 1` 里直接加过表（未发版、数据可丢）。**Phase 5 起已改为显式 Migration**：`Migrations.MIGRATION_1_2` + `Migration_1_2_Test`，`EchoMindApp` 只注册 `Migrations.ALL`，没有 destructive 兜底 | Phase 6 建 `transcript_job` 时写 v2→v3，并顺带给 `subtitle_segment.job_id` 补外键（要整表重建） |
+| v1 schema 曾在开发期就地扩表 | Phase 3/4 往 `version = 1` 里直接加过表（未发版、数据可丢）。**Phase 5 起已改为显式 Migration**：`Migrations.MIGRATION_1_2` + `Migration_1_2_Test`，`EchoMindApp` 只注册 `Migrations.ALL`，没有 destructive 兜底 | ~~Phase 6 建 `transcript_job` 时写 v2→v3，并顺带给 `subtitle_segment.job_id` 补外键（要整表重建）~~ → **已做完（2026-10-15）**：`MIGRATION_2_3` + `Migration_2_3_Test`（5 条），整表重建字幕表补 FK，`3.json` 入库 |
 | x86_64 ABI | ~~目前 `abiFilters` 含 arm64-v8a + x86_64~~ → **已收窄为只打 arm64-v8a**（2026-10-15，接 AAR 的同时做的；本机 AVD `ro.product.cpu.abi` 实测 `arm64-v8a`，x86_64 那份 sherpa so 未压缩 27.4 MB 纯属浪费） | 已处理；x86 真机/模拟器如需用，再单独放开并实测体积 |
 | 手工 DI | `AppGraph` 会随阶段变胖 | 若超过 ~15 个装配项或出现循环依赖再评估拆模块 |

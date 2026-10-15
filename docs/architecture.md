@@ -28,6 +28,8 @@ app/src/main/java/com/xinchen/echomind/
 │   ├── model/ImportModels.kt      // ✅
 │   ├── model/PlaybackModels.kt    // ✅ ListeningSessionData / PlaybackProgress / SessionEndReason / SessionStatus
 │   ├── model/SubtitleModels.kt    // ✅ SubtitleSegment（index/startMs/endMs/text）
+│   ├── model/TranscriptModels.kt  // ✅ TranscriptJobRow / TranscriptJobStatus / TranscriptFailure / TranscriptModelRef / EnqueueOutcome
+│   ├── transcript/TranscriptRepository.kt // ✅ 任务状态机入口接口（实现在 data/repo）
 │   ├── importing/AudioTreeWalker.kt   // ✅ 递归遍历（TreeBrowser 抽象）
 │   ├── importing/AudioImportPlanner.kt// ✅ 差量判定 NEW/CHANGED/UNCHANGED/VANISHED/REVIVED
 │   ├── playback/PlaybackController.kt // ✅ 接口 + QueueItem + PlaybackUiState + resumePositionFor
@@ -43,15 +45,15 @@ app/src/main/java/com/xinchen/echomind/
 │   └── model/AsrModels.kt           // ✅ SpeechSpan / PcmChunkPlan / TokenTiming / ChunkRecognition（不暴露任何 native 类型）
 ├── data/
 │   ├── db/                        // ✅ Entity / DAO / EchoMindDatabase / Migrations
-│   │   └──（v2 实到 5 表：imported_folder、audio_book、playback_state、listening_session、subtitle_segment）
-│   ├── repo/                      // ✅ AudioRepository、PlaybackRepository、SubtitleRepository、TreeGrantStore
-│   │   └── TranscriptRepository / SettingsRepository — Phase 6 / 7
+│   │   └──（v3 实到 6 表：imported_folder、audio_book、playback_state、listening_session、subtitle_segment、transcript_job；`Migrations.ALL` = 1→2、2→3 两条）
+│   ├── repo/                      // ✅ AudioRepository、PlaybackRepository、SubtitleRepository、TranscriptRepository、TreeGrantStore
+│   │   └── SettingsRepository — Phase 7
 │   └── scan/                      // ✅ SafTreeBrowser（DocumentFile→TreeBrowser）、AudioMetadataReader（Media3 时长）
 ├── playback/
 │   ├── Media3PlaybackController.kt// ✅ 实现 + Player.Listener + 统计事件翻译 + 串行落库通道
 │   ├── PlayerHolder.kt            // ✅ 单例 ExoPlayer 持有（同进程共享给 Service；不提供 release()）
 │   └── EchoMindMediaService.kt    // ✅ MediaSessionService + addSession + 前台通知 + onTaskRemoved
-├── asr/                           // 模型准备 ✅ + 解码 ✅ + VAD ✅ + 推理 ✅（端到端串联与入库还没有）
+├── asr/                           // 模型准备 ✅ + 解码 ✅ + VAD ✅ + 推理 ✅（端到端串联还没有；入库的状态机与事务在 data/repo）
 │   ├── ModelCatalog.kt            // ✅ 清单唯一出处：URL/字节数/SHA-256 全部实测，无官方校验值标 null 并本机钉住
 │   ├── ModelVerifier.kt           // ✅ 存在 → 大小 → SHA-256 三步核对 + 流式哈希（纯 JVM，可单测）
 │   ├── ModelFetcher.kt            // ✅ `fun interface ModelFetcher`（测试接缝）+ `HttpFetcher`（HttpURLConnection，手工跟 Location）
@@ -59,7 +61,7 @@ app/src/main/java/com/xinchen/echomind/
 │   ├── PcmDecoder.kt              // ✅ MediaExtractor+MediaCodec 同步模式流式解码 → 16k 单声道定长块；4 条仪器化在真 MP3 上跑过
 │   ├── VadSegmenter.kt            // ✅ silero VAD 流式封装：push 块 → 出段（绝对样本下标 + 段内样本），6 条仪器化
 │   ├── SherpaOnnxEngine.kt        // ✅ 离线 Paraformer 封装：open 前按清单核对，recognize(块) → 逐字绝对毫秒；8 条仪器化
-│   └── TranscriptCoordinator      // — Phase 6 第 4 项（把上面三层串起来 + 取消/重试/入库）
+│   └── TranscriptCoordinator      // — Phase 6 第 4 项（把上面三层串起来；取消/重试/入库的仓储接口已经就绪，等它来调）
 │       （`PcmResampler` 这个名字不再需要：采样率转换落在 `domain/asr/SincResampler`）
 ├── work/                          // TranscriptWorker / FolderRescanWorker — Phase 6
 │   └──（当前无 WorkManager：重扫是 appScope 里的 `Dispatchers.IO` 协程）
@@ -161,7 +163,23 @@ class ModelManager(modelsRoot: File, timeSource: TimeSource, specs: List<ModelSp
 }
 // 取舍：`ModelManager` 是类不是接口。它的测试接缝放在**依赖**上——`fun interface ModelFetcher` 用假实现注入，
 // 于是「下载状态机」在 JVM 单测里可测，不需要再给 ModelManager 套一层接口。本地导入（`importFrom(uri)`）还没实现，等它落地时再谈签名。
-interface TranscriptRepository { fun jobs(): Flow<List<TranscriptJobRow>>; suspend fun enqueue(audioId: String); suspend fun cancel(jobId: Long); suspend fun retry(jobId: Long) }
+// ✅ Phase 6 实现（domain/transcript/TranscriptRepository.kt + data/repo/TranscriptRepositoryImpl.kt）
+interface TranscriptRepository {
+    fun jobs(): Flow<List<TranscriptJobRow>>                       // 转录页列表，新建在前
+    fun observeActiveJob(audioId: String): Flow<TranscriptJobRow?>  // 书架那一格与「重试」按钮读它
+    suspend fun enqueue(audioId: String, model: TranscriptModelRef, force: Boolean = false): EnqueueOutcome
+    suspend fun cancel(jobId: String): Boolean                      // false = 那行已经结束了，取消晚了
+    suspend fun retry(jobId: String, model: TranscriptModelRef): EnqueueOutcome   // 新建一行，旧行留着当错误上下文
+    suspend fun markRunning(jobId: String, totalSegments: Int): Boolean
+    suspend fun updateProgress(jobId: String, doneSegments: Int, totalSegments: Int): Boolean
+    suspend fun commitSubtitles(jobId: String, segments: List<SubtitleSegment>): Int   // 单事务：删旧+插新+SUCCESS+READY
+    suspend fun markFailed(jobId: String, failure: TranscriptFailure, message: String?): Boolean
+    suspend fun recoverInterrupted(): Int                            // FR-507，幂等
+}
+// 状态跃迁一律带 `WHERE status IN (...)` 守卫并返回受影响行数 → 非法跃迁/重复结算是 `false`，不是异常。
+// 唯一例外是 `commitSubtitles`：那条只有成功分支，跃迁失败就抛、事务整体回滚（字幕与任务状态必须同生同死）。
+// `TranscriptModelRef` 由 `asr/ModelCatalog.transcriptRef` 给出（模型 id + 权重 SHA-256 前 12 位），
+// 调用方传进来而不是让 domain 反向 import `asr`。
 interface SubtitleRepository {                         // ✅ Phase 5 实现（data/repo/SubtitleRepository.kt）
     fun observeSegments(audioId: String): Flow<List<SubtitleSegment>>   // 整本按 segment_index 升序
     fun observeSummary(audioId: String): Flow<SubtitleSummary>          // 句数 + 是否 ASR 产物
@@ -211,18 +229,20 @@ EchoMindMediaService(MediaSessionService) ── addSession(MediaSession.Builder
 
 ### 5.3 转录
 ```
-TranscriptRepository.enqueue ─► WorkManager(前台类型 mediaPlayback? 见下) 
+TranscriptRepository.enqueue ✅ ─► WorkManager(前台类型 mediaPlayback? 见下) 
   ─► TranscriptCoordinator(代码里还没有，Phase 6 第 4 项):
        PcmDecoder ✅(MediaExtractor+MediaCodec 同步流式 → PcmConversion 均值下混 → SincResampler 到 16k → 定长块回调)
        ─► VadSegmenter ✅(silero VAD，float 块 → VadUtterance(绝对样本下标 + 段内样本)，段与段不重叠，≤20 s 强制切段)
        ─► AsrChunkPlanner ✅(>20s 段均分成 ≤20s 块，用全局样本下标算绝对 startMs/endMs)
        ─► SherpaOnnxEngine ✅.recognize(块) ─► ChunkRecognition(text + tokens[绝对毫秒])
        ─► SentenceSplitter(标点切句 + 时间清洗 — 还没有，Phase 6 第 5 项)
-       ─► Room 事务：删旧字幕 + 插新字幕 + job=SUCCESS + audio.transcriptionState=READY
+       ─► TranscriptRepository.commitSubtitles ✅(Room 单事务：删旧字幕 + 插新字幕(source=ASR, job_id) + job=SUCCESS + audio.transcriptionState=READY)
   ─► 进度每块更新一次（内存节流 ≥1s 写库）
 ```
 前三步已在 emulator-5554 上真串起来跑过（`VAD段逐块识别出来的时间是全局单调的`：60 s 素材 → 9 段 → 6 块 → 58 个逐字时间，
-跨块单调、全部落块内），但**串联代码在测试里，不在生产代码里**：`TranscriptCoordinator`、任务表、WorkManager、入库事务都还没写。
+跨块单调、全部落块内），但**串联代码在测试里，不在生产代码里**：`TranscriptCoordinator` 与 WorkManager 还没写。
+任务这一侧 v3 已经落地（`transcript_job` 表 + `TranscriptRepository` 全套跃迁 + 16 条仪器化用例），
+也就是说图上最后那两格是**能跑的、有人测过的**，只是现在还没有调用方——模型识别出的字句至今一次都没进过生产数据库。
 一条实测到的坑：块的边界不等于句子的边界——同一段歌词整块 20 s 识别出「那片笑声让我想起我的那些年」，
 被 VAD 切成两块后给出「偏笑声让」+「想起我的那些话」。逐字时间依然有效，但文本要靠 `SentenceSplitter` 收拾，不能拿块文本直接当字幕。
 前台服务用于长任务通知：转录用 `ForegroundInfo`（WorkManager 支持在 worker 返回 `Result` 前 `setForeground`），不额外起 Service。
@@ -327,3 +347,5 @@ controller.state.map { it.positionMs }        // 500ms tick，即 PlaybackPolicy
 | D28 | `PcmDecoder` 用 `MediaCodec` **同步模式 + 贪心喂入**（一次把能塞的输入都塞进去，本轮有产出就用 0 超时非阻塞继续取，两头都不动才等 10 ms），不用异步回调 API，也不逐「一进一出」 | 实测代价与收益：一进一出时解码器经常没活干，每轮都在 `dequeueOutputBuffer` 的超时上干等——148 s 真素材 27,974 ms（RTF 0.189）；改贪心后 24,557 ms（RTF 0.166），**产出字节序列逐样本相同**（`outSamples 2,378,188`、581 块、`peak/rms` 一致），所以这是调度而非算法改动。不选异步回调（`setCallback` + `MediaCodec.Callback`）：回调跑在专用线程上，要自己做「回调线程 ↔ 调用方取消」的同步与缓冲生命周期管理，而转录本来就在 `Dispatchers.IO` 协程里跑，同步模式 + 协程取消位（`PcmChunkSink` 返回 false）已经够用且状态全在一条栈上看得清。兜底：连续 3,000 轮（≈30 s）两头不动就抛 `PcmDecodeException`，不让任务无限挂住 |
 | D29 | 逐字时间戳的换算**独立成纯 Kotlin 的 `TokenTimingMapper`**，单位按实测钉死为**秒**（`timestamps` 相对本块起点），`durations` 数组长度是 **0** 所以每字的 `endMs` 取**下一个字的起点**、末字收到块末尾；任何自相矛盾（字数≠时间戳数、NaN/Inf、负数、越块、倒序）抛 `TokenTimingMapper.Mismatch`，**不返回半份结果也不猜缺的是哪一个** | 这是全项目最容易自欺的一环：猜错单位是整条字幕偏移 1000 倍，而它不会崩、只会「看起来有点不对」。所以三条判据都写成了设备断言（`逐字时间落在块内且单调` + 反向对照 `把秒当成毫秒喂进换算器会立刻抛错`），而不是靠日志里看一眼。`endMs` 不猜的代价：相邻字挤在同一毫秒会得到零长字幕，实测存在且合法，UI 靠 `SubtitleSynchronizer` 的 gap 迟滞吸收。数量不等也绝不「按少的对齐」——真出这种结果说明模型与封装版本不匹配，静默对齐就是把未知错误写进字幕表 |
 | D30 | `VadSegmenter` 是**流式**的（`push(FloatArray)` → 段列表，`finish()` 收尾），并且把**段内样本一起带回来**（`VadUtterance(startSample, samples)`），而不是只报区间让调用方回头再读一遍音频 | 内存账：1 小时书解 = 3.6×10⁷ 样本 = 144 MB float（还有解码中间态），而实测最长语音段 118,720 样本 ≈ 0.48 MB → 峰值只需 1 个输入块 + 512 样本窗 + 已出段。只报区间的写法要么整章进内存，要么解码两遍（这台设备 148 s 素材单趟解码就 8.9 s，RTF 0.15，两遍直接翻倍）。副作用实测：喂入块长（4096/1024/3000/整串一次）不影响分段结果——同一批样本吐出完全相同的 `(startSample, len)` 列表，这条已做成用例，就是「攒不满一窗的尾巴要留住」的实现契约。另外**不给 `AsrEngine` 套接口**：目前只有一个实现、没有假引擎可注入，代价是推理层只能上设备测（JVM 侧退到 `TokenTimingMapper`/`AsrChunkPlanner`），等真需要第二个引擎时再抽 |
+| D31 | `subtitle_segment.job_id` 的外键在 **v3 用整表重建补上**（建 `_new` → 显式列名 `INSERT..SELECT` 搬数据（含主键 `id` 原值）→ DROP → RENAME → 重建三条索引），而不是「长期不建 FK」或「为挂 FK 新建一张关联表」 | 不建 FK 的代价是「字幕指向一个不存在的任务」这种行永远写得出、也没人会发现；用关联表绕开则是把一次 join 变成常态。SQLite 只有整表重建这一条正路，而它真正危险的地方是**搬丢数据**：所以 `Migration_2_3_Test` 不只要 `runMigrationsAndValidate` 与 `3.json` 对账，还要逐句比对字幕文本/时间/id，并在这台迁移后的库上真跑一次「删任务行只把 `job_id` 置空、不删字幕」——SET NULL 写在 DDL 里不等于生效过。另有一条有意的严格：搬数据时外键已开着，指向不存在任务的 `job_id` 会让整条迁移失败而不是被吞掉（v2 的代码写不出这种值，真出现就是库被外部改过，必须让人看见） |
+| D32 | 任务状态跃迁写成**带 `WHERE status IN (...)` 守卫的 UPDATE**、返回受影响行数，由 `TranscriptRepositoryImpl` 把 0 行翻译成 `false`；而不是「先 SELECT 判断再 UPDATE」，也不给 `AsrEngine`/任务表加乐观锁版本号 | 转录这件事天然会有两个写者（UI 协程取消 + worker 结算 + WorkManager 重试），先读后写中间的窗口足够把 SUCCESS 改回 RUNNING。守卫式 UPDATE 把判定交给 SQLite 的单语句原子性，重复结算第二次就是 0 行，看得见也改不动；加版本号列则是为同一件事付双倍复杂度。例外是 `commitSubtitles`：那条路径只有成功分支，跃迁失败说明这批字幕不该落库，所以用 `check` 抛出、事务整体回滚——用例 `重复结算第二次整体失败并回滚字幕` 就是断言「第二次写完字幕又被回滚干净」。另外 `transcript_job` 的历史**只追加不覆盖**（重试新建一行），否则「上次为什么失败」就没有东西可查 |

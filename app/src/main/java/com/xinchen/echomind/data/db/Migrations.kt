@@ -9,7 +9,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
  * 为什么手写 DDL 而不用 Room 的自动迁移：自动迁移会重建整表，而 SQLite 加外键必须走
  * 「建新表→拷数据→删旧表→改名→重建索引」，静默重写用户全部收听历史的风险不值得省这几行
  * （AGENTS.md §4：正式版禁止 destructive migration）。DDL 必须与 Room 由实体生成的
- * `CREATE TABLE` 逐字一致，一致性由 `Migration_1_2Test` 用导出的 schema JSON 校验。
+ * `CREATE TABLE` 逐字一致，一致性由 `Migration_1_2_Test` / `Migration_2_3_Test` 用导出的 schema JSON 校验。
  */
 object Migrations {
 
@@ -44,6 +44,81 @@ object Migrations {
         }
     }
 
+    /**
+     * v2 → v3：建 `transcript_job`，并把 `subtitle_segment` 整表重建以补上 `job_id` 的外键。
+     *
+     * 为什么要重建：SQLite 不支持 `ALTER TABLE ... ADD CONSTRAINT`，加 FK 只有
+     * 「建新表 → 拷数据 → 删旧表 → 改名 → 重建索引」这一条路（`docs/database-design.md` §5.1）。
+     * 顺序是有讲究的：
+     * 1. 先建 `transcript_job`，否则重建字幕表时外键指向的表还不存在；
+     * 2. 拷贝用列名清单而不是 `SELECT *`——新旧表列序一旦因为实体改动而不同，`*` 会静默错位；
+     * 3. 旧表的索引在 `DROP TABLE` 时自动消失，所以改名后要按 Room 的命名重建三条（v3 比 v2 多一条 `job_id`；少一条就与导出 schema 不符）。
+     *
+     * 已有字幕行 `job_id` 恒为 null（Phase 5 只写测试字幕），所以 `SET NULL` 这条外键在本机上不会拒收任何历史数据。
+     */
+    val MIGRATION_2_3: Migration = object : Migration(2, 3) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS `transcript_job` (" +
+                    "`id` TEXT NOT NULL, " +
+                    "`audio_id` TEXT NOT NULL, " +
+                    "`model_id` TEXT NOT NULL, " +
+                    "`model_version` TEXT NOT NULL, " +
+                    "`status` TEXT NOT NULL, " +
+                    "`total_segments` INTEGER NOT NULL, " +
+                    "`done_segments` INTEGER NOT NULL, " +
+                    "`error_code` TEXT, " +
+                    "`error_message` TEXT, " +
+                    "`work_request_id` TEXT, " +
+                    "`created_at_ms` INTEGER NOT NULL, " +
+                    "`started_at_ms` INTEGER, " +
+                    "`finished_at_ms` INTEGER, " +
+                    "PRIMARY KEY(`id`), " +
+                    "FOREIGN KEY(`audio_id`) REFERENCES `audio_book`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE" +
+                    ")",
+            )
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_transcript_job_audio_id` ON `transcript_job` (`audio_id`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_transcript_job_status` ON `transcript_job` (`status`)")
+            db.execSQL(
+                "CREATE INDEX IF NOT EXISTS `index_transcript_job_audio_id_created_at_ms` " +
+                    "ON `transcript_job` (`audio_id`, `created_at_ms`)",
+            )
+
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS `subtitle_segment_new` (" +
+                    "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                    "`audio_id` TEXT NOT NULL, " +
+                    "`segment_index` INTEGER NOT NULL, " +
+                    "`start_ms` INTEGER NOT NULL, " +
+                    "`end_ms` INTEGER NOT NULL, " +
+                    "`text` TEXT NOT NULL, " +
+                    "`source` TEXT NOT NULL, " +
+                    "`job_id` TEXT, " +
+                    "`created_at_ms` INTEGER NOT NULL, " +
+                    "FOREIGN KEY(`audio_id`) REFERENCES `audio_book`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE, " +
+                    "FOREIGN KEY(`job_id`) REFERENCES `transcript_job`(`id`) ON UPDATE NO ACTION ON DELETE SET NULL" +
+                    ")",
+            )
+            db.execSQL(
+                "INSERT INTO `subtitle_segment_new` " +
+                    "(`id`, `audio_id`, `segment_index`, `start_ms`, `end_ms`, `text`, `source`, `job_id`, `created_at_ms`) " +
+                    "SELECT `id`, `audio_id`, `segment_index`, `start_ms`, `end_ms`, `text`, `source`, `job_id`, `created_at_ms` " +
+                    "FROM `subtitle_segment`",
+            )
+            db.execSQL("DROP TABLE `subtitle_segment`")
+            db.execSQL("ALTER TABLE `subtitle_segment_new` RENAME TO `subtitle_segment`")
+            db.execSQL(
+                "CREATE UNIQUE INDEX IF NOT EXISTS `index_subtitle_segment_audio_id_segment_index` " +
+                    "ON `subtitle_segment` (`audio_id`, `segment_index`)",
+            )
+            db.execSQL(
+                "CREATE INDEX IF NOT EXISTS `index_subtitle_segment_audio_id_start_ms` " +
+                    "ON `subtitle_segment` (`audio_id`, `start_ms`)",
+            )
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_subtitle_segment_job_id` ON `subtitle_segment` (`job_id`)")
+        }
+    }
+
     /** 装配进 `Room.databaseBuilder(...).addMigrations(...)`；顺序无关，Room 按 startVersion/endVersion 排路径 */
-    val ALL: Array<Migration> = arrayOf(MIGRATION_1_2)
+    val ALL: Array<Migration> = arrayOf(MIGRATION_1_2, MIGRATION_2_3)
 }

@@ -11,6 +11,7 @@ import androidx.room.RoomDatabase
  *
  * v1 = imported_folder / audio_book / playback_state / listening_session（Phase 2~4）。
  * v2 = + subtitle_segment（Phase 5，`Migrations.MIGRATION_1_2`）。
+ * v3 = + transcript_job，并给 `subtitle_segment.job_id` 补上外键（整表重建，`Migrations.MIGRATION_2_3`）。
  */
 @Database(
     entities = [
@@ -19,8 +20,9 @@ import androidx.room.RoomDatabase
         PlaybackStateEntity::class,
         ListeningSessionEntity::class,
         SubtitleSegmentEntity::class,
+        TranscriptJobEntity::class,
     ],
-    version = 2,
+    version = 3,
     exportSchema = true,
 )
 abstract class EchoMindDatabase : RoomDatabase() {
@@ -29,6 +31,7 @@ abstract class EchoMindDatabase : RoomDatabase() {
     abstract fun playbackStateDao(): PlaybackStateDao
     abstract fun listeningSessionDao(): ListeningSessionDao
     abstract fun subtitleSegmentDao(): SubtitleSegmentDao
+    abstract fun transcriptJobDao(): TranscriptJobDao
     abstract fun shelfDao(): ShelfDao
 
     companion object {

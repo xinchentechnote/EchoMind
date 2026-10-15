@@ -2,11 +2,12 @@
 
 引擎：Room 2.8.5 + 系统 SQLite。文件：`app/src/main/java/com/xinchen/echomind/data/db/`。
 导出 schema：`app/schemas/`（`room.schemaLocation` 由 KSP 参数配置，JSON 入库以便迁移测试）。
-数据库名 `echomind.db`，当前版本 **1**。
+数据库名 `echomind.db`，当前版本 **3**（只有 `settings` 还没进 schema，Phase 7）。
 
-> **v1 里真正存在的表只有三张**：`imported_folder`、`audio_book`、`playback_state`（`app/schemas/…/1.json` 可核对）。
-> `listening_session`（Phase 4）、`subtitle_segment` / `transcript_job`（Phase 5/6）、`settings`（Phase 7）目前是**设计**，还没进 schema。
-> Phase 3 期间往 v1 加表不写 Migration 的前提是「开发包数据可丢」；一旦有已安装的真实包，必须先冻结 v1 再走显式 Migration（`architecture.md` D12）。
+> **各版本实际包含的表**（`app/schemas/…/N.json` 可核对）：
+> v1 = `imported_folder`、`audio_book`、`playback_state`、`listening_session`；
+> v2（Phase 5a）+ `subtitle_segment`；v3（Phase 6）+ `transcript_job`，同时把 `subtitle_segment.job_id` 补成外键（整表重建，见 §5.1）。
+> Phase 3 期间往 v1 加表不写 Migration 的前提是「开发包数据可丢」；一旦有已安装的真实包，必须先冻结 v1 再走显式 Migration（`architecture.md` D12）——v2、v3 都是这么做的。
 
 ## 1. ER 关系
 
@@ -26,7 +27,7 @@ erDiagram
 要点：
 - **`LISTENING_SESSION` 故意不建外键**，这样「删除书架记录」不会带走听书历史（需求 NFR-04）；代价是历史行需要自带展示用的快照字段（§4.3）。
 - `PLAYBACK_STATE` 与 `AUDIO_BOOK` 一对一：用 `audio_id` 同时作 PK 与 FK，数据库层面就杜绝重复行。
-- `SUBTITLE_SEGMENT.transcript_job_id` 用 `SET NULL`：清理任务历史不影响已生成字幕的可用性。
+- `SUBTITLE_SEGMENT.job_id` 用 `SET NULL`：清理任务历史不影响已生成字幕的可用性。
 
 ## 2. imported_folder（文件夹授权）
 
@@ -122,21 +123,34 @@ erDiagram
 | `start_ms` / `end_ms` | INTEGER | | 来源见 `asr-design.md`（禁止均分伪造） |
 | `text` | TEXT | | 已切句 |
 | `source` | TEXT | NOT NULL | `ASR` / `MANUAL_TEST`。手工导入的测试字幕必须与模型产物分得开（AGENTS.md §5） |
-| `job_id` | TEXT | 可空，**本版无 FK** | 产出批次；`transcript_job` 表 Phase 6 才存在 |
-| `created_at_ms` | INTEGER | | |
+| `job_id` | TEXT | 可空，FK→transcript_job **SET NULL**，索引 | 产出批次。v3 起有外键（§5.1）；只有 ASR 提交路径写它，手工导入的测试字幕永远是 null |
+| `created_at_ms` | INTEGER | | 落库时刻，也是「字幕比文件新还是旧」的判据（§5.2） |
 
-索引：`UNIQUE(audio_id, segment_index)`、`(audio_id, start_ms)`。
+索引：`UNIQUE(audio_id, segment_index)`、`(audio_id, start_ms)`、`(job_id)`。
 读取路径：`SELECT ... WHERE audio_id = ? AND start_ms BETWEEN ? AND ?`（窗口 ±N 句）或整本有序加载进内存索引（长音频用 `segment_index` 分页）。二分查找在内存里对 `List<SubtitleSegment>` 做，列表由 DAO 一次按 `segment_index` 顺序取（Phase 5 评估：单本 5000 句量级约几百 KB，可接受；超限则改为窗口查询）。
 
 重转时替换语义：**一个事务内** `DELETE FROM subtitle_segment WHERE audio_id = ?` + 批量插入新行（FR-605），避免半套字幕。实现见 `SubtitleRepositoryImpl.replace()`（`db.withTransaction`），仪器化测试 `SubtitleRepositoryTest.再次导入是整本替换而不是追加` 覆盖。
 
-### 5.1 为什么 `job_id` 先不做外键
+### 5.1 `job_id` 的外键是 v2→v3 补上来的（为什么当初先不建）
 
-SQLite 不支持 `ALTER TABLE ... ADD CONSTRAINT`，后补 FK 只能整表重建（建新表→拷贝→改名→重建索引）。`transcript_job` 要到 Phase 6 才存在，所以 v2 把 `job_id` 建成可空 TEXT，等 Phase 6 建任务表时用一次 v2→v3 重建把 FK 补上（`onDelete = SET NULL`）。
-另一条路是现在就建一张空的 `transcript_job` 只为了挂 FK——那会让 Phase 6 的表结构被 v2 钉死，改一列就得再来一次重建，得不偿失。
-**代价**：本版可以写入指向不存在任务的 `job_id`。当前只有 `SubtitleRepositoryImpl` 会写这一列，且它恒写 `null`，所以实际不可达。
+v2 那版刻意没给 `job_id` 挂 FK：SQLite 不支持 `ALTER TABLE ... ADD CONSTRAINT`，后补 FK 只能整表重建（建新表→按列名拷贝→删旧表→改名→重建索引），而 `transcript_job` 当时还不存在，挂 FK 得先建一张空表把结构钉死——Phase 6 想改一列就得再来一次重建，得不偿失。
+所以 v2 的代价是「可以写入指向不存在任务的 `job_id`」，但当时只有 `SubtitleRepositoryImpl` 写这一列且恒写 `null`，实际不可达。
 
-## 6. transcript_job（转录任务）
+v3 补 FK 的做法（`Migrations.MIGRATION_2_3`）：
+- 建 `subtitle_segment_new`（两条 FK：`audio_id` CASCADE、`job_id` SET NULL），`INSERT ... SELECT` **显式列名**把数据搬过去，主键 `id` 原值保留——那些 id 即将被 `job_id` 引用，重排就是改历史；
+- `DROP TABLE` 旧表 + `ALTER TABLE ... RENAME`，再重建三条索引（漏一条不会报错，只会让读取路径静默退化成全表扫）。
+- 搬数据时外键已开着，所以指向不存在任务的 `job_id` 会让整条迁移失败而不是被悄悄吞掉。这是有意的：v2 的代码不可能写出这种值，真出现了就是库被外部改过，必须让人看见。
+
+覆盖它的仪器化测试 `Migration_2_3_Test`（5 条）不只看 `runMigrationsAndValidate` 与 `3.json` 对账，还在这台迁移后的库上真跑了一遍行为：逐句比对字幕内容与 id、`PRAGMA foreign_key_list` 有两条外键、删书级联带走字幕与任务、**删任务行只把 `job_id` 置空而不删字幕**、三条索引都在。
+
+### 5.2 只有 ASR 字幕算「转录过」
+
+`source` 一列把「模型产物」和「手工导入的测试字幕」分开（AGENTS.md §5）。任务状态机只看前者：
+`SubtitleSegmentDao.countAsrOf()` / `latestAsrCreatedAtMs()` 两条查询都带 `AND source = 'ASR'`，所以一副测试字幕不会让 `enqueue` 误判成「已经转好了」，也不会让取消后的书架谎报 READY。
+
+`latestAsrCreatedAtMs` 与 `audio_book.file_last_modified_ms` 比大小，就是「这副字幕跟当前文件对不对得上」的判据（FR-107）——用的还是扫描路径那套 mtime 规则，不新造第二种口径。任务被取消后书架回哪个状态（NONE / READY / EXPIRED）由它决定，见 `TranscriptRepositoryImpl.stateAfterRollback()`。
+
+## 6. transcript_job（转录任务，v3 起）
 
 | 列 | 类型 | 约束 | 说明 |
 | --- | --- | --- | --- |
@@ -146,12 +160,19 @@ SQLite 不支持 `ALTER TABLE ... ADD CONSTRAINT`，后补 FK 只能整表重建
 | `status` | TEXT | | `QUEUED`/`RUNNING`/`SUCCESS`/`FAILED`/`CANCELLED` |
 | `total_segments` | INTEGER | | 分段总数（规划后才知道，初始 0） |
 | `done_segments` | INTEGER | | 进度分子（≥1s 节流写库） |
-| `error_code` | TEXT | | `MODEL_MISSING`/`DECODE_FAILED`/`OUT_OF_MEMORY`/`PERMISSION_REVOKED`/`CANCELLED`/`UNKNOWN` |
-| `error_message` | TEXT | | 面向用户的说明 |
-| `work_request_id` | TEXT | | WorkManager 请求 ID，用于取消与重启对账 |
+| `error_code` | TEXT | | `MODEL_MISSING`/`DECODE_FAILED`/`OUT_OF_MEMORY`/`PERMISSION_REVOKED`/`CANCELLED`/`INTERRUPTED`/`UNKNOWN`。`INTERRUPTED` = 进程被杀/重启时还挂着，不是模型或文件出了问题 |
+| `error_message` | TEXT | | 面向用户的说明，直接取异常原文，不做二次加工 |
+| `work_request_id` | TEXT | | WorkManager 请求 ID，用于取消与重启对账。**列在 v3 建好了但还没人写**：入队方是下一步的 `TranscriptCoordinator`，那一版才需要它 |
 | `created_at_ms` / `started_at_ms` / `finished_at_ms` | INTEGER | | |
 
-历史按版本保留（不做「一书一行」覆盖），失败重试会产生新行，旧行保留错误上下文。
+索引：`(audio_id)`、`(status)`、`(audio_id, created_at_ms)`。
+
+历史按版本保留（不做「一书一行」覆盖），失败重试会产生新行，旧行保留错误上下文——`retry()` 是「再入队一次」，不是把旧行改回 `QUEUED`。
+
+**实现现状（v3）**：DAO 是 `TranscriptJobDao`，每条跃迁语句都带 `WHERE status IN (...)` 守卫并返回受影响行数，所以重复结算第二次是 0 行、已取消的任务被 worker 写回 RUNNING 在 SQL 层面就改不动；0 行由 `TranscriptRepositoryImpl` 翻译成 `false` 交给调用方，而不是抛异常打断 worker。
+唯一的例外是 `commitSubtitles()`：那条路径只有成功分支，跃迁失败意味着这批字幕不该落库，于是 `check` 抛出、事务回滚——宁可一句都不写，也不能留下「字幕是新的、任务还在 RUNNING」的账。
+状态跃迁与 `audio_book.transcription_state` 的写在同一个 `withTransaction` 里（§9），行为由 `TranscriptRepositoryTest`（16 条仪器化用例）覆盖。
+`total_segments` 存的是 **VAD 段数**而不是句数：一句字幕可能来自多个块，把分母改成句数会让进度条倒退，所以 SUCCESS 时也只把 `done_segments` 追平到入库前那个 `total_segments`。
 
 ## 7. settings（键值）
 
@@ -173,8 +194,10 @@ SQLite 不支持 `ALTER TABLE ... ADD CONSTRAINT`，后补 FK 只能整表重建
 ## 9. 事务与索引原则
 
 - 扫描结果整批写入用 `@Transaction`（或 `withTransaction`），单批一个事务，避免逐条 fsync。
-  **当前实现的真实边界**：`upsertAll` 批量写自带事务（KSP 生成的 `AudioBookDao_Impl` 里走 `performSuspending(db, false, true)`），但 `importFolder` 的「插新 → 逐条改变更 → 标 MISSING/PRESENT → markScanned」是多次独立提交，中途失败会留下半套状态。Phase 4 把它整体收进一个 `withTransaction`（逐条 upsert 也一并改成批量）。
+  **当前实现的真实边界**：`upsertAll` 批量写自带事务（KSP 生成的 `AudioBookDao_Impl` 里走 `performSuspending(db, false, true)`），但 `importFolder` 的「插新 → 逐条改变更 → 标 MISSING/PRESENT → markScanned」仍是多次独立提交，中途失败会留下半套状态。**没做**（`AudioRepositoryImpl` 里没有 `withTransaction`），原因是逐条 `upsert` 得先改成批量、`changed` 那条循环得先收成一个 DAO 调用，属于独立一次改动，不能顺手做。
 - 字幕替换、任务状态跃迁 + `audio_book.transcription_state` 更新，必须在同一事务里，防止状态与数据不一致。
+  **已落地**：`SubtitleRepositoryImpl.replace()` 与 `TranscriptRepositoryImpl` 的每条跃迁都是 `db.withTransaction`。
+  `commitSubtitles` 没有复用 `SubtitleRepository.replace()`：那条接口写不了 `job_id`，而且它会再开一层事务（Room 允许嵌套、内层直接加入外层，但两套代码各自假设自己拥有事务，边界就不清楚了）。所以字幕实体在 `TranscriptRepositoryImpl` 里直接构造，事务由拥有状态跃迁的那一方开。
 - 聚合缓存（`play_count` 等）的写入路径：会话 `finalize` 时在同一事务里 (a) 更新会话行 (b) `UPDATE playback_state`；重算入口用 §10 的 SQL 覆盖缓存值。
 
 ## 10. 统计口径的 SQL 定义（与 `playback-design.md` 一致）
@@ -217,8 +240,11 @@ SELECT COUNT(*) FROM listening_session WHERE ended_at_ms > 0 AND completed = 1; 
 2. **正式版禁止** `fallbackToDestructiveMigration()`；开发期 v1 内部演进除外（本文与 roadmap 里明确标注）。
 3. 每个后续版本变更：写 `Migration(OLD, NEW)`，含索引/外键重建（SQLite 改表要建新表再 rename，字幕这类有索引的表尤其注意）。
 4. 仪器化测试用 `MigrationTestHelper` + 导出 JSON 校验每条迁移。
-   **首条真实迁移已在 Phase 5 落地**：`EchoMindDatabase` 升到 `version = 2`，`Migrations.MIGRATION_1_2` 手写建表 + 两条索引，DDL 与 Room 导出的 `2.json` 逐字对齐；`Migration_1_2_Test` 三项全绿（结构校验 / 已有书籍与收听历史保留 / `PRAGMA foreign_key_list` 确认 FK）。
+   **两条真实迁移都已落地**：
+   - v1→v2（Phase 5a）：`Migrations.MIGRATION_1_2` 手写建 `subtitle_segment` + 两条索引，DDL 与 `2.json` 逐字对齐；`Migration_1_2_Test` 三项全绿（结构校验 / 已有书籍与收听历史保留 / `PRAGMA foreign_key_list` 确认 FK）。
+   - v2→v3（Phase 6）：`Migrations.MIGRATION_2_3` 建 `transcript_job` + 三条索引，并**整表重建** `subtitle_segment` 以补 `job_id` 外键（做法与理由见 §5.1）；`Migration_2_3_Test` 五条覆盖了结构对账、字幕逐句不丢、两条 FK 的存在与**行为**（级联删、SET NULL）、三条索引。
+   写手写 DDL 的固定动作：先 `./gradlew :app:kspDebugKotlin` 导出 `N.json`，把 Room 生成的 `createSql` 与索引语句逐条抄进 Migration——注意 TEXT 主键落成表级 `PRIMARY KEY(\`id\`)`（SQLite 因此会额外建一个 `sqlite_autoindex_*`，它不是 Room 的索引，测试做集合断言时要剔掉）。
    `MigrationTestHelper` 的 `recreateTableOnMigrationError` 传 `false`——传 `true` 等于把「迁移失败就重建表」这条破坏性后路偷偷请回来。
    helper 从 assets 读 schema，路径是 `"$databaseClassName/$version.json"`（没有 `schemas/` 前缀），所以 `build.gradle.kts` 里是 `assets.directories.add("$projectDir/schemas")`。
-5. 迁移里对统计类字段的变更（例如改 `is_counted` 定义）必须同时提供数据回填 SQL，且回填口径写进本文，不留「静默改变历史数字」。MIGRATION_1_2 只新增空表，不触碰统计列，因此无需回填。
+5. 迁移里对统计类字段的变更（例如改 `is_counted` 定义）必须同时提供数据回填 SQL，且回填口径写进本文，不留「静默改变历史数字」。MIGRATION_1_2 与 MIGRATION_2_3 都只新增表（后者搬的是字幕原值，不改任何统计列），因此无需回填。
 6. `Migrations.ALL` 是 `Room.databaseBuilder` 唯一注册的迁移集（`EchoMindApp`），加新版本时往这个数组里追加，不要漏——漏了就是运行时 `IllegalStateException`。

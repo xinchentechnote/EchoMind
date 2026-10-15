@@ -1,5 +1,7 @@
 package com.xinchen.echomind.asr
 
+import com.xinchen.echomind.domain.model.TranscriptModelRef
+
 /**
  * 一个模型文件：下载源 + 期望大小 + 校验值。
  *
@@ -103,6 +105,22 @@ object ModelCatalog {
     )
 
     val all: List<ModelSpec> = listOf(paraformer, sileroVad)
+
+    /**
+     * 当前识别模型的身份，写进 `transcript_job` 的 `model_id` / `model_version`。
+     *
+     * `version` 取权重文件的权威校验值（官方发布值，无官方值时是本机钉住的那个）前 12 位：
+     * 它回答的是「这批字幕是哪份权重跑出来的」，文件名和日期回答不了这个。
+     * 只存前 12 位是够辨认又不至于把整张表撑宽，全值随时能从清单再算出来。
+     */
+    val transcriptRef: TranscriptModelRef
+        get() = TranscriptModelRef(
+            id = paraformer.id,
+            version = paraformer.files
+                .first { it.fileName == PARAFORMER_MODEL_FILE }
+                .expectedSha256
+                .take(12),
+        )
 
     /** 找不到就抛，清单是封闭集合：调用方拿到 null 也做不了什么，不如让它立刻炸在日志里 */
     fun byId(id: String): ModelSpec = all.firstOrNull { it.id == id }
