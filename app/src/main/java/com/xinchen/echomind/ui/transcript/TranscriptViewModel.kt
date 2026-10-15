@@ -1,6 +1,5 @@
 package com.xinchen.echomind.ui.transcript
 
-import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -15,6 +14,7 @@ import com.xinchen.echomind.domain.model.EnqueueOutcome
 import com.xinchen.echomind.domain.model.TranscriptJobRow
 import com.xinchen.echomind.domain.model.TranscriptModelRef
 import com.xinchen.echomind.domain.transcript.TranscriptRepository
+import com.xinchen.echomind.ui.common.safeLogW
 import com.xinchen.echomind.work.TranscriptWorkScheduler
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -140,7 +140,7 @@ class TranscriptViewModel(
                         onSuccess = { TranscriptDisplay.enqueueOutcomeLabel(it) },
                         onFailure = { error ->
                             // 界面只给短句，细节进 logcat，否则「授权刚给就失效」这类问题无法定位
-                            Log.w(TAG, "transcript action failed", error)
+                            safeLogW(TAG, "transcript action failed", error)
                             "操作失败：${error.message ?: error.javaClass.simpleName}"
                         },
                     ),

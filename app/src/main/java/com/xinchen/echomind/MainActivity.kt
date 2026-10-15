@@ -28,6 +28,7 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.xinchen.echomind.ui.nav.Destinations
 import com.xinchen.echomind.ui.player.PlayerScreen
+import com.xinchen.echomind.ui.settings.SettingsScreen
 import com.xinchen.echomind.ui.shelf.ShelfScreen
 import com.xinchen.echomind.ui.stats.StatsScreen
 import com.xinchen.echomind.ui.transcript.TranscriptScreen
@@ -105,7 +106,7 @@ private fun RootScreen() {
                 )
             }
             composable(Destinations.STATS) { StatsScreen() }
-            composable(Destinations.SETTINGS) { Placeholder("设置", "Phase 7") }
+            composable(Destinations.SETTINGS) { SettingsScreen() }
             composable(
                 route = Destinations.PLAYER,
                 arguments = listOf(navArgument("audioId") { type = NavType.StringType }),

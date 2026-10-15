@@ -13,7 +13,7 @@
 | 3 | 文件夹导入 + 书架 | **PARTIAL** | `assembleDebug` + 31 项 JVM 单测 + 20 项仪器化测试全绿；`emulator-5554` 真实 SAF 导入 6 首、连续重扫不重复建记录、移走→MISSING、原样移回→PRESENT、手改标题不被覆盖、force-stop 后书架不丢，DB 查询与截图为证（`testing.md` §4）。缺口见下「Phase 3 遗留」 |
 | 4 | Media3 播放 + 播放记忆与统计 | **PARTIAL** | `assembleDebug` + 59 项 JVM 单测 + 41 项仪器化测试全绿（2026-10-15）；`emulator-5554` 实测：前台中媒体通知、通知栏控制、媒体键、瞬时焦点丢失暂停且不自动续播、自动切歌逐首分账、崩溃恢复标 `CRASHED`、重算==增量、统计页与 DB 对账一致。缺口见下「Phase 4 遗留」 |
 | 5 | 字幕基础设施与七句窗口 | **PARTIAL** | `assembleDebug` + 83 项 JVM 单测 + 48 项仪器化测试全绿（2026-10-15）；`emulator-5554` 实测：v2 建表、七句窗口 3+1+3、末句不补位、当前句高亮、点句跳 `start_ms`（DB 复核 12000/15000/24000）、拖动与倍速后跟手、切歌后换成另一套字幕、测试字幕常驻标注「非 ASR 产物」。缺口见下「Phase 5 遗留」 |
-| 6 | 本地 ASR（sherpa-onnx） | **PARTIAL**（**管线端到端与用户端到端都已通，缺口在标定与自动化测试**） | 已实装并在 `emulator-5554` 上真跑过：模型清单/下载/校验（35 JVM + 4 仪器化）、PCM 解码（4 仪器化，148 s 真素材）、VAD 分段（6 仪器化，RTF 0.017~0.020）、SherpaOnnx 推理（9 仪器化，装载 3.1~4.9 s，识别 RTF 0.083~0.143 —— 模拟器两轮差 1.6 倍）、逐字时间换算（14 JVM）、**任务表与状态机（schema v3：`transcript_job` + `subtitle_segment.job_id` 外键整表重建；5 条迁移仪器化 + 19 条仓储仪器化）**、**切句与时间清洗（`SentenceSplitter`，25 JVM + 1 条「解码→VAD→识别→切句」设备用例：60 s 歌唱素材 58 字 → 9 句）**、**编排接线（`TranscriptCoordinator` 9 条仪器化端到端：整首歌 24 段 → 24 块 → 丢弃 0 → **35 句入库**；`TranscriptQuality` 9 JVM；`work/TranscriptWorker` + `TranscriptWorkScheduler` 已写并已挂进 `AppGraph`）**、**转录页 UI（`ui/transcript/`：任务列表 + 确认卡片 + 取消/重试 + 8 个失败分支的可执行文案，`TranscriptDisplay` 13 JVM + `TranscriptForegroundServiceTypeTest` 2 仪器化；从界面点出来的转录让用户那份 `echomind.db` 第一次出现 35 行 `source=ASR` 字幕）**。JVM **216** / 仪器化 **106** 全绿。**缺口**：~~①没有任何界面能发起转录~~ → ①**已解（2026-10-15，Phase 6d）**：转录页是 `schedule()` 的生产调用方，真库里 35 行 `source=ASR` 字幕 + 7 行 `transcript_job`，`那些花儿` 变 `READY`、播放页七句窗口读的就是它；②`work/` 两个类的**主体逻辑仍无用例**（端到端用例直接调协调器；新增那 2 条只断言合并后清单里的前台服务类型与权限），前台通知/`APPEND` 排队/`FAILED(UNKNOWN)` 兜底/撤销只有代码 + 人工点出来的设备证据；~~③**跨书并发会开出第二个引擎**（D36）~~ → ③**已修（2026-10-15）**：全机只允许一行 `RUNNING`（`markRunning` 的 SQL 闸门，有用例且证过伪）+ 全局单一唯一名 `APPEND`（无用例，但界面上同屏「转录中 + 排队中」看得见），AGENTS.md §3 那条现在成立；④切句的三个阈值（500ms/×2/700ms）**未标定**且只在歌唱素材上验过；⑤`OUT_OF_MEMORY` 分支只有代码；~~⑥重复入队缺仓储层去重~~ → **⑥已修（16ee324 就已落地，2026-10-15 复核时发现文档漏改）**：`enqueue` 里有 `activeOf` 守卫，同一本书已有 QUEUED/RUNNING 任务时返回 `AlreadyActive`（同一行，不新建），READY + 已有 ASR 字幕被 `AlreadyTranscribed` 拦、force 放行——两条都有仓储仪器化用例（`重复入队返回同一个活动任务而不是排两个队` / `已就绪的书再入队被拦住而force放行`），口径见下技术债表；⑦「播放 + 转录同时跑不卡顿」（FR-509）与转录期间主线程无阻塞没测。模型是 `adb push` 搬进设备的，App 自己下载 243 MB 那条路还没验过。见下「Phase 6 待办」 |
+| 6 | 本地 ASR（sherpa-onnx） | **PARTIAL**（**管线端到端与用户端到端都已通，缺口在标定与自动化测试**） | 已实装并在 `emulator-5554` 上真跑过：模型清单/下载/校验（35 JVM + 4 仪器化）、PCM 解码（4 仪器化，148 s 真素材）、VAD 分段（6 仪器化，RTF 0.017~0.020）、SherpaOnnx 推理（9 仪器化，装载 3.1~4.9 s，识别 RTF 0.083~0.143 —— 模拟器两轮差 1.6 倍）、逐字时间换算（14 JVM）、**任务表与状态机（schema v3：`transcript_job` + `subtitle_segment.job_id` 外键整表重建；5 条迁移仪器化 + 19 条仓储仪器化）**、**切句与时间清洗（`SentenceSplitter`，25 JVM + 1 条「解码→VAD→识别→切句」设备用例：60 s 歌唱素材 58 字 → 9 句）**、**编排接线（`TranscriptCoordinator` 9 条仪器化端到端：整首歌 24 段 → 24 块 → 丢弃 0 → **35 句入库**；`TranscriptQuality` 9 JVM；`work/TranscriptWorker` + `TranscriptWorkScheduler` 已写并已挂进 `AppGraph`）**、**转录页 UI（`ui/transcript/`：任务列表 + 确认卡片 + 取消/重试 + 8 个失败分支的可执行文案，`TranscriptDisplay` 13 JVM + `TranscriptForegroundServiceTypeTest` 2 仪器化；从界面点出来的转录让用户那份 `echomind.db` 第一次出现 35 行 `source=ASR` 字幕）**。JVM **216** / 仪器化 **106** 全绿。**缺口**：~~①没有任何界面能发起转录~~ → ①**已解（2026-10-15，Phase 6d）**：转录页是 `schedule()` 的生产调用方，真库里 35 行 `source=ASR` 字幕 + 7 行 `transcript_job`，`那些花儿` 变 `READY`、播放页七句窗口读的就是它；②`work/` 两个类的**主体逻辑仍无用例**（端到端用例直接调协调器；新增那 2 条只断言合并后清单里的前台服务类型与权限），前台通知/`APPEND` 排队/`FAILED(UNKNOWN)` 兜底/撤销只有代码 + 人工点出来的设备证据；~~③**跨书并发会开出第二个引擎**（D36）~~ → ③**已修（2026-10-15）**：全机只允许一行 `RUNNING`（`markRunning` 的 SQL 闸门，有用例且证过伪）+ 全局单一唯一名 `APPEND`（无用例，但界面上同屏「转录中 + 排队中」看得见），AGENTS.md §3 那条现在成立；④切句的三个阈值（500ms/×2/700ms）**未标定**且只在歌唱素材上验过；⑤`OUT_OF_MEMORY` 分支只有代码；~~⑥重复入队缺仓储层去重~~ → **⑥已修（16ee324 就已落地，2026-10-15 复核时发现文档漏改）**：`enqueue` 里有 `activeOf` 守卫，同一本书已有 QUEUED/RUNNING 任务时返回 `AlreadyActive`（同一行，不新建），READY + 已有 ASR 字幕被 `AlreadyTranscribed` 拦、force 放行——两条都有仓储仪器化用例（`重复入队返回同一个活动任务而不是排两个队` / `已就绪的书再入队被拦住而force放行`），口径见下技术债表；⑦「播放 + 转录同时跑不卡顿」（FR-509）与转录期间主线程无阻塞没测。~~模型是 `adb push` 搬进设备的，App 自己下载 243 MB 那条路还没验过~~ → **已验（2026-10-15，Phase 6e）**：删掉设备上的 `model.int8.onnx` 后从设置页点「继续下载」，App 自己从 hf-mirror 取回 243,371,218 B（~130 s）、校验通过才改名、来源记录落盘，宿主机独立复算 SHA-256 与官方值一致。见下「Phase 6 待办」第 6e 项 |
 | 7 | UI 完整化与端到端验收 | **TODO** | — |
 | 8 | 交付文档与总结 | **TODO** | — |
 
@@ -104,7 +104,7 @@ CI **不覆盖**：仪器化测试（没有模拟器）、真机验证、ASR 端
    **PARTIAL（2026-10-15）**：**下载 + 校验 + 删除已完成并在设备上打到真实 URL**——`asr/` 四个文件（`ModelCatalog` / `ModelVerifier` / `ModelFetcher`+`HttpFetcher` / `ModelManager`）
    挂进 `AppGraph`（`modelsRoot = filesDir/models`），35 条 JVM 单测 + 4 条仪器化用例（`ModelManagerNetworkTest` 用清单里真实的 hf-mirror URL 取回 `tokens.txt` 并独立复算 sha256）；
    清单三个文件的字节数与 SHA-256 全部实测过、`tokens.txt` 标了「无官方校验值 + 本机钉住」；顺带补上被漏掉的 `INTERNET` 权限（漏它时 35 条单测一条都不红）。
-   **仍缺三块**：① 本地导入（SAF 选目录）未实现；② 243 MB 的 int8 与 GitHub 单源的 VAD 都没从设备取回过（`github.com:443` 本机与模拟器同时超时，实测记录见 `docs/testing.md` §4）；③ 没有任何 UI 消费 `ModelManager.statuses`，所以「点一下就能下模型」还没交付 —— 归本清单第 6 项。
+   **仍缺三块** → **三块都已有交代（2026-10-15，Phase 6e）**：①本地导入：`ModelManager.importFile` 早已实现（`.part` 规矩与下载一致、按单文件结算），设置页 SAF 选文件入口（`OpenDocument` → 按文件名对号入座）已接，JVM 有用例——**「真用 SAF 选文件导入」的设备实测仍欠着**；②~~243 MB 的 int8 没从设备取回过~~ → **已由 App 自己取回并核对**（删除 → 设置页「继续下载」→ ~130 s 完成 → 宿主机独立 `shasum` 与官方值一致）；VAD 的 GitHub 单源在设备上仍会超时，**本地导入是它的现实路径**（UI 已给，待设备实测）；③~~没有任何 UI 消费 `ModelManager.statuses`~~ → **已解**：设置页模型节是它的第一个生产消费者（`ui/settings/SettingsViewModel`），`ModelDisplay` 15 JVM + `SettingsViewModel` 8 JVM。
 3. ~~PCM → VAD → 引擎~~ → **DONE（2026-10-15，三层都在设备上真跑过；端到端「入库」归第 4 项）**：
    `domain/asr/PcmConversion`（16-bit LE → 单声道 float，均值下混）、
    `domain/asr/SincResampler`（源采样率 → 16k 抗混叠 FIR；**必须自己写**——实测 Media3 1.11.1 里没有 `AudioResamplingAudioProcessor`，
@@ -199,11 +199,17 @@ CI **不覆盖**：仪器化测试（没有模拟器）、真机验证、ASR 端
    ②底部标签切不走——`popUpTo(saveState=true)` + `restoreState=true` 会把带参数的转录页连同确认卡片一起复活，去掉这两个 flag 后 navA→navE 逐步复核（`architecture.md` D38）。
    ⚠ **一条没定性的可疑记录**：导航 bug 还在时库里多出两行相隔 13 秒的同书 SUCCESS 任务，而只点了一次；修完导航后同样顺序重点 4 次没再复现，
    但**原因没找到**，且暴露出 `enqueue()` 对已在 RUNNING/SUCCESS 的书不做去重（现在只有 UI 卡片挡着）。如实记在 `docs/testing.md` §4 Phase 6d。
-   **仍缺**：`work/` 主体逻辑（`doWork`/`isStopped`/`FAILED(UNKNOWN)`/`cancelWorkById`/`APPEND` 排队）无自动化用例；「播放 + 转录同时跑不卡顿」（FR-509）与 `dumpsys gfxinfo` 没测；`MODEL_MISSING` 文案指向还不存在的模型页（第 6e 项）。
+   **仍缺**：`work/` 主体逻辑（`doWork`/`isStopped`/`FAILED(UNKNOWN)`/`cancelWorkById`/`APPEND` 排队）无自动化用例；「播放 + 转录同时跑不卡顿」（FR-509）与 `dumpsys gfxinfo` 没测；~~`MODEL_MISSING` 文案指向还不存在的模型页~~ → **模型页已存在（第 6e 项）**，那句文案不再指空。
+
+6e. **模型页（设置页 v1，任务 #24）** → **DONE（2026-10-15，`emulator-5554` 实测）**：
+   `ui/settings/SettingsScreen + SettingsViewModel`（`ModelManager.statuses` 的第一个生产消费者；文案层 `ModelDisplay` 15 JVM + VM 行为 8 JVM——核对初始态、下载成败、导入按名对号/错名拒绝/打不开如实报错、删除收尾，全部用**真 ModelManager + 假 fetcher + 临时目录**跑）+ `MainActivity` 设置路由接真页面（placeholder 撤掉，页脚如实标注其余条目待后续阶段）。
+   设备实测三步：①正常态——两包「已就绪」、逐文件核对结论与校验值来源（官方 / 本机钉住）如实渲染、就绪的包不给下载按钮；②删掉 `model.int8.onnx` 后重启——包变「不可用」、缺的那个文件说「不存在」而完好的 `tokens.txt` 仍是「已核对通过」、按钮变「继续下载（232 MB）」与「删除残留文件」；③点下载——进度行 `正在下载 model.int8.onnx：23.3 MB / 232 MB（10%）` + 真进度条（截图），~130 s 后 `.part` 改名、包回「已就绪」，`download-provenance.properties` 落了 url/bytes/sha256/`checksum=official`/时间，宿主机独立 `shasum -a 256` 与清单官方值逐字符一致；下载中另一包的按钮禁用、本包按钮收起。**用户数据无恙**：`那些花儿` 仍 `READY`、35 行 `source=ASR` 字幕在库。
+   ⚠ 顺带修了一个测试基建坑：VM 失败路径调 `android.util.Log` 在 JVM 单测里抛 "not mocked"（项目刻意不开 `isReturnDefaultValues`），新增 `ui/common/safeLogW` 包住，`TranscriptViewModel` 同型代码一并换。
+   **仍缺**：删除按钮与 SAF 导入的设备实测（删除要在真机上按——删 243 MB 后没有网络就得靠重新 push）；下载中途取消/断网恢复；`MODEL_MISSING` 的完整闭环（删掉模型 → 转录页出现该文案 → 按指引去设置页恢复）没连起来走一遍。
 
 ## Phase 7 待办要点
 
-- **7**：设置页全量（字号/深浅色/重算统计/按文件夹重新授权）、错误与降级文案、离线（飞行模式）验收、性能与内存实测、迷你播放条、行内重命名、文档回填。
+- **7**：设置页其余条目（字号/深浅色/重算统计/按文件夹重新授权——模型节已由 6e 提前交付）、错误与降级文案、离线（飞行模式）验收、性能与内存实测、迷你播放条、行内重命名、文档回填。
 
 ## 后续（MVP 之后，按价值排序）
 
@@ -219,7 +225,7 @@ CI **不覆盖**：仪器化测试（没有模拟器）、真机验证、ASR 端
 
 | 项 | 说明 | 计划处理 |
 | --- | --- | --- |
-| 占位页面 | 书架/播放/统计/转录已实装；**只剩设置页是 placeholder** | Phase 7 替换，替换前不宣称完成 |
+| 占位页面 | ~~只剩设置页是 placeholder~~ → **设置页 v1（模型节）已落地（2026-10-15，6e）**，页脚如实标注字号/深浅色/统计重算/按文件夹授权待后续 | Phase 7 补齐其余条目 |
 | 文件夹管理 UI | 只有全局重扫；FR-102/904 要求的按文件夹授权/重扫没有入口 | Phase 7 |
 | `connectedDebugAndroidTest` 会清掉被测 App 的数据 | 实测：跑完仪器化测试后 `dumpsys package` 显示 `notLaunched=true`、databases 目录消失、持久化授权一并失效，需要重装 APK 并重新走一遍 SAF 导入。**2026-10-15 拿到了机制**：AGP 的 managed-device 流程在跑完后 `deletePackageX` 把 App 与测试 APK 一起卸掉（logcat 里 `USER_INITIATED=true, DATA_REMOVED=true`），于是 `filesDir/models/*` 与 `filesDir/asr-fixtures/*` 全被带走、整套件 13 条红在「缺少测试素材」上——**红的原因与代码无关**。绕过办法（本轮就是这么取到绿的）：`adb install -r -t` 手动装两个 APK → 重新搬模型与素材 → `adb shell am instrument -w -e package com.xinchen.echomind com.xinchen.echomind.test/androidx.test.runner.AndroidJUnitRunner`。搬模型用 `adb push` 到 `/data/local/tmp` 再 `run-as ... cat > files/models/<id>/<f>`（直接 `adb shell mkdir` 出来的目录属 root，App 读不到） | 设备验证放在仪器化测试**之后**做，或接受重导入成本；CI 里这条路径需要在跑完后重推素材 |
 | `work/` 两个类的主体逻辑无用例 | `TranscriptWorker`（`setForeground` / 通知 / 意外异常兜 `UNKNOWN`）与 `TranscriptWorkScheduler`（全局唯一名 + `APPEND`、`work_request_id` 写不回就撤销、先改库再 `cancelWorkById`）**没有行为用例**：9 条端到端用例是直接调协调器的。Phase 6d 之后 `work/` 有的 2 条仪器化只断言**合并后清单**里的前台服务类型与权限（D37 的回归闸门）。~~`schedule()` 没有生产调用方~~ → 已有（转录页 ViewModel），前台通知/排队/取消/守卫都拿到了**人工点出来的设备证据**，但那是观察不是断言 | 补一层「worker 行为」测试要么注入假的协调器（现在 `AppGraph` 直接 new，没有接缝），要么用 `TestWorkerBuilder`——两条都要先动装配，属 Phase 7 的测试债 |
