@@ -5,6 +5,8 @@ name: CI
 on:
   push:
     branches: [main]
+    # 版本标签（v0.1 等）也出包：产物名带标签号（EchoMind-v0.1-debug），作为该版本的交付物
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -145,6 +147,6 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v7
         with:
-          name: app-debug
+          name: EchoMind-${{ github.ref_name }}-debug
           path: app/build/outputs/apk/debug/app-debug.apk
           retention-days: 14

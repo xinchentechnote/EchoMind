@@ -92,6 +92,9 @@
 私有库 `https://github.com/xinchentechnote/EchoMind`（`main`），工作流 `.github/workflows/ci.yml` 在 push/PR/workflow_dispatch 上跑
 `:app:assembleDebug` + `:app:testDebugUnitTest`，并把调试 APK 作为 artifact 上传。**第三次跑才绿**（run 38632644725，83 项单测，`BUILD SUCCESSFUL in 5m36s`）；
 前两次的真实死因与排查过程记在 `docs/environment.md` §8 与 `docs/testing.md` §4——其中「阿里云镜像在 runner 上 502」这条只有远端测得出来。
+**2026-10-16 起**：①push 触发增加 `tags: ['v*']`——打版本标签即出包，产物名带标签号（`EchoMind-v0.1-debug`，原 `app-debug`）；
+②新增「取回并校验内置模型」一步（6f 内置化的配套，actions/cache 缓存 + 钉住哈希 `sha256sum -c`，首次跑会多拉 ~244 MB）；
+产物是 **debug 签名**的 APK——release 签名与 R8 按 roadmap 属 MVP 之后的工作，发布前不宣称「正式包」。
 
 CI **不覆盖**：仪器化测试（没有模拟器）、真机验证、ASR 端到端。这三项仍然按老规矩在本地/设备上做，绿 CI 不等于它们过了。
 
