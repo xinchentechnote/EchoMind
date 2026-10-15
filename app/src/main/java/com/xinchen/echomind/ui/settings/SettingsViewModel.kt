@@ -6,7 +6,6 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.xinchen.echomind.EchoMindApp
-import com.xinchen.echomind.asr.ModelDownloadException
 import com.xinchen.echomind.asr.ModelImportException
 import com.xinchen.echomind.asr.ModelManager
 import com.xinchen.echomind.asr.ModelStatus
@@ -26,18 +25,18 @@ data class SettingsUiState(
 )
 
 /**
- * 设置页「模型」一节的 ViewModel（FR-510 / FR-901）。
+ * 设置页「模型」一节的 ViewModel（FR-510 / FR-511 / FR-901）。
  *
- * 它是 `ModelManager.statuses` 的**第一个生产消费者**：之前模型要么 `adb push` 进设备、
- * 要么只有测试在调 `download()`，没有任何界面能看状态或发起下载/导入/删除。
+ * 模型随安装包内置（FR-511）：启动时 [ModelManager.ensureProvisioned] 已把文件就位，
+ * 这一页能看到状态；用户删过文件后，[restore] 从 assets 恢复——**没有**下载/导入这些网络时代的动作。
  * 这里不判断文件对不对——那是 [ModelManager] 与清单的事，本类只负责调它、把结局翻成一句文案。
  *
- * [openStream] 由装配处给（Android 侧是 `contentResolver.openInputStream`），
- * 传 uri 的**字符串**是为了让本类不依赖 `android.net.Uri`，导入路径能在 JVM 里测。
+ * [openAsset] 由装配处给（Android 侧是 `assets.open(path)`），传字符串路径是为了让本类
+ * 不依赖任何 Android 类型，恢复路径能在 JVM 里测。
  */
 class SettingsViewModel(
     private val modelManager: ModelManager,
-    private val openStream: (uri: String) -> InputStream?,
+    private val openAsset: (assetPath: String) -> InputStream?,
 ) : ViewModel() {
 
     private val _state = MutableStateFlow(SettingsUiState())
@@ -56,28 +55,11 @@ class SettingsViewModel(
         _state.update { it.copy(message = null) }
     }
 
-    /** 取回一个包里还没合格的文件（就绪的包点了也只是把现有文件再核对一遍，`download` 会逐文件跳过） */
-    fun download(specId: String) = runOp {
-        val spec = specOf(specId) ?: return@runOp "没有这个模型包：$specId"
-        modelManager.download(spec)
-        ModelDisplay.downloadSucceededLabel(statusOf(specId) ?: return@runOp "没有这个模型包：$specId")
-    }
-
-    /**
-     * SAF 选回来的文件按**文件名**对号入座：清单是封闭集合（`model.int8.onnx` / `tokens.txt` /
-     * `silero_vad.onnx`），名字对不上就不能往包里塞——那份文件下一步会被引擎按名字装载。
-     */
-    fun importPicked(specId: String, uri: String, displayName: String) = runOp {
+    /** 从安装包恢复一个包里所有不合格的文件（就绪的包点了也不会动任何文件，`provision` 是幂等的） */
+    fun restore(specId: String) = runOp {
         val status = statusOf(specId) ?: return@runOp "没有这个模型包：$specId"
-        val fileSpec = status.spec.files.firstOrNull { it.fileName == displayName }
-        if (fileSpec == null) {
-            return@runOp "选中的「$displayName」不是这个包要的文件，它要的是：" +
-                status.spec.files.joinToString("、") { it.fileName }
-        }
-        val verification = modelManager.importFile(status.spec, fileSpec.fileName, uri) {
-            openStream(uri) ?: throw ModelImportException("打不开所选的文件，可能没有被授权读取")
-        }
-        ModelDisplay.importSucceededLabel(verification, fileSpec.fileName)
+        modelManager.provision(status.spec.id, openAsset)
+        ModelDisplay.restoreSucceededLabel(statusOf(specId) ?: return@runOp "没有这个模型包：$specId")
     }
 
     /** 删除。调用方（页面）必须先出示 [ModelDisplay.deleteConfirmText] 拿到确认，这里不再问一遍 */
@@ -108,13 +90,11 @@ class SettingsViewModel(
                     message = result.fold(
                         onSuccess = { it },
                         onFailure = { error ->
-                            // ModelDownload/ImportException 的 message 本来就是给人看的（试过哪些地址、差在哪），
+                            // ModelImportException 的 message 本来就是给人看的（差哪个文件、assets 缺什么），
                             // 原样给用户；其余异常只给类名，细节进 logcat
                             safeLogW(TAG, "model action failed", error)
                             when (error) {
-                                is ModelDownloadException, is ModelImportException ->
-                                    "操作失败：${error.message}"
-
+                                is ModelImportException -> "操作失败：${error.message}"
                                 else -> "操作失败：${error.message ?: error.javaClass.simpleName}"
                             }
                         },
@@ -132,7 +112,9 @@ class SettingsViewModel(
                 val app = this[ViewModelProvider.AndroidViewModelFactory.APPLICATION_KEY] as EchoMindApp
                 SettingsViewModel(
                     modelManager = app.graph.modelManager,
-                    openStream = { uri -> app.contentResolver.openInputStream(android.net.Uri.parse(uri)) },
+                    openAsset = { path ->
+                        runCatching { app.assets.open(path) }.getOrNull()
+                    },
                 )
             }
         }

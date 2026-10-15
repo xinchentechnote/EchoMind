@@ -1,10 +1,5 @@
 package com.xinchen.echomind.ui.settings
 
-import android.content.Context
-import android.net.Uri
-import android.provider.OpenableColumns
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -18,7 +13,6 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -36,7 +30,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -46,11 +39,11 @@ import com.xinchen.echomind.asr.ModelStatus
 import com.xinchen.echomind.ui.common.formatBytes
 
 /**
- * 设置页 v1：目前只有「模型」一节（FR-510 / FR-901）。
+ * 设置页 v1：目前只有「模型」一节（FR-510 / FR-511 / FR-901）。
  *
- * 文案一律来自 [ModelDisplay]（纯 Kotlin，JVM 有用例），页面只做排版与动作分发；
- * 就绪与否、差哪个文件、进度到哪——全部读 [ModelStatus]，这里一个判断都不另写
- * （FR-901：UI 只许读 `ModelStatus`/`ModelCatalog`）。
+ * 模型随安装包内置：这一页没有「下载」也没有 SAF 导入——文件坏了/被删了就「从安装包恢复」，
+ * 全程不需要网络。文案一律来自 [ModelDisplay]（纯 Kotlin，JVM 有用例），页面只做排版与动作分发；
+ * 就绪与否、差哪个文件、进度到哪——全部读 [ModelStatus]，这里一个判断都不另写（FR-901）。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -68,16 +61,6 @@ fun SettingsScreen(
         }
     }
 
-    // SAF 导入：两个包共用一个选择器，记住是哪个包发起的，结果按文件名对号入座（VM 里做）
-    val context = LocalContext.current
-    var pendingImportSpecId by remember { mutableStateOf<String?>(null) }
-    val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        val specId = pendingImportSpecId
-        pendingImportSpecId = null
-        if (uri != null && specId != null) {
-            viewModel.importPicked(specId, uri.toString(), displayNameOf(context, uri))
-        }
-    }
     var deleteTarget by remember { mutableStateOf<ModelStatus?>(null) }
 
     Scaffold(
@@ -104,11 +87,7 @@ fun SettingsScreen(
                 ModelPackageCard(
                     status = status,
                     busy = state.isBusy,
-                    onDownload = { viewModel.download(status.spec.id) },
-                    onImport = {
-                        pendingImportSpecId = status.spec.id
-                        importLauncher.launch(arrayOf("*/*"))
-                    },
+                    onRestore = { viewModel.restore(status.spec.id) },
                     onDelete = { deleteTarget = status },
                 )
             }
@@ -146,8 +125,7 @@ fun SettingsScreen(
 private fun ModelPackageCard(
     status: ModelStatus,
     busy: Boolean,
-    onDownload: () -> Unit,
-    onImport: () -> Unit,
+    onRestore: () -> Unit,
     onDelete: () -> Unit,
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
@@ -192,7 +170,7 @@ private fun ModelPackageCard(
                         },
                     )
                     Text(
-                        "${ModelDisplay.checksumLabel(fileSpec)}；${ModelDisplay.sourceLabel(fileSpec)}",
+                        "${ModelDisplay.checksumLabel(fileSpec)}；随安装包内置",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -222,13 +200,10 @@ private fun ModelPackageCard(
 
             HorizontalDivider(modifier = Modifier.padding(top = 10.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 10.dp)) {
-                if (ModelDisplay.canDownload(status)) {
-                    Button(onClick = onDownload, enabled = !busy) {
-                        Text(ModelDisplay.downloadButtonLabel(status))
+                if (ModelDisplay.canRestore(status)) {
+                    Button(onClick = onRestore, enabled = !busy) {
+                        Text(ModelDisplay.restoreButtonLabel(status))
                     }
-                }
-                if (ModelDisplay.canImport(status)) {
-                    FilledTonalButton(onClick = onImport, enabled = !busy) { Text("导入") }
                 }
                 if (ModelDisplay.canDelete(status)) {
                     TextButton(onClick = onDelete, enabled = !busy) {
@@ -238,14 +213,4 @@ private fun ModelPackageCard(
             }
         }
     }
-}
-
-/** SAF 文档的显示名；查不到就退回路径最后一段，再不行让 VM 按「名字对不上」如实拒绝 */
-private fun displayNameOf(context: Context, uri: Uri): String {
-    context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
-        if (cursor.moveToFirst()) {
-            cursor.getString(0)?.let { return it }
-        }
-    }
-    return uri.lastPathSegment ?: ""
 }

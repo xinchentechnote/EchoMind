@@ -11,9 +11,9 @@
     <!-- 转录长任务的前台通知（WorkManager setForeground） -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
-    <!-- 只用于「把模型取回本机」（asr/HttpFetcher → ModelManager）。
-         转录与播放本身不调任何在线 API：FR-501 的边界是「准备模型要联网，准备完飞行模式可用」。 -->
-    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 刻意**没有** INTERNET（FR-511，2026-10-15）：模型随安装包内置，就位走 assets 拷贝，
+         全 App 没有任何在线调用，「离线听书」由清单层面可证（飞行模式验收见 docs/testing.md）。
+         原「下载模型」路径已退出产品（HttpFetcher 仅存于测试）；若哪天要恢复，须连 FR-501 的口径一起改。 -->
 
     <!-- 音频通过 SAF 树授权读取，不需要 READ_EXTERNAL_STORAGE / READ_MEDIA_AUDIO -->
 

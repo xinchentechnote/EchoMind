@@ -1,16 +1,13 @@
 package com.xinchen.echomind.ui.settings
 
-import com.xinchen.echomind.asr.ModelDownloadException
 import com.xinchen.echomind.asr.ModelFetcher
 import com.xinchen.echomind.asr.ModelManager
 import com.xinchen.echomind.asr.ModelRole
 import com.xinchen.echomind.asr.ModelSpec
 import com.xinchen.echomind.asr.fileSpecOf
-import com.xinchen.echomind.asr.sha256Hex
 import com.xinchen.echomind.core.time.FakeTimeSource
 import java.io.ByteArrayInputStream
 import java.io.File
-import java.io.IOException
 import java.io.InputStream
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -21,6 +18,7 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -32,8 +30,9 @@ import org.junit.rules.TemporaryFolder
  * 设置页 ViewModel 的行为：它只许「调 [ModelManager]、把结局翻成一句文案」，
  * 这些用例钉住的就是这句话——状态从 manager 的流里来，文件对不对由 manager 与清单裁决。
  *
- * 直接用**真 [ModelManager]**（假 fetcher + 临时目录 + 假时钟）而不是再造一层假接口：
- * VM 的全部价值就在于它调的参数能让 manager 真的动起来，用假接口测等于什么都没测。
+ * 模型内置后这一页的动作是「从安装包恢复」，直接用**真 [ModelManager]**（假 assets + 临时目录 +
+ * 假时钟）而不是再造一层假接口：VM 的全部价值就在于它调的参数能让 manager 真的动起来，
+ * 用假接口测等于什么都没测。
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class SettingsViewModelTest {
@@ -69,20 +68,25 @@ class SettingsViewModelTest {
         Dispatchers.resetMain()
     }
 
-    private fun manager(fetcher: ModelFetcher): ModelManager = ModelManager(
+    private fun manager(): ModelManager = ModelManager(
         modelsRoot = modelsRoot,
         timeSource = time,
         specs = listOf(spec),
-        fetcher = fetcher,
+        fetcher = unusedFetcher(),
         ioDispatcher = Dispatchers.Unconfined,
     )
 
-    private fun viewModel(
-        fetcher: ModelFetcher,
-        streams: Map<String, ByteArray> = emptyMap(),
-    ): SettingsViewModel = SettingsViewModel(
-        modelManager = manager(fetcher),
-        openStream = { uri -> streams[uri]?.let { ByteArrayInputStream(it) } },
+    private fun viewModel(assets: Map<String, ByteArray> = emptyMap()): SettingsViewModel = SettingsViewModel(
+        modelManager = manager(),
+        openAsset = { path -> assets[path]?.let { ByteArrayInputStream(it) } },
+    )
+
+    /** assets 布局与生产一致：models/<specId>/<fileName> */
+    private fun assetPathOf(fileName: String) = "models/${spec.id}/$fileName"
+
+    private fun fullAssets(): Map<String, ByteArray> = mapOf(
+        assetPathOf("model.onnx") to modelBytes,
+        assetPathOf("tokens.txt") to tokenBytes,
     )
 
     // -- 核对 --------------------------------------------------------------------
@@ -90,7 +94,7 @@ class SettingsViewModelTest {
     @Test
     fun `初始核对把已经在位的包标成就绪`() = runTest {
         installValidFiles()
-        val vm = viewModel(fetcher = failingFetcher())
+        val vm = viewModel()
         advanceUntilIdle()
 
         val status = vm.state.value.models.single()
@@ -98,100 +102,73 @@ class SettingsViewModelTest {
         assertTrue(status.verification!!.isReady)
     }
 
-    // -- 下载 --------------------------------------------------------------------
+    // -- 从安装包恢复 ---------------------------------------------------------------
 
     @Test
-    fun `下载成功后给成功文案且状态就绪`() = runTest {
-        val vm = viewModel(fetcher = fakeFetcher())
+    fun `恢复把缺的文件从assets就位并给成功文案`() = runTest {
+        val vm = viewModel(assets = fullAssets())
         advanceUntilIdle()
 
-        vm.download(spec.id)
+        vm.restore(spec.id)
         advanceUntilIdle()
 
         val status = vm.state.value.models.single()
         assertTrue(status.verification!!.isReady)
-        // 大小是清单里两个文件字节数之和（22 + 12），文案不许另编一个数
-        assertEquals("已取回并核对通过：假识别模型（仅测试）（34 B）", vm.state.value.message)
-    }
-
-    @Test
-    fun `下载失败把可执行的原因放进消息`() = runTest {
-        val vm = viewModel(fetcher = failingFetcher())
-        advanceUntilIdle()
-
-        vm.download(spec.id)
-        advanceUntilIdle()
-
-        val message = vm.state.value.message!!
-        assertTrue(message, message.startsWith("操作失败："))
-        assertTrue(message, message.contains("model.onnx"))
-        // manager 也在包状态里留了同一份原因，卡片上的错误行有据可读
-        assertNotNull(vm.state.value.models.single().error)
-    }
-
-    // -- 本地导入 ------------------------------------------------------------------
-
-    @Test
-    fun `导入按文件名对号入座并报还缺什么`() = runTest {
-        val uri = "content://fake/1"
-        val vm = viewModel(
-            fetcher = failingFetcher(),
-            streams = mapOf(uri to modelBytes),
+        assertEquals(
+            "已从安装包恢复并核对通过：假识别模型（仅测试）（34 B）",
+            vm.state.value.message,
         )
-        advanceUntilIdle()
-
-        vm.importPicked(spec.id, uri, displayName = "model.onnx")
-        advanceUntilIdle()
-
-        val message = vm.state.value.message!!
-        assertTrue(message, message.contains("model.onnx"))
-        assertTrue(message, message.contains("还差"))
-        assertTrue(message, message.contains("tokens.txt"))
+        // 就位的文件内容与 assets 一致，磁盘上不留半截 .part
+        val dir = File(modelsRoot, spec.id)
+        assertTrue(File(dir, "model.onnx").readBytes().contentEquals(modelBytes))
+        assertFalse(dir.listFiles()!!.any { it.name.endsWith(".part") })
     }
 
     @Test
-    fun `导错文件如实拒绝并列出包要的文件名`() = runTest {
-        val vm = viewModel(fetcher = failingFetcher())
+    fun `assets缺文件如实报错且不假装成功`() = runTest {
+        val vm = viewModel(assets = emptyMap())
         advanceUntilIdle()
 
-        vm.importPicked(spec.id, uri = "content://fake/2", displayName = "别的文件.bin")
+        vm.restore(spec.id)
         advanceUntilIdle()
 
         val message = vm.state.value.message!!
-        assertTrue(message, message.contains("不是这个包要的文件"))
-        assertTrue(message, message.contains("model.onnx"))
-        assertTrue(message, message.contains("tokens.txt"))
+        assertTrue(message, message.contains("安装包里没有"))
+        assertTrue(message, message.contains("models/${spec.id}/model.onnx"))
+        assertFalse(vm.state.value.models.single().verification!!.isReady)
     }
 
     @Test
-    fun `打不开的文件如实报错不假装导入成功`() = runTest {
-        val vm = viewModel(fetcher = failingFetcher(), streams = emptyMap())
+    fun `内容坏掉的assets过不了校验目标文件不被替换`() = runTest {
+        val corrupted = "corrupted-bytes".toByteArray()
+        val vm = viewModel(assets = mapOf(assetPathOf("model.onnx") to corrupted))
         advanceUntilIdle()
 
-        vm.importPicked(spec.id, uri = "content://fake/3", displayName = "model.onnx")
+        vm.restore(spec.id)
         advanceUntilIdle()
 
         val message = vm.state.value.message!!
         assertTrue(message, message.contains("操作失败"))
-        assertTrue(message, message.contains("读不出"))
+        assertTrue(message, message.contains("大小不符"))
+        // .part 规矩：没过校验就不许改名，目录里不能冒出一个内容坏的正式文件
+        val dir = File(modelsRoot, spec.id)
+        assertFalse(File(dir, "model.onnx").exists())
+        assertFalse(dir.listFiles()!!.any { it.name.endsWith(".part") })
     }
 
     @Test
-    fun `两个文件分两次导入齐了就是就绪`() = runTest {
-        val streams = mapOf(
-            "content://fake/a" to modelBytes,
-            "content://fake/b" to tokenBytes,
-        )
-        val vm = viewModel(fetcher = failingFetcher(), streams = streams)
+    fun `删除后从安装包恢复不需要网络也能回到就绪`() = runTest {
+        installValidFiles()
+        val vm = viewModel(assets = fullAssets())
         advanceUntilIdle()
 
-        vm.importPicked(spec.id, "content://fake/a", "model.onnx")
+        vm.deleteConfirmed(spec.id)
         advanceUntilIdle()
-        vm.importPicked(spec.id, "content://fake/b", "tokens.txt")
-        advanceUntilIdle()
+        assertFalse(vm.state.value.models.single().verification!!.isReady)
 
+        vm.restore(spec.id)
+        advanceUntilIdle()
         assertTrue(vm.state.value.models.single().verification!!.isReady)
-        assertTrue(vm.state.value.message!!.contains("这个包现在齐了"))
     }
 
     // -- 删除 --------------------------------------------------------------------
@@ -199,7 +176,7 @@ class SettingsViewModelTest {
     @Test
     fun `删除后回未就绪并给收尾文案`() = runTest {
         installValidFiles()
-        val vm = viewModel(fetcher = failingFetcher())
+        val vm = viewModel()
         advanceUntilIdle()
 
         vm.deleteConfirmed(spec.id)
@@ -207,7 +184,7 @@ class SettingsViewModelTest {
 
         val status = vm.state.value.models.single()
         assertTrue(!status.verification!!.isReady)
-        assertTrue(vm.state.value.message!!, vm.state.value.message!!.contains("播放不受影响"))
+        assertTrue(vm.state.value.message!!, vm.state.value.message!!.contains("从安装包恢复"))
         assertTrue(status.spec.files.all { !File(dirOf(status.spec.id), it.fileName).exists() })
     }
 
@@ -223,18 +200,8 @@ class SettingsViewModelTest {
         File(dir, "tokens.txt").writeBytes(tokenBytes)
     }
 
-    private fun fakeFetcher(): ModelFetcher = ModelFetcher { url, target, onProgress ->
-        val body = when {
-            url.endsWith("model.onnx") -> modelBytes
-            url.endsWith("tokens.txt") -> tokenBytes
-            else -> throw IOException("意外地址：$url")
-        }
-        target.parentFile?.mkdirs()
-        target.writeBytes(body)
-        onProgress(body.size.toLong(), body.size.toLong())
-    }
-
-    private fun failingFetcher(): ModelFetcher = ModelFetcher { url, _, _ ->
-        throw ModelDownloadException("取回失败（测试假件）：$url")
+    /** 产品路径已无在线下载；这个假件任何调用都直接失败，钉住「本套件不依赖网络」 */
+    private fun unusedFetcher(): ModelFetcher = ModelFetcher { url, _, _ ->
+        throw AssertionError("这些用例不该走网络下载：$url")
     }
 }

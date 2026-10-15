@@ -2,8 +2,10 @@ package com.xinchen.echomind.asr
 
 import com.sun.net.httpserver.HttpServer
 import com.xinchen.echomind.core.time.FakeTimeSource
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
 import java.net.InetSocketAddress
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -395,6 +397,128 @@ class ModelManagerTest {
         }
         assertNotNull("应该抛 ModelDownloadException", thrown)
         return thrown!!
+    }
+
+    // -- 从安装包恢复（FR-511 的产品路径：assets → .part → 校验 → 改名 → 记来源） --------------
+
+    private fun noNetworkFetcher(): ModelFetcher = ModelFetcher { url, _, _ ->
+        throw AssertionError("恢复路径不该走网络：$url")
+    }
+
+    private fun assetsOf(vararg entries: Pair<String, ByteArray>): (String) -> InputStream? {
+        val map = entries.toMap()
+        return { path -> map[path]?.let { ByteArrayInputStream(it) } }
+    }
+
+    @Test
+    fun `从assets恢复缺失的文件并记来源`() {
+        val content = "model-bytes-0123456789".toByteArray()
+        val fileSpec = fileSpecOf("model.onnx", content)
+        val spec = specOf(fileSpec)
+
+        val verification = runBlocking {
+            manager(noNetworkFetcher(), spec)
+                .provision(spec.id, assetsOf("models/${spec.id}/model.onnx" to content))
+        }
+
+        assertTrue(verification.failures.toString(), verification.isReady)
+        assertArrayEquals(content, installedFile(spec, "model.onnx").readBytes())
+        assertFalse(verification.dir.list()!!.any { it.endsWith(".part") })
+        val provenance = provenanceText(spec)
+        assertTrue(provenance, provenance.contains("model.onnx.apk_asset=models/${spec.id}/model.onnx"))
+        assertTrue(provenance, provenance.contains("model.onnx.sha256=${sha256Hex(content)}"))
+    }
+
+    @Test
+    fun `恢复成功后忙位落定不许卡在恢复中`() {
+        val content = "model-bytes-0123456789".toByteArray()
+        val fileSpec = fileSpecOf("model.onnx", content)
+        val spec = specOf(fileSpec)
+        val subject = manager(noNetworkFetcher(), spec)
+
+        val verification = runBlocking {
+            subject.provision(spec.id, assetsOf("models/${spec.id}/model.onnx" to content))
+        }
+
+        assertTrue(verification.isReady)
+        val status = subject.statuses.value.single()
+        assertFalse("成功后 isImporting 必须落定，否则包永远显示「恢复中」", status.isImporting)
+        assertFalse(status.isDownloading)
+    }
+
+    @Test
+    fun `文件齐全时恢复是空操作不碰任何文件`() {
+        val content = "model-bytes-0123456789".toByteArray()
+        val fileSpec = fileSpecOf("model.onnx", content)
+        val spec = specOf(fileSpec)
+        val dir = ModelVerifier.dirOf(modelsRoot, spec)
+        dir.mkdirs()
+        installedFile(spec, "model.onnx").writeBytes(content)
+
+        // assets 故意给坏内容：齐全的包根本不该读 assets，坏的也拷不进来
+        val verification = runBlocking {
+            manager(noNetworkFetcher(), spec)
+                .provision(spec.id, assetsOf("models/${spec.id}/model.onnx" to "corrupted".toByteArray()))
+        }
+
+        assertTrue(verification.isReady)
+        assertArrayEquals(content, installedFile(spec, "model.onnx").readBytes())
+        assertFalse("空操作不该写来源记录", File(dir, ModelManager.PROVENANCE_FILE_NAME).exists())
+    }
+
+    @Test
+    fun `内容坏的assets过不了校验也不许改名`() {
+        val fileSpec = fileSpecOf("model.onnx", "right-bytes-0123456".toByteArray())
+        val spec = specOf(fileSpec)
+        val subject = manager(noNetworkFetcher(), spec)
+
+        val error = runCatching {
+            runBlocking {
+                subject.provision(spec.id, assetsOf("models/${spec.id}/model.onnx" to "wrong".toByteArray()))
+            }
+        }.exceptionOrNull()
+
+        assertNotNull("应该抛 ModelImportException", error)
+        assertTrue(error is ModelImportException)
+        assertTrue(error!!.message!!, error.message!!.contains("大小不符"))
+        val dir = ModelVerifier.dirOf(modelsRoot, spec)
+        assertFalse(File(dir, "model.onnx").exists())
+        assertFalse(dir.list()!!.any { it.endsWith(".part") })
+    }
+
+    @Test
+    fun `assets缺文件时strict抛错nonStrict写进状态不炸启动`() {
+        val spec = specOf(fileSpecOf("model.onnx", "payload".toByteArray()))
+        val subject = manager(noNetworkFetcher(), spec)
+        val emptyAssets: (String) -> InputStream? = { null }
+
+        val strictError = runCatching {
+            runBlocking { subject.provision(spec.id, emptyAssets) }
+        }.exceptionOrNull()
+        assertNotNull("strict（设置页按钮）要抛", strictError)
+        assertTrue(strictError is ModelImportException)
+        assertTrue(strictError!!.message!!, strictError.message!!.contains("安装包里没有"))
+
+        val ensured = runBlocking { subject.ensureProvisioned(emptyAssets) }
+        // non-strict（启动就位）不抛：原因写进该包状态，交给 UI 呈现
+        assertTrue(ensured.single().error!!, ensured.single().error!!.contains("安装包里没有"))
+        assertFalse(ensured.single().verification!!.isReady)
+    }
+
+    @Test
+    fun `ensureProvisioned把缺的包就位且幂等`() {
+        val content = "model-bytes-0123456789".toByteArray()
+        val fileSpec = fileSpecOf("model.onnx", content)
+        val spec = specOf(fileSpec)
+        val subject = manager(noNetworkFetcher(), spec)
+        val assets = assetsOf("models/${spec.id}/model.onnx" to content)
+
+        val first = runBlocking { subject.ensureProvisioned(assets) }
+        assertTrue(first.single().verification!!.isReady)
+        // 第二遍只是再核对一次，结果不变
+        val second = runBlocking { subject.ensureProvisioned(assets) }
+        assertTrue(second.single().verification!!.isReady)
+        assertArrayEquals(content, installedFile(spec, "model.onnx").readBytes())
     }
 
     private class RecordingFetcher(

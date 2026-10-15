@@ -91,6 +91,40 @@ jobs:
           mkdir -p app/libs
           cp "$CACHE_DIR/$AAR" app/libs/
 
+      - name: 缓存内置模型
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/echomind-models
+          key: bundled-models-f36a0433-59aba887-9e2449e1
+
+      - name: 取回并校验内置模型
+        run: |
+          set -euo pipefail
+          # 模型不入仓库（.gitignore 排掉 assets/models/），CI 按清单里的钉住哈希取回后放进 assets。
+          # 构建脚本对同一组文件还会再做一遍「存在 + 字节数」检查，两道闸都不过就别想打出 APK（AGENTS.md §5）。
+          # runner 直连 huggingface.co / github.com 没有问题（超时只发生在本机网络，见 docs/environment.md）。
+          CACHE_DIR="$HOME/.cache/echomind-models"
+          mkdir -p "$CACHE_DIR" app/src/main/assets/models/paraformer-zh-2023-09-14-int8 app/src/main/assets/models/silero-vad
+          fetch() { # fetch <缓存名> <URL> <sha256>
+            if [ ! -f "$CACHE_DIR/$1" ]; then
+              curl -sSL --retry 3 -o "$CACHE_DIR/$1" "$2"
+            fi
+            echo "$3  $CACHE_DIR/$1" | sha256sum -c -
+            cp "$CACHE_DIR/$1" "$4"
+          }
+          fetch model.int8.onnx \
+            "https://huggingface.co/csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14/resolve/main/model.int8.onnx" \
+            f36a0433bcf096bd6d6f11b80a3ac8bed110bdca632fe0d731df8d1a84475945 \
+            app/src/main/assets/models/paraformer-zh-2023-09-14-int8/model.int8.onnx
+          fetch tokens.txt \
+            "https://huggingface.co/csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14/resolve/main/tokens.txt" \
+            59aba8873a2ed1e122c25fee421e25f283b63290efbde85c1f01a853d83cb6e6 \
+            app/src/main/assets/models/paraformer-zh-2023-09-14-int8/tokens.txt
+          fetch silero_vad.onnx \
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx" \
+            9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6 \
+            app/src/main/assets/models/silero-vad/silero_vad.onnx
+
       - name: 准备 Gradle（缓存 wrapper 与依赖）
         uses: gradle/actions/setup-gradle@v6
 

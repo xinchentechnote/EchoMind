@@ -127,6 +127,49 @@ if (!sherpaAar.exists()) {
     )
 }
 
+/**
+ * 模型随安装包内置（FR-511，2026-10-15）：三个文件放在 `assets/models/<specId>/`，不入仓库
+ * （`.gitignore` 排掉 `app/src/main/assets/models/` 与 `*.onnx`），运行时由 `ModelManager.ensureProvisioned`
+ * 从 assets 拷进 filesDir 并逐文件校验。构建期只查**存在与字节数**（stat 便宜；配置阶段跑 SHA-256
+ * 会让每次构建慢 1~2 秒）——完整哈希由 CI 取回时 `sha256sum -c` 与运行时就位时各做一遍，两道闸都别省。
+ * 缺失时给出确切来源，不许静默打出一个没模型的 APK（AGENTS.md §5）。
+ */
+data class BundledModelFile(val relativePath: String, val expectedBytes: Long)
+
+val bundledModelFiles = listOf(
+    BundledModelFile(
+        "src/main/assets/models/paraformer-zh-2023-09-14-int8/model.int8.onnx",
+        243_371_218L,
+    ),
+    BundledModelFile(
+        "src/main/assets/models/paraformer-zh-2023-09-14-int8/tokens.txt",
+        75_756L,
+    ),
+    BundledModelFile(
+        "src/main/assets/models/silero-vad/silero_vad.onnx",
+        643_854L,
+    ),
+)
+
+bundledModelFiles.forEach { model ->
+    val f = file(model.relativePath)
+    if (!f.exists() || f.length() != model.expectedBytes) {
+        throw GradleException(
+            """
+            |缺少或大小不符的模型文件：${f.absolutePath}（期望 ${model.expectedBytes} B）
+            |  模型不入仓库（.gitignore），按清单从上游取回后放进 assets：
+            |  model.int8.onnx : https://hf-mirror.com/csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14/resolve/main/model.int8.onnx
+            |                    SHA-256 f36a0433bcf096bd6d6f11b80a3ac8bed110bdca632fe0d731df8d1a84475945（官方）
+            |  tokens.txt      : https://hf-mirror.com/csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14/resolve/main/tokens.txt
+            |                    SHA-256 59aba8873a2ed1e122c25fee421e25f283b63290efbde85c1f01a853d83cb6e6（本机钉住，无官方值）
+            |  silero_vad.onnx : https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
+            |                    SHA-256 9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6（官方）
+            |  CI 会自动取回并校验；本机可照抄 .github/workflows/ci.yml 里「取回并校验内置模型」一步
+            """.trimMargin()
+        )
+    }
+}
+
 dependencies {
     implementation(files(sherpaAar))
 

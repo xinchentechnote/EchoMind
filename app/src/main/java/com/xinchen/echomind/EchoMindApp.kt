@@ -120,5 +120,13 @@ class EchoMindApp : Application() {
         // WorkManager 可能会自己把 worker 重跑一遍，那一轮会在 markRunning 的守卫前收手——
         // 这里刻意**不**去 cancelAllWorkByTag：那个调用是异步的，会连用户刚点的「转录」一起取消。
         graph.appScope.launch { graph.transcriptRepository.recoverInterrupted() }
+        // 模型随安装包内置（FR-511）：把缺的文件从 assets 拷进 filesDir 并逐文件校验。
+        // 文件都齐时它只是一遍哈希核对（~1-2 秒，后台线程），不阻塞任何界面；
+        // assets 缺文件不会炸启动——原因写进该包的状态，设置页会显示出来
+        graph.appScope.launch {
+            graph.modelManager.ensureProvisioned { path ->
+                runCatching { assets.open(path) }.getOrNull()
+            }
+        }
     }
 }

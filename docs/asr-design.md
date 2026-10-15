@@ -281,33 +281,35 @@ Phase 6d 之后这些行为有了**设备证据**（人工从界面点出来：�
 
 后续可选改进（roadmap，不进 MVP）：接入中文标点恢复模型（ sherpa-onnx 侧无现成 Kotlin API，需自行集成 `punc_ct-transformer` ONNX，成本较高），或换用自带标点的模型。
 
-## 7. 模型准备与校验（FR-510、需求「模型部署策略」）
+## 7. 模型准备与校验（FR-510/FR-511、需求「模型部署策略」；**2026-10-15 用户决策改为安装包内置**，见 `architecture.md` D39）
 
-三种准备路径，最终都归一到 `ModelVerifier.verify(spec, modelsRoot, verifiedAtMs)`（存在 → 大小 → SHA-256 三步，全过才算就绪）：
+**产品路径（唯一有 UI 入口的）：模型随 APK 的 `assets/models/<specId>/` 发布，运行时就位，全程不联网。**
+三个文件不入仓库（`.gitignore` 排掉 `assets/models/` 与 `*.onnx`）；构建脚本查「存在 + 字节数」（缺失直接失败并打印来源 URL 与哈希，完整哈希留给 CI 与运行时两道闸，配置阶段不算 243 MB 的 SHA-256）；CI 按钉住哈希取回、`sha256sum -c` 后放进 assets。运行时两步，最终都归一到 `ModelVerifier.verify(spec, modelsRoot, verifiedAtMs)`（存在 → 大小 → SHA-256 三步，全过才算就绪）：
 
-1. **在线下载**（默认）→ **已实现（2026-10-15）**：`asr/ModelManager.kt`。
+1. **启动就位**：`ModelManager.ensureProvisioned(openAsset)`（`EchoMindApp.onCreate` 后台调）——逐包核对，缺/坏的文件从 assets 拷：
+   `<file>.part` → 比大小 → 整份 SHA-256 → 全对才改名（**不留一份「看起来存在」的坏模型**）。
+   assets 缺文件**不炸启动**：原因写进该包状态，设置页显示出来。文件都齐时它只是一遍哈希核对（243 MB 约 1~2 秒，IO 线程）。
+2. **手动恢复**：用户删过文件后，设置页「从安装包恢复（…）」按钮 → `provision(specId, openAsset)` 走同一套规矩补齐；
+   就绪的包不显示按钮。来源记录写 `download-provenance.properties`，origin 键是 `apk_asset`（assets 路径），
+   与在线下载的 `url`、SAF 的 `local_import` 三者不混。进度沿用同一套限流（250 ms 一推，尾包必推）。
+
+两条历史路径**保留代码与 JVM 测试但已无产品入口**（谁要把在线路径加回产品，须连 FR-501 的「无 INTERNET」口径一起改）：
+
+1. **在线下载**（原默认路径）→ `ModelManager.download()` + `HttpFetcher`：
    - 目录：`filesDir/models/<ModelSpec.id>/`（`ModelVerifier.dirOf`）。
-   - 流程：`ModelFetcher.fetch` 把字节写进 `<file>.part` → 比大小 → `ModelVerifier.sha256` 流式比对清单值 → 全对才 `renameTo(正式文件)`；
-     任何一步失败都删 `.part`，**不留一份「看起来存在」的坏模型**。断点续传只到**文件级**（已合格的文件跳过，半截文件下次从头重下），
-     不用 HTTP Range：清单的哈希是整份文件的，拿半截去比对没有意义。
+   - 流程：`ModelFetcher.fetch` 把字节写进 `<file>.part` → 比大小 → 流式比对清单值 → 全对才 `renameTo(正式文件)`。
+     断点续传只到**文件级**（已合格的文件跳过，半截文件下次从头重下），不用 HTTP Range：清单的哈希是整份文件的。
    - 多源：按 `ModelFileSpec.candidateUrls`（首选 + 备用）依次尝试，全失败才抛 `ModelDownloadException`，异常里带上每个地址各自的失败原因。
-   - 来源记录：每个取回成功的文件向模型目录里的 `download-provenance.properties` 追加 6 行
-     （`<file>.url` / `.bytes` / `.sha256` / `.checksum=official|pinned-by-first-download` / `.model_id` / `.fetched_at_ms`）。
-     无官方校验值的文件（当前只有 `tokens.txt`）记的就是 `pinned-by-first-download`，与 §3 表格一致。
-   - 进度：`HttpFetcher` 的 64 KB 分块回调按**单调时钟**限流 250 ms 才推一次 `ModelStatus.download`（尾包必推），
-     否则一次 243 MB 的下载要往 `StateFlow` 塞 ~3700 个值。
    - 传输层是 `HttpURLConnection`（不引 OkHttp），自己跟 `Location`（相对地址按当前 URL 解析），
-     `instanceFollowRedirects=false` + 最多 5 跳，见 §3 里 hf-mirror 实测返回缓存 URL 那条。
-     **注意**：设备上的 `HttpURLConnection` 实现是 `com.android.okhttp.internal.huc.*`（Android Framework 自带的 OkHttp 移植），
-     与 host JDK 那份不是同一套代码，所以「JVM 单测绿」不构成「设备能下载」的证据——这条路径由 `androidTest/asr/ModelManagerNetworkTest.kt`
-     用真实 hf-mirror URL 验证（2026-10-15，4/4 通过，`docs/testing.md` §4）。前提条件是 `AndroidManifest` 里的 `INTERNET` 权限，
-     它当初被漏掉时**没有任何一条单测变红**，这是这类代码的固有风险。
-2. **本地导入**（完全离线的首次使用）→ **未实现**：设置页选一个模型包目录（SAF），跑同一个 `ModelVerifier`，再把文件移入私有目录。
-   校验逻辑已经复用得上（`ModelVerifier.checkFile` 就是给它准备的），缺的是 SAF 侧的搬运与 UI。
-3. **预置**：把模型放 APK assets —— **不做**（§2.2 体积结论：仅模型就 232 MiB，远超可接受范围）。
+     `instanceFollowRedirects=false` + 最多 5 跳。**注意**：设备上的 `HttpURLConnection` 是 Framework 自带的 OkHttp 移植，
+     与 host JDK 那份不是同一套代码——原来由 `androidTest/asr/ModelManagerNetworkTest.kt` 用真实 hf-mirror URL 验证
+     （2026-10-15，4/4 通过），**该测试已随内置化删除**（它要求主清单持有 `INTERNET`，而产品已不联网）；
+     重定向/404 的行为仍由 `ModelManagerTest` 的本机 HTTP 服务用例覆盖。
+2. **本地导入**（SAF 选文件）→ `ModelManager.importFile()` 保留（按单文件结算，`.part` 规矩一致）；设置页的 SAF 入口已随内置化移除。
 
 删除模型：`ModelManager.delete(spec)` 只删 `filesDir/models/<id>/` 里清单列出的文件、`.part` 与来源记录，再删目录本身；
 字幕与收听历史一律不碰（FR-508）。删除不成功的文件路径会写进 `ModelStatus.error`，不假装删干净了。
+删除后转录会 `MODEL_MISSING`，指引文案指向设置页的「从安装包恢复」（离线即可恢复，这是内置化之后删除变得低危的原因）。
 
 ## 8. 降级与失败处理
 
@@ -316,7 +318,7 @@ Phase 6d 之后这些行为有了**设备证据**（人工从界面点出来：�
 `TranscriptCoordinatorTest` 9 条用例逐条走过（`文档里不许出现代码没有的能力`，反过来说也一样：写入了但没验过的路径要标出来）。
 **UI 那一半在 Phase 6d 补上了**：`ui/transcript/TranscriptDisplay.failureGuide` 把 8 个 `TranscriptFailure` 逐个翻成「发生了什么 + 你能做什么」，
 卡片同时把 `error_message` 原文照登成「原始信息：…」（不加工、不美化），文案里出现的阈值一律从 `AudioFormats` 常量渲染（13 条 JVM 用例钉住，
-含 `每种失败都给得出一个动作`）。**仍缺**：`OUT_OF_MEMORY` 分支既无用例也无设备证据；`MODEL_MISSING` 文案里的「请先在模型页准备好」指向**还不存在的页面**（任务 #24）。
+含 `每种失败都给得出一个动作`）。**仍缺**：`OUT_OF_MEMORY` 分支既无用例也无设备证据。~~`MODEL_MISSING` 文案指向不存在的模型页~~ → **已解（6d/6e/6f）**：模型页存在，文案已改为「到『设置』页点『从安装包恢复』（模型随安装包内置，不需要网络）」（JVM 有用例钉住）；「转录失败时页面上出现该文案 → 按指引恢复 → 重试成功」这条完整闭环还没在设备上连起来走。
 
 | 触发 | 行为 |
 | --- | --- |

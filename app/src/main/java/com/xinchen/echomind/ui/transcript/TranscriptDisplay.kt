@@ -49,7 +49,7 @@ object TranscriptDisplay {
      */
     fun failureGuide(failure: TranscriptFailure): String = when (failure) {
         TranscriptFailure.ModelMissing ->
-            "模型没有就位。把转录模型准备好之后点重试——模型页还没上线，现在只能把文件放进 App 的 files/models 目录"
+            "模型没有就位。到「设置」页点「从安装包恢复」（模型随安装包内置，不需要网络），就位后回来点重试"
 
         TranscriptFailure.DecodeFailed ->
             "这个文件解不出音频：可能已不在原位置、格式不支持或已损坏。先回书架重扫（或在文件管理器里确认它还在），再点重试"
