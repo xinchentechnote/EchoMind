@@ -271,7 +271,7 @@ private fun transcriptionLabel(state: String): String = when (state) {
 private fun EmptyShelf(hasFolders: Boolean, tab: ShelfTab, hasQuery: Boolean, onImport: () -> Unit) {
     // 「没有匹配」和「这个 tab 本来就空」是两件事：混成一句会让收藏页看起来像搜索坏了
     val (title, hint) = when {
-        !hasFolders -> "书架还是空的" to "选择一个包含 MP3 的文件夹开始导入"
+        !hasFolders -> "书架还是空的" to "选择一个包含音频文件的文件夹开始导入（支持 MP3 / M4A / FLAC / WAV）"
         hasQuery -> "没有匹配的音频" to "试试换个关键词，或重新扫描文件夹"
         tab == ShelfTab.Favorites -> "还没有收藏" to "点行上的 ☆ 把常听的书收进来"
         tab == ShelfTab.Recent -> "还没有播放记录" to "随便播一首，这里就会出现最近收听"

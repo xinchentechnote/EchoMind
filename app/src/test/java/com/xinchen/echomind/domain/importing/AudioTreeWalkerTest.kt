@@ -1,5 +1,6 @@
 package com.xinchen.echomind.domain.importing
 
+import com.xinchen.echomind.core.conf.AudioFormats
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -47,6 +48,24 @@ class AudioTreeWalkerTest {
         assertEquals(4096L, entry.sizeBytes)
         assertEquals(4096L * 7, entry.lastModifiedMs)
         assertEquals("a.mp3", entry.fileName)
+    }
+
+    @Test
+    fun `生产白名单的格式全部收进来且大小写不敏感`() {
+        // 白名单扩展（放开 m4a/aac/flac/wav）走的是同一条 walker 判定，这里用**真实清单**钉住：
+        // 大写扩展名照收，白名单之外的 wma/ogg（未实测/无解码器）照丢
+        val tree = mapOf(
+            "root" to listOf(
+                file("a.mp3", "root/a.mp3"), file("b.m4a", "root/b.m4a"), file("c.aac", "root/c.aac"),
+                file("d.flac", "root/d.flac"), file("e.wav", "root/e.wav"), file("f.WAV", "root/f.WAV"),
+                file("g.wma", "root/g.wma"), file("h.ogg", "root/h.ogg"), file("i.txt", "root/i.txt"),
+            ),
+        )
+        val walker = AudioTreeWalker(FakeBrowser(tree), AudioFormats.SUPPORTED_EXTENSIONS)
+        assertEquals(
+            listOf("a.mp3", "b.m4a", "c.aac", "d.flac", "e.wav", "f.WAV"),
+            walker.walk("root").files.map { it.fileName },
+        )
     }
 
     @Test

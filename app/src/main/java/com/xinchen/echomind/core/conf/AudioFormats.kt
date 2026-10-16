@@ -2,7 +2,20 @@ package com.xinchen.echomind.core.conf
 
 /** 扫描与解码相关的格式白名单（FR-103）。扩展其他格式前必须先实测系统解码能力。 */
 object AudioFormats {
-    val SUPPORTED_EXTENSIONS: Set<String> = setOf("mp3")
+
+    /**
+     * 扫描白名单（FR-103）。**只列实测过「导入 → 播放 → 转录解码」的格式**，没实测的不放行：
+     * - `mp3`（2026-10-15 起全程在用）
+     * - `m4a` / `aac`（AAC in M4A，2026-10-16 端到端实测：导入 → 播放 → `PcmDecoder` 解码 → 转录出 38 句）
+     * - `flac` / `wav`（同日实测导入、播放与转录解码；素材由 macOS `afconvert` 从同一份真语音转出）
+     *
+     * 刻意**不在**白名单里：
+     * - `ogg` / `opus`：`DeviceCodecProbeTest` 探针确认设备上 `audio/vorbis` / `audio/opus` 解码器**存在**，
+     *   缺的只是本机能产出的测试素材（`afconvert` 不支持 vorbis 容器）——素材到位后加两个词即可放行。
+     * - `wma`：Android（AOSP）**没有 WMA 解码器**——`asr/DeviceCodecProbeTest` 在设备上枚举解码器清单为证；
+     *   支持它必须引入 FFmpeg 量级的第三方解码框架，按 AGENTS.md §3 得先证明系统能力不足（已证）并立决策记录后才能动手。
+     */
+    val SUPPORTED_EXTENSIONS: Set<String> = setOf("mp3", "m4a", "aac", "flac", "wav")
 
     /** ASR 侧统一采样率；sherpa-onnx 内部会重采样，但 VAD 要求 16k（docs/asr-design.md §1-A8） */
     const val ASR_SAMPLE_RATE: Int = 16_000

@@ -35,7 +35,7 @@
 | --- | --- | --- | --- |
 | FR-101 | 用 `ACTION_OPEN_DOCUMENT_TREE` 选文件夹，`takePersistableUriPermission` 持久化授权 | 杀进程重开仍不需重新授权；书架不丢 | **DONE**（`dumpsys activity permissions` 实测 `persistable=0x3 persisted=0x1`；force-stop 后重启书架 6 首仍在。`testing.md` §4） |
 | FR-102 | 支持多个文件夹；已授权文件夹列表在设置页可见 | 列表显示 URI 的显示名、上次扫描时间 | **PARTIAL**（多文件夹导入/去重/跨文件夹归属已实现并有仪器化测试；`displayName`+`lastScanAtMs` 已入库；设置页的文件夹列表 UI 未做 → Phase 7） |
-| FR-103 | 递归扫描子目录，识别 `.mp3`（大小写不敏感）；扩展名白名单集中配置 | 三层子目录里的 mp3 都能入库；非 mp3 不入库 | **DONE**（设备：3 层目录 + `5.MP3` 入库、`notes.txt` 不入库；`AudioTreeWalkerTest` 8 项） |
+| FR-103 | 递归扫描子目录，识别音频文件（大小写不敏感）；扩展名白名单集中配置（`core/conf/AudioFormats`，**只列实测过的格式**） | 白名单内的格式都能入库；白名单外的不入库 | **DONE（2026-10-16 扩展）**：白名单 = `mp3 / m4a / aac / flac / wav`。m4a/flac/wav 各造一份真语音素材（macOS `afconvert` 转自同一份 MP3）在 `emulator-5554` 上端到端实测：重扫入库（时长 148.6~148.7 s 全部读出）→ 播放 → 首播自动转录 → 任务 SUCCESS、38 句 `source=ASR` 落库、书 READY（三种格式同一天全绿）。**刻意不放行**：`ogg`/`opus`（探针证实解码器存在，缺本机测试素材）、`wma`（`DeviceCodecProbeTest` 在设备上枚举 39 个解码器证实 AOSP 无 WMA 解码器——支持它必须引入 FFmpeg 量级框架，见 `docs/roadmap.md`「音频格式支持」）。walker 8 项 + 新格式白名单用例（大写扩展照收、wma/ogg 照丢）在 `AudioTreeWalkerTest` |
 | FR-104 | 提取文件名、URI、size、lastModified，并用 Media3 `MetadataRetriever`/`MediaExtractor` 读取时长 | 时长与系统播放器读数误差 < 1s | **PARTIAL**（四个字段均入库，时长读取失败标 `duration_read_failed` 不阻塞导入；「与系统播放器对比误差」未实测 → Phase 7） |
 | FR-105 | 标题默认从文件名生成（去扩展名、去前导集数 `03_`、下划线转空格），用户可改标题且不被重扫描覆盖 | 改名后重新扫描仍保留用户标题 | **DONE**（设备：改成 `ManualRename` 后重扫仍保留，`title_is_manual=1`；`TitleDeriverTest` 7 项） |
 | FR-106 | 首次导入、手动重新扫描、新增文件识别；**同一 URI 不重复建记录** | 连续扫描 3 次，记录数不变 | **DONE**（设备连续重扫 `count(*)` 恒为 6；planner + 仓库测试各覆盖） |

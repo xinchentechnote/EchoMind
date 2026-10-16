@@ -690,6 +690,26 @@ FR-707（只在当前句变化时更新）用**设备 + 单测两头**取证：�
 - `MODEL_MISSING` 失败在播放页的文案只有 JVM 用例（模型已内置，设备上造不出来）。
 - 上一轮（6e/6f）遗留：删除按钮本体、`MODEL_MISSING` 三段闭环——继续挂账。
 
+### 格式支持（m4a/flac/wav 放行 + WMA 探针，2026-10-16 12:15 ~ 12:40）
+
+生产改动一处：`AudioFormats.SUPPORTED_EXTENSIONS` = `mp3, m4a, aac, flac, wav`（白名单唯一出处）；`ShelfScreen` 空态文案同步。
+新增测试：仪器化 `asr/DeviceCodecProbeTest`（枚举设备解码器 + 断言无 WMA + 断言四类必备解码器在）；JVM walker 新用例
+`生产白名单的格式全部收进来且大小写不敏感`（真实清单：五种格式 + 大写 .WAV 照收、wma/ogg/txt 照丢）。
+
+| 验收点 | 结果 | 凭据 |
+| --- | --- | --- |
+| 新格式导入 | 三份素材（`afconvert` 自同一份 148 s 真语音）重扫入库，时长全部读出（148,637~148,701 ms） | `run-as sqlite3` 查 `audio_book` |
+| m4a 端到端 | 首播自动转录 → SUCCESS、38 句 `source=ASR`、READY | DB 查询（job `SUCCESS\|23 段`、字幕 38 行） |
+| flac 端到端 | 同上（SUCCESS、38 句、READY） | 同上 |
+| wav 端到端 | 同上（SUCCESS、24 段、38 句、READY） | 同上 |
+| **WMA 无解码器（证据）** | 设备 39 个解码器可解类型 `[3gpp, amr-wb, flac, g711-alaw, g711-mlaw, mp4a-latm, mpeg, opus, raw, vorbis]`——**无 `x-ms-wma`**，断言钉住 | logcat `DeviceCodecProbe` + `DeviceCodecProbeTest` 绿 |
+| 构建与测试 | JVM 全绿（walker 用例进 `AudioTreeWalkerTest`）；仪器化 `DeviceCodecProbeTest` `OK (1 test)` | gradle 输出 + instrument 尾行 |
+
+**过程坑**：①新仪器化类一度 `ClassNotFoundException`——根因是 `MediaCodecInfo.isDecoder` 不存在（只有 `isEncoder`）导致
+`compileDebugAndroidTestKotlin` 失败，而当时链式命令里 gradle 失败被 `tail`/`grep` 吞了、`adb install` 装的还是旧 APK；
+教训：链式命令里 gradle 的 BUILD 状态必须在 install 之前显式检查。②写 WMA 探针查的是「解码器枚举」而不是造 wma 文件试
+MediaExtractor——前者是能力的直接证据，后者只证明容器解析失败，混起来会得出「能/不能」的假结论。
+
 ## 5. 待补的自动化测试清单（按阶段）
 
 | Phase | 用例 |
