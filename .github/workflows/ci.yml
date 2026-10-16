@@ -128,16 +128,17 @@ jobs:
             app/src/main/assets/models/silero-vad/silero_vad.onnx
 
       - name: 缓存并取回 libwma.so（WMA 解码，D40）
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           # 自建的 FFmpeg 最小裁剪 JNI 库（LGPL-2.1-or-later），构建脚本见 docs/architecture.md D40。
-          # 私有仓库的 release 资产要带 token；哈希钉住，不匹配即失败。
+          # 私有仓库的 release 资产要带 token（gh 自带，经 env 注入）；哈希钉住，不匹配即失败。
           CACHE_DIR="$HOME/.cache/echomind-libs"
           mkdir -p "$CACHE_DIR" app/libs/wma-jni/arm64-v8a
           if [ ! -f "$CACHE_DIR/libwma.so" ]; then
-            curl -sSL --retry 3 -H "Authorization: Bearer $GITHUB_TOKEN" \
-              -o "$CACHE_DIR/libwma.so" \
-              "https://github.com/xinchentechnote/EchoMind/releases/download/v0.1.1/libwma-arm64-v8a-dc064aed.so"
+            gh release download v0.1.1 -R xinchentechnote/EchoMind \
+              -p "libwma-arm64-v8a-dc064aed.so" -O "$CACHE_DIR/libwma.so"
           fi
           echo "dc064aede3aaefb5204989af3748f52d7c3b3a0309555165ebf2c561fe2a530e  $CACHE_DIR/libwma.so" | sha256sum -c -
           cp "$CACHE_DIR/libwma.so" app/libs/wma-jni/arm64-v8a/libwma.so
