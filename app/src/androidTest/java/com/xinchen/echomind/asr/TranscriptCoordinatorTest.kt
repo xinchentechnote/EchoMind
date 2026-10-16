@@ -255,7 +255,7 @@ class TranscriptCoordinatorTest {
 
         // 第二本书必须换一个 uri（`audio_book.uri` 上有唯一索引，同一份文件不能挂两本书）。
         // 这里用静音那份负例：它只是「另一本书」的占位，本轮根本走不到解码——收手在装载模型之前。
-        val second = enqueueBook(fileUriOf(DeviceAsrFixtures.SILENT_MP3), audioId = "b")
+        val second = enqueueBook(fileUriOf(DeviceAsrFixtures.SILENT_WAV), audioId = "b")
         val outcome = coordinator().run(second)
         val skipped = outcome as? TranscriptOutcome.Skipped
             ?: error("第二本书竟然跑起来了（那就是两个引擎并存）：$outcome")
@@ -354,7 +354,7 @@ class TranscriptCoordinatorTest {
      */
     @Test
     fun 没有语音的素材标成结果不可用而不是成功() = runBlocking {
-        val jobId = enqueueBook(fileUriOf(DeviceAsrFixtures.SILENT_MP3))
+        val jobId = enqueueBook(fileUriOf(DeviceAsrFixtures.SILENT_WAV))
 
         val failed = coordinator().run(jobId) as? TranscriptOutcome.Failed
             ?: error("静音素材竟然提交了字幕（这就是「造时间戳」会走到的地方）")
@@ -368,17 +368,14 @@ class TranscriptCoordinatorTest {
         assertEquals("没字幕可写：库里的行必须与 FAILED 一致", 0, subtitles().size)
     }
 
-    /**
-     * 自动路由（D41）：任务行记 auto 时，协调器先用 SenseVoice 听开头 30 s 判语言，
-     * zh/yue → Paraformer、en → SenseVoice，并把行上的 model_id 改写成最终模型。
-     */
     @Test
-    fun 自动路由把中文素材路由到paraformer并改写行上的模型() = runBlocking {
+    fun 升级前遗留的auto任务统一改写为中文听书模型() = runBlocking {
         val durationMs = DeviceAsrFixtures.REAL_MP3_DURATION_MS
         val jobId = enqueueBook(
             fileUriOf(DeviceAsrFixtures.REAL_MP3),
             durationMs = durationMs,
-            modelRef = TranscriptModelRef(ModelCatalog.AUTO_MODEL_ID, ""),
+            // 旧版本已经可能把这个哨兵写进用户数据库；常量删除后仍要验证兼容收口。
+            modelRef = TranscriptModelRef("auto", ""),
         )
         coordinator().run(jobId, isCancelled = { false })
 
@@ -389,18 +386,19 @@ class TranscriptCoordinatorTest {
     }
 
     @Test
-    fun 自动路由把英文素材路由到sensevoice() = runBlocking {
+    fun 升级前遗留的多语种任务也统一改写为中文听书模型() = runBlocking {
         val jobId = enqueueBook(
-            fileUriOf("en-tts.wav"),
-            durationMs = 27_293L,
-            modelRef = TranscriptModelRef(ModelCatalog.AUTO_MODEL_ID, ""),
+            fileUriOf(DeviceAsrFixtures.REAL_MP3),
+            durationMs = DeviceAsrFixtures.REAL_MP3_DURATION_MS,
+            modelRef = ModelCatalog.refOf(ModelCatalog.senseVoice),
         )
         coordinator().run(jobId, isCancelled = { false })
 
         val row = jobRow(jobId)
-        assertEquals("英文素材应路由到 SenseVoice", ModelCatalog.SENSEVOICE_ID, row.modelId)
+        assertEquals("产品任务只能执行中文听书模型", ModelCatalog.PARAFORMER_ID, row.modelId)
+        assertEquals(ModelCatalog.transcriptRef.version, row.modelVersion)
         assertEquals(TranscriptJobEntity.Status.Success, row.status)
-        assertTrue("英文素材应出字幕", subtitles().isNotEmpty())
+        assertEquals(35, subtitles().size)
     }
 
     /**
@@ -409,7 +407,7 @@ class TranscriptCoordinatorTest {
      */
     @Test
     fun 取消位为真时立刻停手且不写终态() = runBlocking {
-        val jobId = enqueueBook(fileUriOf(DeviceAsrFixtures.SILENT_MP3))
+        val jobId = enqueueBook(fileUriOf(DeviceAsrFixtures.SILENT_WAV))
 
         val outcome = coordinator().run(jobId, isCancelled = { true })
         assertTrue("没走取消支路：$outcome", outcome is TranscriptOutcome.Cancelled)

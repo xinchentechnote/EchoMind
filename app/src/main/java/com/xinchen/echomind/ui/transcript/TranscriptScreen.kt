@@ -17,7 +17,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -89,13 +88,17 @@ fun TranscriptScreen(
         topBar = { TopAppBar(title = { Text("转录") }) },
     ) { padding ->
         Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+            Text(
+                TranscriptDisplay.SCOPE_NOTE,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+            )
             state.pendingAudioId?.let { audioId ->
                 StartCard(
                     title = state.titles[audioId] ?: "这本书",
                     existing = state.existingAsr[audioId] ?: ExistingAsr.None,
                     busy = state.isBusy,
-                    selectedModel = state.modelChoice,
-                    onModelSelected = viewModel::onModelSelected,
                     onStart = { force ->
                         viewModel.transcribe(audioId, force)
                         viewModel.clearTarget()
@@ -144,8 +147,6 @@ private fun StartCard(
     title: String,
     existing: ExistingAsr,
     busy: Boolean,
-    selectedModel: ModelChoice,
-    onModelSelected: (ModelChoice) -> Unit,
     onStart: (force: Boolean) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -158,20 +159,6 @@ private fun StartCard(
                 style = MaterialTheme.typography.bodySmall,
                 modifier = Modifier.padding(top = 6.dp),
             )
-            Text(
-                "识别模型",
-                style = MaterialTheme.typography.labelMedium,
-                modifier = Modifier.padding(top = 8.dp),
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 4.dp)) {
-                ModelChoice.entries.forEach { choice ->
-                    FilterChip(
-                        selected = selectedModel == choice,
-                        onClick = { onModelSelected(choice) },
-                        label = { Text(choice.label) },
-                    )
-                }
-            }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 10.dp)) {
                 Button(onClick = { onStart(TranscriptDisplay.startNeedsForce(existing)) }, enabled = !busy) {
                     Text(TranscriptDisplay.startButtonLabel(existing))

@@ -16,9 +16,8 @@ import org.junit.runner.RunWith
 /**
  * WMA 解码与转码的设备端到端（D40）。
  *
- * 两条对照基准都来自宿主机：素材由自建 ffmpeg（wmav2 128k）转出；参考样本数由它解到 wav 数出来
- * （`DeviceAsrFixtures.REAL_WMA_REF_SAMPLES_44K`）。设备端的 libwma 与宿主机用的是同一份 6.1.1 解码器代码，
- * 所以「样本数对得上、不是静音」就是「解码正确」的强证据，不需要人耳。
+ * 素材是仓库 `test-data/` 里用户提供的 34 分钟中文书解 WMA。容器时长、设备解码后的 16 kHz 样本数、
+ * 转码产物时长三方必须对得上；再检查不是静音，避免“文件读完但没有音频”的假成功。
  */
 @RunWith(AndroidJUnit4::class)
 class WmaDecodeTest {
@@ -45,9 +44,9 @@ class WmaDecodeTest {
             "容器时长 ${summary.durationMs} 不在预期内",
             summary.durationMs in (DeviceAsrFixtures.REAL_WMA_DURATION_MS - 500)..(DeviceAsrFixtures.REAL_WMA_DURATION_MS + 500),
         )
-        val expected = DeviceAsrFixtures.REAL_WMA_REF_SAMPLES_44K * 16_000 / 44_100
+        val expected = summary.durationMs * 16_000 / 1_000
         assertTrue(
-            "16k 输出样本 ${summary.outputSamples} 偏离参考 $expected 超过容差",
+            "16k 输出样本 ${summary.outputSamples} 与容器时长换算值 $expected 偏离超过容差",
             Math.abs(summary.outputSamples - expected) < 4_000,
         )
         assertTrue("解出来是静音——解码没真正工作", firstChunk.single().any { it != 0f })
@@ -78,7 +77,10 @@ class WmaDecodeTest {
                 assertTrue("转码产物里没有音轨", format != null)
                 assertEquals("audio/mp4a-latm", format!!.getString(MediaFormat.KEY_MIME))
                 val containerMs = if (format.containsKey(MediaFormat.KEY_DURATION)) format.getLong(MediaFormat.KEY_DURATION) / 1000 else -1
-                assertTrue("产物时长 $containerMs 与源不符", containerMs in 147_000..150_000)
+                assertTrue(
+                    "产物时长 $containerMs 与源 $durationMs 不符",
+                    Math.abs(containerMs - durationMs) < 1_000,
+                )
                 Log.i(TAG, "转码产物：${output.length()} B，${format.getString(MediaFormat.KEY_MIME)}，${containerMs} ms")
             } finally {
                 extractor.release()

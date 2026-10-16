@@ -6,11 +6,13 @@ import android.util.Log
 import androidx.test.core.app.ApplicationProvider
 import com.xinchen.echomind.core.conf.AudioFormats
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import org.junit.Assert
 import org.junit.Assert.assertTrue
 
 /**
- * 设备上的真素材与真模型（**都由宿主机搬上来**，不是 App 从网上下的，见 `docs/testing.md` §4）。
+ * 设备上的真素材与真模型（真音频由宿主机搬上来；静音负例由测试确定性生成；见 `docs/testing.md` §4）。
  * 模型目录就是生产路径 `filesDir/models/<spec.id>/<fileName>`，所以 [ModelVerifier] 能原样核对。
  *
  * 摆放模型要用 `run-as`（先 `adb push` 到 `/data/local/tmp`，再 `run-as <pkg> cat` 进 filesDir）：
@@ -29,29 +31,26 @@ internal object DeviceAsrFixtures {
     /** 真人的歌（用户素材 `那些花儿.mp3`，44.1 kHz 立体声，148,303 ms，峰值 0.99）。静音占位素材不用。 */
     const val REAL_MP3 = "pcm-fixture-real.mp3"
 
-    /** 那批《三体》占位素材（帧体 99% 是 0x00，也就是**静音**）：只当「这段音频没有语音」的负例用 */
-    const val SILENT_MP3 = "pcm-fixture-01.mp3"
+    /**
+     * 10 秒静音 WAV：只当「这段音频没有语音」的负例用。由 [fixture] 在设备上确定性生成，
+     * 不再依赖早期那份已经丢失的《三体》占位 MP3。
+     */
+    const val SILENT_WAV = "pcm-fixture-silent.wav"
 
     /** [REAL_MP3] 的容器时长，宿主机数出来的（字幕时间越界检查要用它当上界） */
     const val REAL_MP3_DURATION_MS = 148_303L
 
-    /**
-     * 同一份真语音的 WMA 版（宿主机自建 ffmpeg `-c:a wmav2 -b:a 128k` 转出，wmav2 44.1kHz 双声道，148,637 ms）。
-     * WMA 解码走 `libwma`（D40），与 mp3 的 MediaCodec 路径互为对照。
-     */
+    /** 用户的 34 分钟中文书解 WMA（wmav2 44.1 kHz 双声道，仓库 `test-data/` 的真实世界素材）。 */
     const val REAL_WMA = "pcm-fixture-real.wma"
 
-    /** [REAL_WMA] 的容器时长（宿主机 ffmpeg 报告） */
-    const val REAL_WMA_DURATION_MS = 148_637L
+    /** [REAL_WMA] 的容器时长；设备 libwma 与导入转码器独立读出相同值。 */
+    const val REAL_WMA_DURATION_MS = 2_060_956L
 
-    /** 用户的 56 分钟中文书解 mp3（自动路由的 zh 探针素材） */
+    /** 用户的 56 分钟中文书解 mp3（中文识别质量打样素材） */
     const val USER_BOOK_MP3 = "user-test.mp3"
 
-    /** 英文 TTS 朗读书页（27.3 s，有标准答案，自动路由的 en 探针素材） */
+    /** 英文 TTS 朗读书页（27.3 s，有标准答案；仅保留给多语种模型打样，不是产品回归素材） */
     const val EN_TTS_WAV = "en-tts.wav"
-
-    /** 宿主机把 [REAL_WMA] 解到 wav 的样本数（26,214,400 B / 4 B），做设备端解码样本数的对照基准 */
-    const val REAL_WMA_REF_SAMPLES_44K = 6_553_600L
 
     private const val TAG = "DeviceAsrFixtures"
 
@@ -92,10 +91,38 @@ internal object DeviceAsrFixtures {
         val dir = context.getExternalFilesDir(FIXTURE_DIR)
             ?: error("设备上没有 external files 目录（getExternalFilesDir 返回 null）")
         val file = File(dir, name)
+        if (name == SILENT_WAV && !file.isFile) writeSilentWav(file)
         if (!file.isFile) {
             Assert.fail("缺少音频素材 ${file.path}：\n  adb -s emulator-5554 push <本机 mp3> ${file.path}")
         }
         return file
+    }
+
+    /** 16 kHz / mono / PCM16 LE；10 秒足够让 VAD 与解码器证明“有时长但没有语音”。 */
+    private fun writeSilentWav(file: File) {
+        val sampleRate = AudioFormats.ASR_SAMPLE_RATE
+        val dataBytes = sampleRate * 10 * Short.SIZE_BYTES
+        val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN).apply {
+            put("RIFF".toByteArray(Charsets.US_ASCII))
+            putInt(36 + dataBytes)
+            put("WAVE".toByteArray(Charsets.US_ASCII))
+            put("fmt ".toByteArray(Charsets.US_ASCII))
+            putInt(16)
+            putShort(1) // PCM
+            putShort(1) // mono
+            putInt(sampleRate)
+            putInt(sampleRate * Short.SIZE_BYTES)
+            putShort(Short.SIZE_BYTES.toShort())
+            putShort(16)
+            put("data".toByteArray(Charsets.US_ASCII))
+            putInt(dataBytes)
+        }.array()
+        file.parentFile?.mkdirs()
+        file.outputStream().buffered().use { output ->
+            output.write(header)
+            output.write(ByteArray(dataBytes))
+        }
+        Log.i(TAG, "生成静音负例 ${file.path}（${file.length()} B）")
     }
 
     /** 用真解码器解出前 [seconds] 秒的 16k 单声道 float（只用于秒级取样，整章转录走流式）。 */

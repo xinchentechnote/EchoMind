@@ -11,6 +11,9 @@ import com.xinchen.echomind.domain.model.TranscriptJobStatus
  */
 object TranscriptDisplay {
 
+    const val SCOPE_NOTE: String =
+        "当前只保证普通话听书/书解的字幕效果；英文音频与歌曲暂不保证识别质量。"
+
     fun statusLabel(status: TranscriptJobStatus): String = when (status) {
         TranscriptJobStatus.Queued -> "排队中"
         TranscriptJobStatus.Running -> "转录中"

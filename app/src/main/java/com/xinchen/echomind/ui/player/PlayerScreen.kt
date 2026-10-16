@@ -57,6 +57,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.xinchen.echomind.ui.common.formatDuration
 import com.xinchen.echomind.ui.common.formatListenDuration
+import com.xinchen.echomind.ui.transcript.TranscriptDisplay
 
 /**
  * 播放页（FR-302/303/308/309）。进度条、倍速、±15s 的步长全部读 [PlaybackPolicy]，
@@ -306,7 +307,8 @@ private fun SubtitleSection(
 
             summary.count == 0 -> {
                 Text(
-                    "还没有字幕。第一次播放会自动开始转录，识别出的句子会边转边出现在这里；任务管理在「转录」页。",
+                    "还没有字幕。第一次播放会自动开始转录，识别出的句子会边转边出现在这里。" +
+                        TranscriptDisplay.SCOPE_NOTE + "任务管理在「转录」页。",
                     style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.padding(top = 4.dp),
                 )

@@ -25,6 +25,14 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
+ * D42 后仅保留为多语种历史打样；标准产品回归通过 instrumentation 的
+ * `notAnnotation` 参数过滤。需要重跑选型时显式清掉该参数，并准备对应模型与素材。
+ */
+@Retention(AnnotationRetention.RUNTIME)
+@Target(AnnotationTarget.CLASS)
+annotation class MultilingualPilotOnly
+
+/**
  * Whisper 打样实测（D41 第一期）：不做产品断言，产出**选型数据**——
  * 1. 英文 TTS（有标准答案）→ 转写质量人工比对 + RTF；
  * 2. 用户的 56 分钟中文书解 mp3 前 120 s → 真实语音上的 RTF；
@@ -36,6 +44,7 @@ import org.junit.runner.RunWith
  * `result.tokens/timestamps/lang` 而不是经过 Mapper 的结果。模型缺文件时 fail 并给推送命令。
  */
 @RunWith(AndroidJUnit4::class)
+@MultilingualPilotOnly
 class WhisperPilotTest {
 
     private val context: Context = ApplicationProvider.getApplicationContext()

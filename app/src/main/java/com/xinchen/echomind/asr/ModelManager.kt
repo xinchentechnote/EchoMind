@@ -50,7 +50,7 @@ data class ModelStatus(
 /**
  * 模型的就位、校验、删除（FR-510/FR-511，`docs/asr-design.md` §7）。
  *
- * 产品路径是**模型内置**（FR-511，2026-10-15 定）：三个文件随 APK 的 `assets/models/` 发布，
+ * 产品路径是**模型内置**（FR-511，2026-10-15 定）：中文识别模型与 VAD 共三个文件随 APK 的 `assets/models/` 发布，
  * 启动时 [ensureProvisioned] 把缺的文件从 assets 拷进 `filesDir/models/` 并逐文件校验，
  * 用户删掉后可在设置页 [provision] 恢复——全程不需要网络。
  * [download]/[importFile] 保留为非产品路径（清单里仍有上游 URL 与来源记录；仪器化测试也用它们），

@@ -14,10 +14,14 @@ android {
         applicationId = "com.xinchen.echomind"
         minSdk = 26
         targetSdk = 36
-        versionCode = 2
-        versionName = "0.1.1"
+        versionCode = 3
+        versionName = "0.1.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        // D42 后多语种打样不属于产品回归。不能用 JUnit @Ignore：当前 AGP 9.4.1
+        // 会把 runner 的 ignored 事件错误写成空 failure；用 runner 过滤器让标准报告只统计正式用例。
+        testInstrumentationRunnerArguments["notAnnotation"] =
+            "com.xinchen.echomind.asr.MultilingualPilotOnly"
 
         // 只打 arm64-v8a：真机与本机模拟器 `emulator-5554` 的 ro.product.cpu.abi 实测都是 arm64-v8a，
         // 而 sherpa-onnx 的 x86_64 那份 so 未压缩就有 27.4 MB，留着只是白白让调试包翻倍。

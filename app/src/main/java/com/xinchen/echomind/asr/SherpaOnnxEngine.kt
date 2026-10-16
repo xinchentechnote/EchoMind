@@ -84,8 +84,8 @@ class SherpaOnnxEngine private constructor(
         /**
          * 核对模型文件 → 加载引擎。**会阻塞几秒**（Paraformer 实测装载 4,100 ms），调用方必须在后台线程。
          *
-         * [spec] 决定装配哪种 sherpa-onnx 模型配置：中文书解默认用清单里的 Paraformer（逐字时间戳），
-         * 英文/歌曲用 [ModelCatalog.whisperBase]（`enableTokenTimestamps = true`、`language = ""` 自动检测）。
+         * [spec] 决定装配哪种 sherpa-onnx 模型配置：产品路径固定使用 Paraformer（逐字时间戳）；
+         * Whisper/SenseVoice 分支只保留给设备选型测试，不从产品入口调用。
          * 核对走 [ModelVerifier]，也就是清单里那份 sha256，不接受「文件在就用」。
          */
         fun open(modelsRoot: File, spec: ModelSpec = ModelCatalog.paraformer): SherpaOnnxEngine {

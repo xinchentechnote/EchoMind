@@ -104,7 +104,7 @@ class TranscriptRepositoryTest {
     }
 
     @Test
-    fun 自动路由改写模型只许在QUEUED时() = runBlocking {
+    fun 推理前归一模型只许在QUEUED时() = runBlocking {
         val created = repo.enqueue("a", model) as EnqueueOutcome.Created
         assertTrue(repo.updateModel(created.jobId, TranscriptModelRef("sense-voice-zh-en-ja-ko-yue-int8", "abc123")))
         assertEquals("sense-voice-zh-en-ja-ko-yue-int8", job(created.jobId).modelId)

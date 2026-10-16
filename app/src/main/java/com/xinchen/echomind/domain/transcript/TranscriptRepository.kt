@@ -45,7 +45,7 @@ interface TranscriptRepository {
     suspend fun jobById(jobId: String): TranscriptJobRow?
 
     /**
-     * 自动路由的落笔：把行上的 model_id/version 从「auto」改写为语言判定后的最终模型。
+     * 在开始推理前归一任务的模型身份；当前用于把升级前遗留的 auto/多语种排队行改成中文听书模型。
      * 只对该行还是 QUEUED 时有效（返回 false = 已经在跑/已结束，不许改）。
      */
     suspend fun updateModel(jobId: String, model: TranscriptModelRef): Boolean

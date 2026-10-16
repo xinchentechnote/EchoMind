@@ -29,9 +29,8 @@ import org.junit.runner.RunWith
  * `READ_MEDIA_AUDIO` 更干净）。缺素材时**直接 fail 并打印放文件的命令**，不用 `assumeTrue`
  * 静默跳过——跳过的测试等于没有测试，而这里失败只说明「机器上没放素材」，一眼能看懂。
  *
- * 这批用例顺手挖出一件要紧事：Phase 3~5 用的那几份「《三体》」素材**是静音的**（帧体 99% 为
- * 0x00，宿主机逐字节数出来的）。书架、时长、进度、倍速、切歌那些结论不受影响（它们只看得到
- * 长度），但**音频内容从来没在设备上被验证过**，转录精度更不可能拿静音素材去测。
+ * 早期这批用例曾发现 Phase 3~5 的「《三体》」素材其实是静音占位。现在静音反例改成测试自己生成的
+ * 10 秒 PCM WAV：不依赖已丢失的外部文件，仍与真人语音形成正反对照。
  */
 @RunWith(AndroidJUnit4::class)
 class PcmDecoderTest {
@@ -42,6 +41,9 @@ class PcmDecoderTest {
         context.getExternalFilesDir(FIXTURE_DIR) ?: File(context.filesDir, FIXTURE_DIR).also { it.mkdirs() }
 
     private fun fixture(name: String): File {
+        if (name == DeviceAsrFixtures.SILENT_WAV) {
+            return DeviceAsrFixtures.fixture(name, context)
+        }
         val file = File(fixtureDir(), name)
         if (!file.exists() || file.length() == 0L) {
             fail(
@@ -150,14 +152,14 @@ class PcmDecoderTest {
     }
 
     /**
-     * 反向对照：书架那批老素材**本身就是静音**（帧体 99% 是 0x00，宿主机逐字节数出来的），
-     * 解出全零是正确行为。这条存在有两个理由：
+     * 反向对照：测试确定性生成的 10 秒 PCM WAV **本身就是静音**，解出全零是正确行为。
+     * 这条存在有两个理由：
      * 1. 证明「peak=0」来自文件内容，不是解码链路把数据洗平了——真素材那条同时给出非零峰值。
      * 2. 长度对账与块连续性在两份素材上都要成立；静音文件的解码耗时也是有效样本（RTF 不靠内容）。
      */
     @Test
     fun `静音素材解出全零但长度照样对得上`() {
-        val run = run(FIXTURE_SILENT)
+        val run = run(DeviceAsrFixtures.SILENT_WAV)
         assertEquals(0f, run.probe.peak, 0f)
         assertEquals(0.0, run.probe.rms(), 0.0)
         assertEquals(-1L, run.probe.contiguityBroken)
@@ -202,8 +204,6 @@ class PcmDecoderTest {
         /** 真音频：2.38 MB 的一首歌（帧体只有 1.4% 是 0x00）。有版权，不入库，靠 adb push */
         const val FIXTURE_REAL = "pcm-fixture-real.mp3"
 
-        /** 书架那批老素材：字节流 99% 是 0，也就是**静音**。留作反向对照 */
-        const val FIXTURE_SILENT = "pcm-fixture-01.mp3"
         const val CANCEL_BLOCK_SIZE = 1_024
     }
 }

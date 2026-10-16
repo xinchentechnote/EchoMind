@@ -76,7 +76,7 @@ interface TranscriptJobDao {
     suspend fun updateProgress(id: String, doneSegments: Int, totalSegments: Int): Int
 
     /**
-     * 自动路由的落笔：把「auto」改写成最终选用的模型（语言判定在装载引擎前完成）。
+     * 推理前归一模型身份：当前把升级前遗留的 auto/多语种任务改为中文听书模型。
      * 只许改 QUEUED 的行——开始跑之后再换模型等于篡改历史。
      */
     @Query(

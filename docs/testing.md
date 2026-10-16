@@ -465,8 +465,9 @@ FR-707（只在当前句变化时更新）用**设备 + 单测两头**取证：�
 
 - **还没有生产调用方**：`VadSegmenter`/`SherpaOnnxEngine`/`TokenTimingMapper` 只被测试调用，`AppGraph` 里没有它们，
   `transcript_job` 表与 `TranscriptCoordinator` 还没写 → **「点一下就能转录并出字幕」仍未交付**（Phase 6 第 4、6 项）。
-- **识别文本没做人工抽查**：素材是歌曲《那些花儿》，本轮只证明了「时间落在块内、跨块单调、RTF 可行」，
-  **没有**对 10 处字幕做时间对齐误差抽查（FR-506 要求 ±ms 分布）。需要一段真中文书解才能测精度，机器上仍然没有。
+- **识别文本没做人工抽查**：这一个历史阶段的素材是歌曲《那些花儿》，当时只证明了「时间落在块内、跨块单调、RTF 可行」，
+  **没有**对 10 处字幕做时间对齐误差抽查（FR-506 要求 ±ms 分布）。真实中文书解后来已补（见本节 2026-10-17 收口记录），
+  但逐字稿与 10 处人耳时间误差至今仍缺。
 - **只测了 60 s 内的音频**：一小时书的峰值内存、`filesDir/models` 被 `ModelManager.delete()` 之后的重下载路径、
   推理中途取消，都没有覆盖。
 - **模型是 `adb` 搬上去的**：`model.int8.onnx` 与 `silero_vad.onnx` 至今没在设备上通过 HTTP 取回过（GitHub 不通、243 MB 走 hf-mirror 未测）。
@@ -778,8 +779,8 @@ PTS 锚定作为「构造上保证字幕时间轴 = 播放时钟」的加固保�
 
 ### 多语种识别打样（whisper vs SenseVoice，D41，2026-10-16 21:00 ~ 21:25）
 
-新增：`ModelKind`（PARAFORMER/WHISPER/SENSEVOICE）+ `ModelCatalog.whisperBase`（**不进下载列表**）与
-`ModelCatalog.senseVoice`（进列表，哈希钉住）+ `SherpaOnnxEngine.open(modelsRoot, spec)` 工厂按 kind 装配
+当时新增：`ModelKind`（PARAFORMER/WHISPER/SENSEVOICE）+ `ModelCatalog.whisperBase`（**不进下载列表**）与
+`ModelCatalog.senseVoice`（当时进列表并钉住哈希；D42 后退出产品清单）+ `SherpaOnnxEngine.open(modelsRoot, spec)` 工厂按 kind 装配
 （whisper：language="" 自动检测 + enableTokenTimestamps；sense-voice：language="" + ITN）+
 仪器化 `WhisperPilotTest`（英文 TTS 标准答案对照 / 用户书解 RTF / 全曲歌词 / token↔timestamp 形状）。
 
@@ -797,7 +798,7 @@ PTS 锚定作为「构造上保证字幕时间轴 = 播放时钟」的加固保�
 构建与测试：JVM 259 → **260 全绿**（catalog 钉子同步）；仪器化打样 4 条（2 条 whisper + 2 条 SenseVoice，属
 `WhisperPilotTest`，未计入正式套件——它是选型测量不是产品回归）。
 
-### 第二期：多语种产品化（模型选择 UI + 自动路由 + 切句英文适配，2026-10-16 21:30 ~ 23:55）
+### 历史尝试：多语种产品化（2026-10-16；已由 D42 回退）
 
 生产改动：①转录确认卡片加**模型选择 chips**（自动识别/中文书解/英文·歌曲，`ModelChoice.toRef()` 映射到
 AUTO/Paraformer/SenseVoice 引用）；②协调器自动路由——任务记 `auto` 时用 SenseVoice 听开头 30 s，
@@ -824,6 +825,45 @@ Love Story 开头 15 s 是钢琴前奏，SenseVoice 前 30 s 解不出文字，�
 - 英文真实书解素材仍缺（test-data 只有中文书解 + 英文歌；英文 News TTS 已造，端到端走的是英文歌）；
 - SenseVoice 器乐幻觉句（「嗯。」@198 ms）未被质量闸门拦住（占比极低），短期接受；
 - whisper 翻案路径（自建导出加 attention 输出）仍未做。
+
+### 产品范围收口：只保证普通话听书/书解（2026-10-17）
+
+上一节的多语种结果保留为**历史打样证据**，不再代表当前产品能力。复核发现旧实现只有“汉字/拉丁字符”二路路由，
+没有听书/歌曲分类；同时首次播放入口仍固定使用 Paraformer，且自动路由的验收只检查模型选择与非空字幕，没有
+CER/WER 或器乐幻觉门槛。按 D42 收口：删除模型选择 UI、`ModelRouting` 与 30 秒探针；首次播放、手动发起、
+失败重试统一使用 Paraformer；产品模型清单只保留 Paraformer + Silero VAD；升级前排队中的 `auto`/SenseVoice
+任务由协调器在推理前改写成真实执行的 Paraformer。英文与歌曲恢复前必须建立四类真实回归集并量化验收。
+
+**本轮最终验证（同日，`emulator-5554` / API 36 / arm64）**：
+
+- `:app:assembleDebug`：`BUILD SUCCESSFUL`；`assembleDebug + assembleDebugAndroidTest` 同样成功。
+- `:app:testDebugUnitTest --rerun-tasks`：`BUILD SUCCESSFUL in 7s`，26 个任务全部执行；XML 汇总
+  **263 / 0 failures / 0 errors / 0 skipped**。
+- 中文听书真实素材回归：用户的 56.2 分钟 MP3 取前 120.064 s，生产同款链路产出 **32 个语音段 / 32 块 /
+  481 token / 18 句**；汉字占比 **99.4%**、平均每句 **26.8 字**，token 与句级时间单调，字幕不重叠、不越界，
+  切句正文与模型 token 一致。测试耗时 5.013 s（识别 wall 1.680 s；仅作本机样本，不当性能承诺）。
+  ⚠ 没有人工逐字稿，所以本轮**没有 CER 数字**；也没有完成 10 处人耳时间误差抽查。
+- 正式设备套件用不清数据的 `am instrument -e package com.xinchen.echomind` 执行：**OK (111 tests)**，
+  `Time: 154.416`。静音负例改成测试生成的
+  10 秒 PCM WAV；WMA 两条改用仓库现有的 34:20.956 中文书解真实素材，解码/样本数/转码产物三方对账通过。
+- 按规范也实际执行了 `:app:connectedDebugAndroidTest`：第一次结果 **117 tests / 12 failures**。XML 逐条确认：
+  6 条是尚未 `@Ignore` 的历史 Whisper/SenseVoice 打样缺非产品模型，4 条缺早期静音 MP3，2 条把仓库 34 分钟 WMA
+  误套旧 148 秒 fixture 基线；其余 **105 条通过**，其中本轮中文听书、两条旧任务归一与仓储守卫均通过。
+  修正测试归属与夹具后采用项目既定的不清数据跑法得到上一条 **111 全绿**；没有把这次标准命令失败写成成功。
+- 修复夹具后最终重跑标准命令 `./gradlew :app:connectedDebugAndroidTest`：**BUILD SUCCESSFUL in 2m 37s**；
+  XML 汇总 **111 tests / 0 failures / 0 errors / 0 skipped**。中文听书回归 1 条（4.911 s）与 WMA 2 条
+  （101.597 s）都通过。D42 已退出产品的 `WhisperPilotTest` 以运行时注解从标准产品套件过滤，不计入这 111 条；
+  它需要的 Whisper/SenseVoice 权重不进产品 APK，未来恢复多语种选型时再显式启用。曾尝试 JUnit `@Ignore`，
+  Android runner 虽报告 ignored，但 AGP 9.4.1 会把它们错误转换为空 failure；因此不把错误 XML 冒充 skipped。
+- UI 实测：安装 → 启动 → 转录页 `uiautomator dump`（确认含 `</hierarchy>`）→ 截图。页面显示
+  “当前只保证普通话听书/书解……英文音频与歌曲暂不保证”，且层级树中不存在“自动识别 / 中文书解 / 英文·歌曲”
+  选择项；设置页只显示 **Paraformer 中文离线 + Silero VAD** 两包并均为“已就绪”，无 SenseVoice/Whisper。
+  截图：`/tmp/echomind_transcript_scope.png`、`/tmp/echomind_settings_models.png`。
+- 发布构建 `v0.1.2`：`versionCode=3`；`:app:assembleDebug :app:testDebugUnitTest --rerun-tasks`
+  **BUILD SUCCESSFUL in 13s**（44 个任务全部执行），JVM XML 仍为 **263 / 0 / 0 / 0**。APK 内嵌版本经
+  `apkanalyzer` 复核为 `0.1.2 (3)`，大小 **268,578,686 B**，debug 证书 SHA-256
+  `b4f304ace4b3e211e31886f6a6d4b94147dfad7d650f9304b2b57f767871e3d6`，APK SHA-256
+  `7fddc2871e21de294464f58b61fbf0195847d85a31d6d212e1e3d30f37008b06`。
 
 ## 5. 待补的自动化测试清单（按阶段）
 

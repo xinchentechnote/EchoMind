@@ -19,6 +19,15 @@ import org.junit.Test
  */
 class TranscriptDisplayTest {
 
+    @Test
+    fun `产品范围只承诺普通话听书并明确排除未达标内容`() {
+        val note = TranscriptDisplay.SCOPE_NOTE
+        assertTrue(note, note.contains("普通话听书"))
+        assertTrue(note, note.contains("英文"))
+        assertTrue(note, note.contains("歌曲"))
+        assertTrue(note, note.contains("暂不保证"))
+    }
+
     private fun row(
         status: TranscriptJobStatus,
         totalSegments: Int = 0,

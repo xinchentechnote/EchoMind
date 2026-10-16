@@ -81,9 +81,9 @@ class ModelCatalogTest {
     fun `没有官方校验值的文件名单是封闭的且都本机钉住`() {
         // 名单是**封闭**的：新增模型带非官方校验值时这里要连着改，防止「来源不明」的文件混进来（AGENTS.md §5）
         val withoutOfficial = ModelCatalog.all.flatMap { it.files }.filterNot { it.hasOfficialChecksum }
-        // whisperBase 不进 all → 其三份非官方校验值文件也退出这份名单
+        // 多语种打样模型不进产品清单 → 其非官方校验值文件也退出这份名单
         assertEquals(
-            listOf("tokens.txt", "model.int8.onnx", "tokens.txt"),
+            listOf("tokens.txt"),
             withoutOfficial.map { it.fileName },
         )
         withoutOfficial.forEach { file ->
@@ -103,6 +103,17 @@ class ModelCatalogTest {
     }
 
     @Test
+    fun `产品只管理普通话书解所需的识别模型与vad`() {
+        assertEquals(
+            "英文与歌曲模型只保留打样记录，不得出现在产品模型页或启动就位流程",
+            listOf(ModelCatalog.paraformer, ModelCatalog.sileroVad),
+            ModelCatalog.all,
+        )
+        assertEquals(ModelCatalog.PARAFORMER_ID, ModelCatalog.transcriptRef.id)
+        assertEquals(ModelCatalog.refOf(ModelCatalog.paraformer), ModelCatalog.transcriptRef)
+    }
+
+    @Test
     fun `whisper是多语种识别模型且时间戳开关打开`() {
         val whisper = ModelCatalog.whisperBase
         assertEquals(ModelKind.WHISPER, whisper.kind)
@@ -119,9 +130,9 @@ class ModelCatalogTest {
         val ids = ModelCatalog.all.map { it.id }
         assertEquals(ids.size, ids.toSet().size)
         assertEquals(ModelCatalog.sileroVad, ModelCatalog.byId(ModelCatalog.SILERO_VAD_ID))
-        // whisperBase 不进 all（D41：无 token 时间戳，出不了字幕）；下载列表 = 三件
+        // 多语种模型只保留打样，不进产品清单；产品清单只有中文 Paraformer + VAD 两包。
         assertEquals(
-            listOf(ModelCatalog.paraformer, ModelCatalog.sileroVad, ModelCatalog.senseVoice),
+            listOf(ModelCatalog.paraformer, ModelCatalog.sileroVad),
             ModelCatalog.all,
         )
     }

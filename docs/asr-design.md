@@ -1,5 +1,9 @@
 # 本地 ASR 设计（asr-design）
 
+> **当前产品范围（2026-10-17，D42）**：只保证普通话听书/书解，生产转录固定使用
+> `paraformer-zh-2023-09-14-int8`。英文与歌曲的 SenseVoice/Whisper 内容是历史打样，未达到产品验收，
+> 不进入模型页、启动就位或转录入口。
+
 > 本文的**每一条外部事实都标了来源 URL 与「实测确证 / 存疑」状态**（调研于 2026-10-14 在本机网络环境完成）。
 > 需求文档 FR-510「不得虚构下载地址或校验值」以本文为执行依据。
 
@@ -102,9 +106,8 @@
 ```
 ModelManager                              ← 清单/下载/导入/SHA-256 校验/删除/状态 Flow   ✅ DONE（设备真 URL 验证过，见 §7）
 PcmDecoder                                ← MediaExtractor + MediaCodec（同步模式）流式解码   ✅ DONE + 4 条仪器化（真 MP3 已在设备解出）
-   ─ 多语种扩展（2026-10-16，D41）：识别模型不再只有 Paraformer——SenseVoice int8（中英日韩粤，
-     226 MB，带时间戳）进清单供英文听书/中英听歌；whisper base 实测英文质量最高但 sherpa 导出
-     无 attention 权重、拿不到时间戳，不进下载清单（spec 保留供打样）。引擎工厂按 ModelSpec.kind 装配。
+   ─ 多语种打样（2026-10-16，D41；2026-10-17 由 D42 退出产品）：SenseVoice int8 与 whisper base
+     的 spec、引擎装配和设备打样保留；二者不进产品清单。生产只装载 Paraformer。
 domain/asr/PcmConversion                  ← 16-bit LE PCM 字节 → 单声道 float（均值下混）  ✅ DONE + 11 条 JVM 单测
 domain/asr/SincResampler                  ← 源采样率 → 16 kHz 的抗混叠流式重采样            ✅ DONE + 12 条 JVM 单测
 asr/VadSegmenter                          ← silero VAD：float 块 → VadUtterance（全局样本起点 + 该段音频） ✅ DONE + 6 条仪器化（真模型真音频）
@@ -354,12 +357,12 @@ Phase 6d 之后这些行为有了**设备证据**（人工从界面点出来：�
    三份文件在 2026-10-15 由 `adb push` + `run-as` 搬进 `filesDir/models/<id>/` 并用 `ModelVerifier` 在设备侧核对通过（大小 + SHA-256 逐项一致），
    **推理用的就是那份搬运来的文件**——所以「设备能自己下模型」这件事仍然没有证据，只有 `tokens.txt` 一条有。
 4. 准备真实素材：一段 3–10 分钟中文书解 MP3（本机自行生成或用用户提供的样本），跑转录，人工抽查 10 处字幕时间对齐误差（记录 ±ms 分布）。
-   **部分完成（2026-10-15）**：**整本跑通了**（148 s 真人演唱《那些花儿》→ 24 段 → 24 块 → 35 句 → 全部落库，§5 第 6~7 步有数字），
-   但**人工抽查时间对齐误差这一条没做**，因为素材是歌唱、不是书解：歌词与字幕内容能逐字对上（用例里就是这么断言的），
-   「这句该在几秒」需要人耳判断，而歌唱的对齐结论搬不到朗读上。
-   另外 `/sdcard/Music/EchoMind/` 那批「《三体》」素材经逐字节核对是**静音占位 MP3**（帧体 99% 为 0x00），
-   宿主机也没有 MP3 编码器（无 ffmpeg/lame/sox），所以**朗读型真实语音要么由用户提供，要么等 App 能录音**。
-   在此之前**转录精度（字错率、时间对齐 ±ms）无从测量，不要声称测过**。静音那批现在只当负例用（`FAILED(OUTPUT_UNRELIABLE)` 那条用例）。
+   **部分完成（2026-10-17）**：用户真实中文书解已经进入正式设备回归，`ChineseAudiobookRegressionTest` 取前 120.064 s
+   走生产同款 `PcmDecoder → Silero VAD → Paraformer → SentenceSplitter`，稳定产出 **32 段 / 32 块 / 481 个带时间 token / 18 句**，
+   汉字占有效字符 **99.4%**、平均每句 **26.8 字**，时间单调且句间不重叠；切句后的正文与模型 token 摘除展示标点后逐字相等。
+   这证明正式链路对真实普通话书解能产出可读的中文句级字幕，**不等于 CER 已达标**：素材还没有人工逐字稿，
+   也仍未完成人耳抽查 10 处时间对齐误差。拿到参考稿后要在同一时间窗补 CER 与 ±ms 分布，之前不得声称准确率百分比。
+   静音负例现由测试生成 10 秒 PCM WAV，继续守住“无语音 → `FAILED(OUTPUT_UNRELIABLE)`，不得伪造字幕”。
 5. 仪器化测试覆盖「分段偏移合并」「切句」「重转替换」「任务取消/重试」，JVM 单测覆盖纯逻辑。
    **DONE（2026-10-15）**：偏移合并 = `SherpaOnnxEngineTest`（跨块时间单调）+ `TranscriptCoordinatorTest`（端到端首次入库）；
    切句 = 25 条 JVM + 1 条设备端到端用例；重转替换 = `TranscriptRepositoryTest`（整本替换 + 重复结算回滚）；
@@ -407,8 +410,8 @@ Phase 6d 之后这些行为有了**设备证据**（人工从界面点出来：�
   贪心喂入/非阻塞排空，`PcmConversion` 均值下混 → `SincResampler` → `BlockAccumulator` 定长块回调）+
   `androidTest/asr/PcmDecoderTest.kt` 4 条，在 emulator-5554 上真解过 148 秒 MP3：44100 Hz/2 声道、单缓冲 ≤4,608 B、
   样本数与容器时长偏差 0.22%、`peak=0.659`、取消只交付 3 块、非音频文件抛人话异常（数字见 `docs/testing.md` §4）。
-  **本轮顺带挖出一件影响后续的事**：Phase 3~5 一直在用的那批「《三体》」素材帧体 99% 是 `0x00`，也就是**静音占位 MP3**，
-  所以「音频内容」到今天才第一次被真正验证过；转录精度需要**真人语音**素材，机器上目前只有歌曲与静音占位。
+  **当时顺带挖出一件影响后续的事**：Phase 3~5 一直在用的那批「《三体》」素材帧体 99% 是 `0x00`，也就是**静音占位 MP3**，
+  所以那一阶段「音频内容」才第一次被真正验证过；这项素材缺口已在 2026-10-17 用用户真实中文书解补上（见 §9 第 4 项）。
 - **模型管理这层的设备侧状态（2026-10-15 更新）**：`AndroidManifest` 现在有 `INTERNET` 权限（**之前漏了**，那 35 条单测全绿也发现不了），
   `androidTest/asr/ModelManagerNetworkTest.kt` 用清单里真实的 hf-mirror URL 在 emulator-5554 上下过 `tokens.txt` 并独立复算 sha256（4/4 通过）。
   仍然空白的三块：243 MB 的 int8 模型没从设备取回过；`silero_vad.onnx`（GitHub 单源）本机与设备**都**连不上、一次都没取回过；

@@ -90,12 +90,6 @@ object ModelCatalog {
     const val SENSEVOICE_MODEL_FILE = "model.int8.onnx"
     const val SENSEVOICE_TOKENS_FILE = "tokens.txt"
 
-    /**
-     * 「自动选模型」的哨兵 id：任务行先记它，协调器在装载引擎前用 SenseVoice 听开头 30 s 判语言，
-     * 再把行上的 model_id/version 改写为最终模型（zh/yue → Paraformer，其余 → SenseVoice，D41/ModelRouting）。
-     */
-    const val AUTO_MODEL_ID = "auto"
-
     private const val HF_MIRROR = "https://hf-mirror.com/csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14/resolve/main"
     private const val HUGGINGFACE = "https://huggingface.co/csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14/resolve/main"
 
@@ -186,7 +180,8 @@ object ModelCatalog {
     )
 
     /**
-     * SenseVoice 多语种（2025-09-09 版：中英日韩粤 + 时间戳；英文书解/中英歌曲候选，D41）。
+     * SenseVoice 多语种打样模型（2025-09-09 版：中英日韩粤 + 时间戳，D41）。
+     * ⚠ 只保留给设备选型测试，不在 [all]，不进入产品模型页、启动就位或转录入口。
      * 哈希为本机下载实测值（hf-mirror，2026-10-16）；官方未发布校验值 → 本机钉住。
      */
     val senseVoice: ModelSpec = ModelSpec(
@@ -218,7 +213,11 @@ object ModelCatalog {
         ),
     )
 
-    val all: List<ModelSpec> = listOf(paraformer, sileroVad, senseVoice)
+    /**
+     * 产品实际管理的模型包。当前产品范围只保证普通话听书/书解：
+     * Paraformer 负责识别，Silero VAD 负责语音段切分。多语种模型只保留打样 spec，不进入这里。
+     */
+    val all: List<ModelSpec> = listOf(paraformer, sileroVad)
 
     /**
      * 当前识别模型的身份，写进 `transcript_job` 的 `model_id` / `model_version`。
@@ -247,11 +246,4 @@ object ModelCatalog {
         return TranscriptModelRef(id = spec.id, version = weight.expectedSha256.take(12))
     }
 
-    /** 各识别模型的语言路由（ModelRouting 的判定结果落到这里） */
-    fun specForFinal(ref: TranscriptModelRef): ModelSpec = when (ref.id) {
-        PARAFORMER_ID -> paraformer
-        WHISPER_BASE_ID -> whisperBase
-        SENSEVOICE_ID -> senseVoice
-        else -> throw IllegalArgumentException("模型清单里没有 id=${ref.id}")
-    }
 }
