@@ -52,8 +52,8 @@ class AudioTreeWalkerTest {
 
     @Test
     fun `生产白名单的格式全部收进来且大小写不敏感`() {
-        // 白名单扩展（放开 m4a/aac/flac/wav）走的是同一条 walker 判定，这里用**真实清单**钉住：
-        // 大写扩展名照收，白名单之外的 wma/ogg（未实测/无解码器）照丢
+        // 白名单扩展（放开 m4a/aac/flac/wav/wma）走的是同一条 walker 判定，这里用**真实清单**钉住：
+        // 大写扩展名照收，白名单之外的 ogg（缺测试素材未实测）照丢
         val tree = mapOf(
             "root" to listOf(
                 file("a.mp3", "root/a.mp3"), file("b.m4a", "root/b.m4a"), file("c.aac", "root/c.aac"),
@@ -63,7 +63,7 @@ class AudioTreeWalkerTest {
         )
         val walker = AudioTreeWalker(FakeBrowser(tree), AudioFormats.SUPPORTED_EXTENSIONS)
         assertEquals(
-            listOf("a.mp3", "b.m4a", "c.aac", "d.flac", "e.wav", "f.WAV"),
+            listOf("a.mp3", "b.m4a", "c.aac", "d.flac", "e.wav", "f.WAV", "g.wma"),
             walker.walk("root").files.map { it.fileName },
         )
     }

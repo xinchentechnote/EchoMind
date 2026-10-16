@@ -239,19 +239,24 @@ CI **不覆盖**：仪器化测试（没有模拟器）、真机验证、ASR 端
 - **7**：设置页其余条目（字号/深浅色/重算统计/按文件夹重新授权——模型节已由 6e/6f 交付）、错误与降级文案、~~离线（飞行模式）验收~~（模型路径已在 6f 飞行模式实测过；剩「飞行模式下播放 + 转录全链路」一遍）、性能与内存实测、迷你播放条、行内重命名、文档回填。
 
 
-## 音频格式支持（2026-10-16）
+## 音频格式支持（2026-10-16 两轮）
 
-**白名单扩到 `mp3 / m4a / aac / flac / wav`**（`core/conf/AudioFormats` 唯一处）。原则不变：**只放实测过的格式**。
-素材用 macOS 自带 `afconvert` 从同一份 148 s 真语音转出（m4a=AAC 128k、flac、wav=PCM 16bit），三种格式在 `emulator-5554` 上
-各走了一遍完整链路：重扫入库（时长全部读出）→ 首播自动转录 → 任务 SUCCESS、38 句 `source=ASR` 落库、书 READY
-（句数与 mp3 的 35 句不同是 VAD 分段随解码样本浮动的正常现象）。
+**白名单 = `mp3 / m4a / aac / flac / wav / wma`**（`core/conf/AudioFormats` 唯一处）。原则不变：**只放实测过的格式**。
 
-**不放行与理由**（证据都在 `asr/DeviceCodecProbeTest`，它枚举设备解码器清单并断言）：
-- `wma`：**AOSP 没有 WMA 解码器**（本机 39 个解码器的可解类型里没有 `x-ms-wma`，测试断言钉住）。支持 WMA 只能引入
-  FFmpeg 量级的第三方解码框架——按 AGENTS.md §3，这需要先立决策（体积 +30~50 MB 的 .so、ABI 矩阵、LGPL 授权）
-  再动手，本轮不擅自引入。要支持时：引框架 → `PcmDecoder` 加一条框架解码支路 → 白名单加词 → 端到端实测。
-- `ogg`/`opus`：探针证实 `audio/vorbis`/`audio/opus` 解码器**存在**，唯一缺的是本机测试素材（`afconvert` 不支持
-  vorbis 容器）。素材到位后放行只是白名单加两个词 + 端到端复测。
+**第一轮（同日早些）**：`m4a/aac/flac/wav`——素材用 macOS 自带 `afconvert` 从同一份 148 s 真语音转出，三种格式在
+`emulator-5554` 上各走完整链路：重扫入库（时长全读出）→ 首播自动转录 → SUCCESS、38 句、READY。
+
+**第二轮（同日，用户拍板引入 FFmpeg，D40）**：`wma`——系统无 WMA 解码器（探针为证），自建 **libwma.so**（1,073,288 B，
+FFmpeg 6.1.1 `--disable-everything --enable-decoder=wmav1,wmav2 --enable-demuxer=asf --enable-pic` + JNI 壳 `wma_jni.c`，
+`-Wl,-Bsymbolic` 解 NEON 汇编的库内绑定；LGPL-2.1-or-later；不入仓库，release 资产哈希钉住，CI 取回）。
+两条路径：**导入时经 libwma 转码成 m4a**（ExoPlayer 播转码产物；转码器回报真实时长），**转录由 libwma 直接解码**
+（`WmaPcmDecoder` 与 `PcmDecoder` 输出契约一致，SAF 输入用自定义 AVIO 在 fd 上读/seek——`/proc/self/fd` 路径在
+scoped storage 下会被拒，实测踩过）。设备端到端：入库（时长 148,636 ms 来自转码器）→ 首播自动转录 →
+SUCCESS、26 段 42 句、READY，播放位置持续推进。解码正确性对照：设备解出的 16k 样本数 2,377,724 vs 宿主机同解码器
+参考 2,377,723（差 1，重采样取整）。
+
+**仍不放行**：`ogg`/`opus`——探针证实 `audio/vorbis`/`audio/opus` 解码器**存在**，唯一缺的是本机测试素材
+（`afconvert` 不支持 vorbis 容器）。素材到位后放行只是白名单加两个词 + 端到端复测。
 
 ## 后续（MVP 之后，按价值排序）
 

@@ -237,7 +237,7 @@ class PcmDecoder(
     }.getOrDefault(-1L)
 
     /** 把 float 流切成固定上限的块交给 sink；[stopped] 一旦置真就不再推进计数，绝对起始样本因此始终正确。 */
-    private class BlockAccumulator(val blockSize: Int) {
+    internal class BlockAccumulator(val blockSize: Int) {
         private val buffer = FloatArray(blockSize)
         private var filled = 0
         var deliveredSamples = 0L

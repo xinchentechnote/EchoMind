@@ -12,10 +12,11 @@ object AudioFormats {
      * 刻意**不在**白名单里：
      * - `ogg` / `opus`：`DeviceCodecProbeTest` 探针确认设备上 `audio/vorbis` / `audio/opus` 解码器**存在**，
      *   缺的只是本机能产出的测试素材（`afconvert` 不支持 vorbis 容器）——素材到位后加两个词即可放行。
-     * - `wma`：Android（AOSP）**没有 WMA 解码器**——`asr/DeviceCodecProbeTest` 在设备上枚举解码器清单为证；
-     *   支持它必须引入 FFmpeg 量级的第三方解码框架，按 AGENTS.md §3 得先证明系统能力不足（已证）并立决策记录后才能动手。
+     * - `wma`（2026-10-16 放行，D40）：系统确实没有 WMA 解码器（探针为证），所以走**自建 libwma**
+     *   （FFmpeg 6.1.1 最小裁剪，LGPL）——导入时转码成 m4a 供播放，转录直接用 libwma 解码。
+     *   放行前提齐了：系统能力不足已证 → 决策已立（D40）→ 端到端实测。
      */
-    val SUPPORTED_EXTENSIONS: Set<String> = setOf("mp3", "m4a", "aac", "flac", "wav")
+    val SUPPORTED_EXTENSIONS: Set<String> = setOf("mp3", "m4a", "aac", "flac", "wav", "wma")
 
     /** ASR 侧统一采样率；sherpa-onnx 内部会重采样，但 VAD 要求 16k（docs/asr-design.md §1-A8） */
     const val ASR_SAMPLE_RATE: Int = 16_000

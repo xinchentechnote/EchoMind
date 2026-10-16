@@ -710,6 +710,35 @@ FR-707（只在当前句变化时更新）用**设备 + 单测两头**取证：�
 教训：链式命令里 gradle 的 BUILD 状态必须在 install 之前显式检查。②写 WMA 探针查的是「解码器枚举」而不是造 wma 文件试
 MediaExtractor——前者是能力的直接证据，后者只证明容器解析失败，混起来会得出「能/不能」的假结论。
 
+### WMA 支持（libwma + 导入转码 + 解码转录，D40，2026-10-16 19:00 ~ 19:30）
+
+生产改动：`app/libs/wma-jni/arm64-v8a/libwma.so`（自建，哈希钉住）+ `cpp/wma_jni.c` JNI 壳 + `asr/WmaJni/WmaPcmDecoder/WmaTranscoder`
++ `data/repo/WmaPlaybackStore`（路径约定）+ 导入编排 WMA 钩子（NEW/CHANGED 都转码，失败跳过该本并打日志）+
+播放队列 URI 换路 + `removeBook` 清转码产物 + 白名单加 `wma`。构建检查：缺 so/大小不符直接 GradleException。
+
+| 验收点 | 结果 | 凭据 |
+| --- | --- | --- |
+| 解码正确性（对照宿主机） | `WmaPcmDecoder` 解 148 s wma：44100 Hz/双声道/时长 148,637 ms，16k 输出 **2,377,724 样本 vs 宿主机同解码器参考 2,377,723（差 1，重采样取整）**，非静音 | `WmaDecodeTest` `OK (2 tests)` + logcat |
+| 转码产物可读 | `WmaTranscoder` 产 m4a：MediaExtractor 读出 `audio/mp4a-latm`、时长 147~150 s 窗口内 | 同上第 2 条 |
+| 导入转码 | SAF 文件夹放 .wma → 重扫入库：时长 148,636 ms（**来自转码器**，Media3 读不出 WMA 时长所以 `durationReadFailed=0`），`files/transcoded/<id>.m4a` 生成 | `run-as sqlite3` + `ls` |
+| 播放走转码产物 | 首播 WMA 书：播放位置持续推进（43 s 处采样）——ExoPlayer 播的是 `transcoded/<id>.m4a` | DB `playback_state.last_position_ms` + UI |
+| 转录走 libwma | 首播自动转录：SUCCESS、26 段、**42 句**、丢弃 0、READY（句数与 mp3 的 35 不同是解码样本流随格式浮动的正常现象） | DB + `EchoMindTranscriptWork: 转录成功` 日志 |
+| 构建与测试 | JVM **253 全绿**（+2：wma 播放 URI 换路/非 wma 原样）；仪器化 `WmaDecodeTest` 2 条 + 整套件见尾行 | XML + instrument 尾行 |
+
+**过程坑（三条都进了代码或文档）**：
+1. `MediaCodecInfo` 没有 `isDecoder`（只有 `isEncoder`），新探针类编译失败曾被链式命令的 `tail`/`grep` 吞掉——
+   教训：链式命令里 gradle 的 BUILD 状态必须在下一步前显式检查。
+2. SAF 输入走 `/proc/self/fd/<fd>` 让 FFmpeg 的 file protocol 重开路径：**file:// 素材能过（应用自有目录）、
+   SAF content:// 必挂**（scoped storage 沿符号链接重开被拒）——正解是自定义 AVIO 直接在 fd 上 read/seek。
+   同一类坑第二次出现（第一次是 m4a/flac/wav 用应用自有目录的 file uri，掩盖了它）。
+3. 改 JNI 签名后忘重编 .so：Kotlin 传 jint、旧 so 按 jstring 解 → JNI abort。`jniLibs` 在构建期打包，
+   改 C 后必须重编 so 再重编 APK。
+
+**这一轮没做 / 做不了**：
+- 转码产物缺失的复活路径（清数据后重扫不重转，播放会失败）——已知边角，Phase 7 加检测。
+- 真机上的 libwma 兼容性（arm64 通用 NEON，理论无差）——真机验证仍是 Phase 7 整体欠账。
+- WMA Pro / WMA Lossless（wmav3/wmapro）不在解码器清单里，.wma 之外的标准变体不支持，如实记录。
+
 ## 5. 待补的自动化测试清单（按阶段）
 
 | Phase | 用例 |

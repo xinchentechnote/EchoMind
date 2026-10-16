@@ -107,6 +107,8 @@ class PlayerViewModel(
      * 做成 lambda 是为了让「该不该自动发起」的判定能在 JVM 里测——调度器那半边要 Android 的 WorkManager。
      */
     private val startTranscription: suspend (audioId: String) -> Unit,
+    /** 播放用的 URI（WMA 书换成本地转码产物 m4a；其余原样）。lambda 接缝同上，JVM 可测 */
+    private val playbackUriOf: (row: ShelfRow) -> String,
 ) : ViewModel() {
 
     private val _state = MutableStateFlow(PlayerScreenState())
@@ -297,7 +299,7 @@ class PlayerViewModel(
     private fun List<ShelfRow>.toQueue(): List<QueueItem> = map {
         QueueItem(
             audioId = it.id,
-            uri = it.uri,
+            uri = playbackUriOf(it),
             title = it.title,
             durationMs = it.durationMs,
             resumePositionMs = it.lastPositionMs,
@@ -342,6 +344,9 @@ class PlayerViewModel(
                             // AlreadyActive / AlreadyTranscribed：有守卫挡着，静默即可——转录页能看到任务
                             else -> Unit
                         }
+                    },
+                    playbackUriOf = { row ->
+                        app.graph.wmaStore.playbackUriFor(row.fileName, row.uri, row.id)
                     },
                 )
             }

@@ -129,8 +129,7 @@ class TranscriptCoordinator(
         isCancelled: () -> Boolean,
         onProgress: (Int, Int) -> Unit,
     ) {
-        val decoder = PcmDecoder(context)
-        decodeSummary = decoder.decode(Uri.parse(target.uri)) { samples, _ ->
+        val sink = PcmChunkSink { samples, _ ->
             if (isCancelled()) {
                 wasCancelled = true
                 false
@@ -138,6 +137,12 @@ class TranscriptCoordinator(
                 vad.push(samples).forEach { utterance -> consume(utterance, target, onProgress) }
                 true
             }
+        }
+        // .wma 走自建 libwma（D40，系统无 WMA 解码器），其余走 MediaCodec；输出契约完全一致
+        decodeSummary = if (target.fileName.endsWith(".wma", ignoreCase = true)) {
+            WmaPcmDecoder().decode(context, Uri.parse(target.uri), sink)
+        } else {
+            PcmDecoder(context).decode(Uri.parse(target.uri), sink)
         }
         if (!wasCancelled) vad.finish().forEach { utterance -> consume(utterance, target, onProgress) }
     }

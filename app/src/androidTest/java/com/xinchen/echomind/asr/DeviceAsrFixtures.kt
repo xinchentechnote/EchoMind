@@ -35,6 +35,18 @@ internal object DeviceAsrFixtures {
     /** [REAL_MP3] 的容器时长，宿主机数出来的（字幕时间越界检查要用它当上界） */
     const val REAL_MP3_DURATION_MS = 148_303L
 
+    /**
+     * 同一份真语音的 WMA 版（宿主机自建 ffmpeg `-c:a wmav2 -b:a 128k` 转出，wmav2 44.1kHz 双声道，148,637 ms）。
+     * WMA 解码走 `libwma`（D40），与 mp3 的 MediaCodec 路径互为对照。
+     */
+    const val REAL_WMA = "pcm-fixture-real.wma"
+
+    /** [REAL_WMA] 的容器时长（宿主机 ffmpeg 报告） */
+    const val REAL_WMA_DURATION_MS = 148_637L
+
+    /** 宿主机把 [REAL_WMA] 解到 wav 的样本数（26,214,400 B / 4 B），做设备端解码样本数的对照基准 */
+    const val REAL_WMA_REF_SAMPLES_44K = 6_553_600L
+
     private const val TAG = "DeviceAsrFixtures"
 
     fun modelRoot(context: Context = ApplicationProvider.getApplicationContext()): File =

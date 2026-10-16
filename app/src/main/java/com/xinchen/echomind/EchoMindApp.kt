@@ -6,12 +6,15 @@ import androidx.room.Room
 import com.xinchen.echomind.asr.ModelCatalog
 import com.xinchen.echomind.asr.ModelManager
 import com.xinchen.echomind.asr.TranscriptCoordinator
+import com.xinchen.echomind.asr.WmaTranscoder
 import com.xinchen.echomind.core.time.AndroidTimeSource
 import com.xinchen.echomind.core.time.TimeSource
 import com.xinchen.echomind.data.db.EchoMindDatabase
 import com.xinchen.echomind.data.db.Migrations
 import com.xinchen.echomind.data.repo.AudioRepository
 import com.xinchen.echomind.data.repo.AudioRepositoryImpl
+import com.xinchen.echomind.data.repo.WmaImportPreparer
+import com.xinchen.echomind.data.repo.WmaPlaybackStore
 import com.xinchen.echomind.data.repo.PlaybackRepository
 import com.xinchen.echomind.data.repo.PlaybackRepositoryImpl
 import com.xinchen.echomind.data.repo.SubtitleRepository
@@ -52,6 +55,7 @@ class AppGraph(
     val transcriptCoordinator: TranscriptCoordinator,
     val transcriptWork: TranscriptWorkScheduler,
     val liveTranscriptStore: LiveTranscriptStore,
+    val wmaStore: WmaPlaybackStore,
     val appScope: CoroutineScope,
     val playbackScope: CoroutineScope,
 )
@@ -71,6 +75,8 @@ class EchoMindApp : Application() {
         val playbackScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
         val playbackRepository = PlaybackRepositoryImpl(db, timeSource)
         val grants = SafTreeGrantStore(this)
+        val wmaTranscoder = WmaTranscoder(this)
+        val wmaStore = WmaPlaybackStore(File(filesDir, "transcoded"))
         val audioRepository = AudioRepositoryImpl(
             audioBookDao = db.audioBookDao(),
             folderDao = db.importedFolderDao(),
@@ -79,6 +85,10 @@ class EchoMindApp : Application() {
             metadataReader = SystemAudioMetadataReader(this),
             grants = grants,
             nowMs = timeSource::wallMs,
+            wmaStore = wmaStore,
+            wmaPrepare = WmaImportPreparer { audioId, uri ->
+                wmaTranscoder.transcodeToM4a(android.net.Uri.parse(uri), wmaStore.fileOf(audioId))
+            },
         )
         val transcriptRepository = TranscriptRepositoryImpl(db, timeSource)
         val modelsRoot = File(filesDir, ModelCatalog.MODELS_DIR_NAME)
@@ -107,6 +117,7 @@ class EchoMindApp : Application() {
             ),
             transcriptWork = TranscriptWorkScheduler(this, transcriptRepository),
             liveTranscriptStore = liveTranscriptStore,
+            wmaStore = wmaStore,
             playbackController = Media3PlaybackController(
                 player = PlayerHolder.get(this),
                 repository = playbackRepository,

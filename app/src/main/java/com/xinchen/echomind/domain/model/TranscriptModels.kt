@@ -108,6 +108,8 @@ data class TranscriptionTarget(
     val audioId: String,
     val uri: String,
     val title: String,
+    /** 原始文件名：协调器据此选解码器（.wma 走 libwma，其余走 MediaCodec） */
+    val fileName: String = "",
     val isFilePresent: Boolean,
     val needsTreeGrant: Boolean,
     val treeUri: String?,

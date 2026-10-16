@@ -26,6 +26,7 @@ import com.xinchen.echomind.domain.playback.PlaybackController
 import com.xinchen.echomind.domain.playback.PlaybackUiState
 import com.xinchen.echomind.domain.playback.QueueItem
 import com.xinchen.echomind.domain.subtitle.SubtitleWindow
+import com.xinchen.echomind.data.repo.WmaPlaybackStore
 import com.xinchen.echomind.domain.transcript.LiveTranscriptStore
 import com.xinchen.echomind.domain.transcript.TranscriptRepository
 import kotlinx.coroutines.Dispatchers
@@ -201,7 +202,13 @@ class PlayerViewModelTest {
             subtitles,
             transcript,
             liveStore,
-        ) { started += it }
+            startTranscription = { started += it },
+            // 与生产同一个约定类：wma 书换转码产物 URI，其余原样
+            playbackUriOf = { row ->
+                WmaPlaybackStore(java.io.File("/tmp/echomind-test-transcoded"))
+                    .playbackUriFor(row.fileName, row.uri, row.id)
+            },
+        )
     }
 
     // -- 既有性质 ------------------------------------------------------------------
@@ -240,13 +247,34 @@ class PlayerViewModelTest {
             FakeAudioRepo(listOf(bookA, bookB)),
             FakePlaybackRepo(memories(positionA = 29_000)),
             FakeSubtitleRepo(), FakeTranscriptRepo(), LiveTranscriptStore(),
-        ) { }
+            startTranscription = { },
+            playbackUriOf = { row -> row.uri },
+        )
         advanceUntilIdle()
 
         assertEquals(0, controller.lastStartPosMs)
     }
 
     // -- 首次播放自动转录 ------------------------------------------------------------
+
+    @Test
+    fun `wma书播放队列用的是转码产物uri`() = runTest {
+        val h = Harness(
+            audio = FakeAudioRepo(listOf(row("w", "WMA 书", 30_000, 0, fileName = "w.wma"), bookB)),
+            audioId = "w",
+        )
+        advanceUntilIdle()
+
+        assertEquals("file:/tmp/echomind-test-transcoded/w.m4a", h.controller.lastQueue.first { it.audioId == "w" }.uri)
+    }
+
+    @Test
+    fun `非wma书播放队列保持原uri`() = runTest {
+        val h = Harness()
+        advanceUntilIdle()
+
+        assertEquals("content://audio/a", h.controller.lastQueue.first { it.audioId == "a" }.uri)
+    }
 
     @Test
     fun `首次播放三无的书自动发起转录`() = runTest {
@@ -396,11 +424,18 @@ class PlayerViewModelTest {
 private val bookA = row("a", "三体", durationMs = 30_000, lastPositionMs = 12_000)
 private val bookB = row("b", "第二章", durationMs = 45_000, lastPositionMs = 0)
 
-private fun row(id: String, title: String, durationMs: Long, lastPositionMs: Long, state: String = "NONE") = ShelfRow(
+private fun row(
+    id: String,
+    title: String,
+    durationMs: Long,
+    lastPositionMs: Long,
+    state: String = "NONE",
+    fileName: String = "$id.mp3",
+) = ShelfRow(
     id = id,
     uri = "content://audio/$id",
     title = title,
-    fileName = "$id.mp3",
+    fileName = fileName,
     durationMs = durationMs,
     sizeBytes = 1_000_000,
     fileStatus = "OK",
