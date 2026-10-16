@@ -36,11 +36,14 @@ class TranscriptWorkScheduler(
             .setInputData(workDataOf(TranscriptWorker.KEY_JOB_ID to jobId, TranscriptWorker.KEY_AUDIO_ID to audioId))
             .addTag(TAG)
             .build()
-        // APPEND：排在别人后面，而不是把别人掀掉。REPLACE 在「每本书一个唯一名」的年代是安全的，
-        // 换成全局唯一名之后它就变成「给 B 入队会取消正在跑的 A」——那是更严重的错。
+        // APPEND_OR_REPLACE：有活着（未结束）的链就排在后面；链条已死（最后一次被取消）就自愈成新链。
+        // 不能用 APPEND：WorkManager 的文档语义是「链条被取消后，APPEND 上去的新任务**连带取消**」——
+        // 实测踩过（docs/testing.md §4 Phase 6g）：用户取消过一次转录之后，后面所有入队全部卡在
+        // QUEUED 永远不跑（worker 根本不会被调度），而且这条只有真机/模拟器测得出来。
+        // REPLACE 单独用不行：它会把正在跑的那本掀掉（D36 更严重的错）。
         // 原来 REPLACE 兜的「行已结束但请求还挂在队列里」这种残留也不再需要清：
         // 它轮到自己跑时，协调器发现那一行不是 QUEUED，直接 Skipped，队列自己干净。
-        workManager.enqueueUniqueWork(UNIQUE_NAME, ExistingWorkPolicy.APPEND, request)
+        workManager.enqueueUniqueWork(UNIQUE_NAME, ExistingWorkPolicy.APPEND_OR_REPLACE, request)
         if (!repository.attachWorkRequest(jobId, request.id.toString())) {
             Log.w(TAG, "任务 $jobId 写不回 work_request_id（行已结束），撤掉刚入队的请求 ${request.id}")
             workManager.cancelWorkById(request.id)

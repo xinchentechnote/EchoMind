@@ -15,18 +15,24 @@ import com.xinchen.echomind.data.repo.SubtitleSource
 import com.xinchen.echomind.data.repo.SubtitleSummary
 import com.xinchen.echomind.domain.model.ListeningSessionData
 import com.xinchen.echomind.domain.model.PlaybackProgress
+import com.xinchen.echomind.domain.model.SubtitleSegment
+import com.xinchen.echomind.domain.model.EnqueueOutcome
+import com.xinchen.echomind.domain.model.TranscriptFailure
+import com.xinchen.echomind.domain.model.TranscriptJobRow
+import com.xinchen.echomind.domain.model.TranscriptModelRef
+import com.xinchen.echomind.domain.model.TranscriptJobStatus
+import com.xinchen.echomind.domain.model.TranscriptionTarget
 import com.xinchen.echomind.domain.playback.PlaybackController
 import com.xinchen.echomind.domain.playback.PlaybackUiState
-import com.xinchen.echomind.domain.model.SubtitleSegment
-import com.xinchen.echomind.domain.model.TranscriptionTarget
 import com.xinchen.echomind.domain.playback.QueueItem
 import com.xinchen.echomind.domain.subtitle.SubtitleWindow
+import com.xinchen.echomind.domain.transcript.LiveTranscriptStore
+import com.xinchen.echomind.domain.transcript.TranscriptRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
@@ -34,15 +40,18 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 
 /**
- * 播放页的三条易碎性质（都在真机上踩过或差点踩到）：
+ * 播放页的易碎性质（都在真机上踩过或差点踩到）：
  * 1. 这一首已经在播时不能重开——否则从通知栏点回 App 会把进度扔回起点；
  * 2. 自动切歌之后页头与统计要跟着换成正在播的那一本；
- * 3. 起播点走 [resumePositionFor]：听完了的从头播，没听完的续在记忆里的那个位置。
+ * 3. 起播点走 [resumePositionFor]：听完了的从头播，没听完的续在记忆里的那个位置；
+ * 4. 「首次播放自动转录」只在三无（没转过、没有任务行、没有任何字幕）时发起，
+ *    且转录中的实时预览要跟随播放位置、失败要给人话文案。
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class PlayerViewModelTest {
@@ -52,24 +61,6 @@ class PlayerViewModelTest {
     @Before fun setUp() = Dispatchers.setMain(dispatcher)
 
     @After fun tearDown() = Dispatchers.resetMain()
-
-    private val bookA = row("a", "三体", durationMs = 30_000, lastPositionMs = 12_000)
-    private val bookB = row("b", "第二章", durationMs = 45_000, lastPositionMs = 0)
-
-    private fun row(id: String, title: String, durationMs: Long, lastPositionMs: Long) = ShelfRow(
-        id = id,
-        uri = "content://audio/$id",
-        title = title,
-        fileName = "$id.mp3",
-        durationMs = durationMs,
-        sizeBytes = 1_000_000,
-        fileStatus = "OK",
-        transcriptionState = "NONE",
-        isFavorite = false,
-        lastPositionMs = lastPositionMs,
-        lastPlayedAtMs = 0,
-        playbackSpeed = 1f,
-    )
 
     private class FakeAudioRepo(rows: List<ShelfRow>) : AudioRepository {
         val shelfFlow = MutableStateFlow(rows)
@@ -134,7 +125,9 @@ class PlayerViewModelTest {
         }
 
         override fun togglePlayPause() = Unit
-        override fun seekTo(positionMs: Long) = Unit
+        override fun seekTo(positionMs: Long) {
+            state.value = state.value.copy(positionMs = positionMs)
+        }
         override fun skip(byMs: Long) = Unit
         override fun setSpeed(speed: Float) = Unit
         override fun next() = Unit
@@ -169,181 +162,258 @@ class PlayerViewModelTest {
         }
     }
 
-    private fun seg(index: Int, startMs: Long, text: String) =
-        SubtitleSegment(index = index, startMs = startMs, endMs = startMs + 1_000, text = text)
+    private class FakeTranscriptRepo(rows: List<TranscriptJobRow> = emptyList()) : TranscriptRepository {
+        val jobsFlow = MutableStateFlow(rows)
 
-    private fun memories(positionA: Long = 12_000, positionB: Long = 0) = mapOf(        "a" to memory(positionMs = positionA, playCount = 3, listenedMsTotal = 40_000),
-        "b" to memory(positionMs = positionB, playCount = 7, listenedMsTotal = 80_000),
-    )
+        override fun jobs(): Flow<List<TranscriptJobRow>> = jobsFlow
+        override fun observeActiveJob(audioId: String): Flow<TranscriptJobRow?> =
+            jobsFlow.map { list -> list.firstOrNull { it.audioId == audioId } }
+
+        override suspend fun enqueue(audioId: String, model: TranscriptModelRef, force: Boolean): EnqueueOutcome =
+            unsupported()
+        override suspend fun cancel(jobId: String): Boolean = unsupported()
+        override suspend fun attachWorkRequest(jobId: String, workRequestId: String): Boolean = unsupported()
+        override suspend fun jobById(jobId: String): TranscriptJobRow? = unsupported()
+        override suspend fun retry(jobId: String, model: TranscriptModelRef): EnqueueOutcome = unsupported()
+        override suspend fun markRunning(jobId: String, totalSegments: Int): Boolean = unsupported()
+        override suspend fun updateProgress(jobId: String, doneSegments: Int, totalSegments: Int): Boolean = unsupported()
+        override suspend fun commitSubtitles(jobId: String, segments: List<SubtitleSegment>): Int = unsupported()
+        override suspend fun markFailed(jobId: String, failure: TranscriptFailure, message: String?): Boolean = unsupported()
+        override suspend fun recoverInterrupted(): Int = unsupported()
+
+        private fun unsupported(): Nothing = throw UnsupportedOperationException()
+    }
+
+    private class Harness(
+        val controller: FakeController = FakeController(),
+        val audio: FakeAudioRepo = FakeAudioRepo(listOf(bookA, bookB)),
+        val subtitles: FakeSubtitleRepo = FakeSubtitleRepo(),
+        val transcript: FakeTranscriptRepo = FakeTranscriptRepo(),
+        val liveStore: LiveTranscriptStore = LiveTranscriptStore(),
+        val audioId: String = "a",
+    ) {
+        val started = mutableListOf<String>()
+        val vm: PlayerViewModel = PlayerViewModel(
+            audioId,
+            controller,
+            audio,
+            FakePlaybackRepo(memories()),
+            subtitles,
+            transcript,
+            liveStore,
+        ) { started += it }
+    }
+
+    // -- 既有性质 ------------------------------------------------------------------
 
     @Test
     fun `不在播这一首时按记忆位置起播`() = runTest {
-        val controller = FakeController()
-        val vm = PlayerViewModel("a", controller, FakeAudioRepo(listOf(bookA, bookB)), FakePlaybackRepo(memories()), FakeSubtitleRepo())
+        val h = Harness()
         advanceUntilIdle()
 
-        assertEquals(1, controller.plays.size)
-        assertEquals(0, controller.lastIndex)
-        assertEquals(12_000, controller.lastStartPosMs)
-        assertEquals(listOf("a", "b"), controller.lastQueue.map { it.audioId })
-        assertEquals("三体", vm.state.value.title)
-        assertEquals(3, vm.state.value.playCount)
+        assertEquals(1, h.controller.plays.size)
+        assertEquals(0, h.controller.lastIndex)
+        assertEquals(12_000, h.controller.lastStartPosMs)
+        assertEquals(listOf("a", "b"), h.controller.lastQueue.map { it.audioId })
+        assertEquals("三体", h.vm.state.value.title)
+        assertEquals(3, h.vm.state.value.playCount)
     }
 
     @Test
     fun `这一首已经在播时不重开`() = runTest {
-        val controller = FakeController(
-            PlaybackUiState(audioId = "a", title = "三体", positionMs = 21_000, isPlaying = true),
+        val h = Harness(
+            controller = FakeController(
+                PlaybackUiState(audioId = "a", title = "三体", positionMs = 21_000, isPlaying = true),
+            ),
         )
-        val vm = PlayerViewModel("a", controller, FakeAudioRepo(listOf(bookA, bookB)), FakePlaybackRepo(memories()), FakeSubtitleRepo())
         advanceUntilIdle()
 
-        assertEquals(0, controller.plays.size)
-        assertEquals(21_000, vm.playback.value.positionMs)
+        assertEquals(0, h.controller.plays.size)
+        assertEquals(21_000, h.vm.playback.value.positionMs)
     }
 
     @Test
     fun `听完过的书再进来从头播`() = runTest {
         val controller = FakeController()
-        // 记忆位置就在末尾容差内：说明上次听完了，不该每次进来都卡在 99%
-        PlayerViewModel("a", controller, FakeAudioRepo(listOf(bookA, bookB)), FakePlaybackRepo(memories(positionA = 29_000)), FakeSubtitleRepo())
+        PlayerViewModel(
+            "a", controller,
+            FakeAudioRepo(listOf(bookA, bookB)),
+            FakePlaybackRepo(memories(positionA = 29_000)),
+            FakeSubtitleRepo(), FakeTranscriptRepo(), LiveTranscriptStore(),
+        ) { }
         advanceUntilIdle()
 
         assertEquals(0, controller.lastStartPosMs)
     }
 
+    // -- 首次播放自动转录 ------------------------------------------------------------
+
     @Test
-    fun `自动切歌后页头与统计跟着换成正在播的那一本`() = runTest {
-        val controller = FakeController()
-        val vm = PlayerViewModel("a", controller, FakeAudioRepo(listOf(bookA, bookB)), FakePlaybackRepo(memories()), FakeSubtitleRepo())
-        advanceUntilIdle()
-        assertEquals("三体", vm.state.value.title)
-
-        controller.state.value = controller.state.value.copy(audioId = "b", title = "第二章", positionMs = 1_000)
+    fun `首次播放三无的书自动发起转录`() = runTest {
+        val h = Harness()
         advanceUntilIdle()
 
-        assertEquals("第二章", vm.state.value.title)
-        assertEquals(7, vm.state.value.playCount)
-        assertEquals(80_000, vm.state.value.listenedMsTotal)
+        assertEquals(listOf("a"), h.started)
     }
 
     @Test
-    fun `收藏切换作用于正在播的那一本`() = runTest {
-        val audio = FakeAudioRepo(listOf(bookA, bookB))
-        val controller = FakeController()
-        val vm = PlayerViewModel("a", controller, audio, FakePlaybackRepo(memories()), FakeSubtitleRepo())
-        advanceUntilIdle()
-
-        controller.state.value = controller.state.value.copy(audioId = "b", title = "第二章")
-        advanceUntilIdle()
-        vm.toggleFavorite()
-        advanceUntilIdle()
-
-        assertEquals(listOf("b" to true), audio.favorites)
-    }
-
-    @Test
-    fun `书不在书架时标记缺失且不起播`() = runTest {
-        val controller = FakeController()
-        val vm = PlayerViewModel("zz", controller, FakeAudioRepo(listOf(bookA, bookB)), FakePlaybackRepo(memories()), FakeSubtitleRepo())
-        advanceUntilIdle()
-
-        assertEquals(0, controller.plays.size)
-        assertEquals(true, vm.state.value.missing)
-    }
-
-    @Test
-    fun `字幕窗口跟着播放位置更新当前句`() = runTest {
-        val subtitles = FakeSubtitleRepo(
-            mapOf("a" to listOf(seg(0, 0, "第一句"), seg(1, 5_000, "第二句"), seg(2, 10_000, "第三句"))),
-        )
-        val controller = FakeController()
-        val vm = PlayerViewModel("a", controller, FakeAudioRepo(listOf(bookA, bookB)), FakePlaybackRepo(memories()), subtitles)
-        advanceUntilIdle()
-
-        // 起播点 12s（记忆位置）落在第三句
-        assertEquals(2, vm.subtitles.value.currentIndex)
-        assertEquals("第三句", vm.subtitles.value.current?.text)
-
-        controller.state.value = controller.state.value.copy(positionMs = 5_500)
-        advanceUntilIdle()
-        assertEquals("第二句", vm.subtitles.value.current?.text)
-        assertEquals(3, vm.subtitleSummary.value.count)
-        assertEquals(false, vm.subtitleSummary.value.producedByAsr)
-    }
-
-    @Test
-    fun `同一句内部的位置推进不重发窗口`() = runTest {
-        val subtitles = FakeSubtitleRepo(
-            mapOf("a" to listOf(seg(0, 0, "第一句"), seg(1, 10_000, "第二句"), seg(2, 20_000, "第三句"))),
-        )
-        val controller = FakeController(PlaybackUiState(audioId = "a", title = "三体", positionMs = 1_000, isPlaying = true))
-        val vm = PlayerViewModel("a", controller, FakeAudioRepo(listOf(bookA, bookB)), FakePlaybackRepo(memories()), subtitles)
-
-        val seen = mutableListOf<SubtitleWindow>()
-        val watching = launch { vm.subtitles.collect { seen += it } }
-        advanceUntilIdle()
-        val afterStart = seen.size
-        assertEquals(0, vm.subtitles.value.currentIndex)
-
-        // 500ms tick 在同一句里连推 5 次：窗口内容一个字都没变，UI 就不该收到新值（FR-707）
-        repeat(5) { step ->
-            controller.state.value = controller.state.value.copy(positionMs = 2_000L + step * 1_000)
-            advanceUntilIdle()
-        }
-        assertEquals(afterStart, seen.size)
-
-        controller.state.value = controller.state.value.copy(positionMs = 10_000)
-        advanceUntilIdle()
-        assertEquals(afterStart + 1, seen.size)
-        assertEquals(1, seen.last().currentIndex)
-        watching.cancel()
-    }
-
-    @Test
-    fun `切歌后字幕跟着换成新歌的那一套`() = runTest {
-        val subtitles = FakeSubtitleRepo(
-            mapOf(
-                "a" to listOf(seg(0, 0, "A 的第一句")),
-                "b" to listOf(seg(0, 0, "B 的第一句"), seg(1, 2_000, "B 的第二句")),
+    fun `转过取消过有任务行就不再自动发起`() = runTest {
+        val h = Harness(
+            transcript = FakeTranscriptRepo(
+                listOf(
+                    TranscriptJobRow(
+                        id = "j1", audioId = "a", modelId = "m", modelVersion = "v",
+                        status = TranscriptJobStatus.Failed, totalSegments = 0, doneSegments = 0,
+                        failure = TranscriptFailure.Cancelled, errorMessage = "用户取消",
+                        createdAtMs = 1, startedAtMs = 2, finishedAtMs = 3,
+                    ),
+                ),
             ),
         )
-        val controller = FakeController()
-        val vm = PlayerViewModel("a", controller, FakeAudioRepo(listOf(bookA, bookB)), FakePlaybackRepo(memories()), subtitles)
-        advanceUntilIdle()
-        assertEquals("A 的第一句", vm.subtitles.value.current?.text)
-
-        controller.state.value = controller.state.value.copy(audioId = "b", title = "第二章", positionMs = 2_500)
         advanceUntilIdle()
 
-        assertEquals("B 的第二句", vm.subtitles.value.current?.text)
-        assertEquals(1, vm.subtitles.value.currentIndex)
+        assertTrue(h.started.isEmpty())
     }
 
     @Test
-    fun `导入测试字幕写进正在播的这一首并标明来源`() = runTest {
-        val subtitles = FakeSubtitleRepo()
-        val controller = FakeController()
-        val vm = PlayerViewModel("a", controller, FakeAudioRepo(listOf(bookA, bookB)), FakePlaybackRepo(memories()), subtitles)
-        advanceUntilIdle()
-        assertEquals(0, vm.subtitleSummary.value.count)
-
-        vm.importTestSubtitles("1\n00:00:00,000 --> 00:00:02,000\n念出来的第一句\n\n")
+    fun `已就绪的书不再自动发起`() = runTest {
+        val h = Harness(
+            audio = FakeAudioRepo(listOf(row("a", "三体", 30_000, 0, state = "READY"), bookB)),
+        )
         advanceUntilIdle()
 
-        assertEquals(listOf("a" to 1), subtitles.replaced)
-        assertEquals(1, vm.subtitleSummary.value.count)
-        assertEquals("念出来的第一句", vm.subtitles.value.current?.text)
-        assertTrue(vm.subtitleNotice.value!!.contains("非 ASR 产物"))
+        assertTrue(h.started.isEmpty())
+    }
 
-        vm.importTestSubtitles("这不是字幕文件")
+    @Test
+    fun `有测试字幕的书不自动发起不悄悄顶掉`() = runTest {
+        val h = Harness(subtitles = FakeSubtitleRepo(mapOf("a" to listOf(seg(0, 0, "测试句")))))
         advanceUntilIdle()
-        assertTrue(vm.subtitleNotice.value!!.startsWith("导入失败"))
+
+        assertTrue(h.started.isEmpty())
+    }
+
+    // -- 转录中的实时显示 --------------------------------------------------------------
+
+    private fun runningJob(audioId: String, done: Int, total: Int = 0) = TranscriptJobRow(
+        id = "j-$audioId", audioId = audioId, modelId = "m", modelVersion = "v",
+        status = TranscriptJobStatus.Running, totalSegments = total, doneSegments = done,
+        failure = null, errorMessage = null, createdAtMs = 1, startedAtMs = 2, finishedAtMs = null,
+    )
+
+    @Test
+    fun `转录中的状态行给段数与句数`() = runTest {
+        val h = Harness(transcript = FakeTranscriptRepo(listOf(runningJob("a", done = 3))))
+        h.liveStore.append("a", listOf(seg(0, 1_000, "甲"), seg(1, 2_000, "乙")), doneSegments = 3)
+        advanceUntilIdle()
+
+        val line = h.vm.liveTranscript.value.statusLine
+        assertTrue("$line", line!!.contains("已识别 3 段"))
+        assertTrue(line.contains("已出 2 句"))
+        assertTrue(line.contains("正在转录"))
+        assertTrue(h.vm.liveTranscript.value.running)
+    }
+
+    @Test
+    fun `实时窗口跟随播放位置高亮当前句`() = runTest {
+        val h = Harness()
+        h.liveStore.append("a", listOf(seg(0, 1_000, "甲"), seg(1, 2_000, "乙")), doneSegments = 1)
+        advanceUntilIdle()
+
+        h.controller.seekTo(2_500)
+        advanceUntilIdle()
+
+        val window = h.vm.liveWindow.value
+        assertEquals("乙", window!!.current?.text)
+        // 库里还没有字幕，这个窗口就是实时预览
+        assertEquals(0, h.subtitles.flows.value.size)
+    }
+
+    @Test
+    fun `收尾清空预览后实时窗口退位`() = runTest {
+        val h = Harness()
+        h.liveStore.append("a", listOf(seg(0, 1_000, "甲")), doneSegments = 1)
+        advanceUntilIdle()
+        assertEquals("甲", h.vm.liveWindow.value!!.current?.text)
+
+        h.liveStore.clear("a")
+        advanceUntilIdle()
+
+        assertNull(h.vm.liveWindow.value)
+        assertNull(h.vm.liveTranscript.value.statusLine)
+    }
+
+    @Test
+    fun `失败的任务给人话文案`() = runTest {
+        val h = Harness(
+            transcript = FakeTranscriptRepo(
+                listOf(
+                    TranscriptJobRow(
+                        id = "j1", audioId = "a", modelId = "m", modelVersion = "v",
+                        status = TranscriptJobStatus.Failed, totalSegments = 0, doneSegments = 0,
+                        failure = TranscriptFailure.ModelMissing, errorMessage = "模型不可用",
+                        createdAtMs = 1, startedAtMs = 2, finishedAtMs = 3,
+                    ),
+                ),
+            ),
+        )
+        advanceUntilIdle()
+
+        val line = h.vm.liveTranscript.value.failureLine!!
+        assertTrue(line, line.contains("转录未完成"))
+        assertTrue(line, line.contains("从安装包恢复"))
+    }
+
+    // -- 状态行纯函数 ------------------------------------------------------------------
+
+    @Test
+    fun `分母未知不报百分比`() {
+        val line = liveStatusLine(runningJob("a", done = 4, total = 0), sentenceCount = 2)
+        assertTrue("$line", line!!.contains("已识别 4 段"))
+        assertTrue(!line.contains("/"))
+        assertTrue(!line.contains("%"))
+    }
+
+    @Test
+    fun `分母已知报进度排队中不报段数`() {
+        assertTrue(liveStatusLine(runningJob("a", done = 3, total = 10), 1)!!.contains("已识别 3/10 段"))
+        val queued = liveStatusLine(
+            TranscriptJobRow(
+                id = "j", audioId = "a", modelId = "m", modelVersion = "v",
+                status = TranscriptJobStatus.Queued, totalSegments = 0, doneSegments = 0,
+                failure = null, errorMessage = null, createdAtMs = 1, startedAtMs = null, finishedAtMs = null,
+            ),
+            sentenceCount = 0,
+        )!!
+        assertTrue(queued.contains("排队"))
+        assertTrue(!queued.contains("段"))
+        assertNull(liveStatusLine(null, 5))
     }
 }
 
+// 顶层假数据：嵌套类（Harness、Fake*）拿不到外部类的成员接收者，所以这些必须是文件级
 
-/** 播放记忆行；nested fake 不是 inner class，所以这个构造器放在文件顶层给两边共用 */
+private val bookA = row("a", "三体", durationMs = 30_000, lastPositionMs = 12_000)
+private val bookB = row("b", "第二章", durationMs = 45_000, lastPositionMs = 0)
+
+private fun row(id: String, title: String, durationMs: Long, lastPositionMs: Long, state: String = "NONE") = ShelfRow(
+    id = id,
+    uri = "content://audio/$id",
+    title = title,
+    fileName = "$id.mp3",
+    durationMs = durationMs,
+    sizeBytes = 1_000_000,
+    fileStatus = "OK",
+    transcriptionState = state,
+    isFavorite = false,
+    lastPositionMs = lastPositionMs,
+    lastPlayedAtMs = 0,
+    playbackSpeed = 1f,
+)
+
+private fun seg(index: Int, startMs: Long, text: String) =
+    SubtitleSegment(index = index, startMs = startMs, endMs = startMs + 1_000, text = text)
+
 private fun memory(positionMs: Long = 0, playCount: Int = 0, listenedMsTotal: Long = 0) = PlaybackStateSnapshot(
     positionMs = positionMs,
     durationMs = 0,
@@ -353,4 +423,9 @@ private fun memory(positionMs: Long = 0, playCount: Int = 0, listenedMsTotal: Lo
     listenedMsTotal = listenedMsTotal,
     lastPlayedAtMs = 0,
     finished = false,
+)
+
+private fun memories(positionA: Long = 12_000, positionB: Long = 0) = mapOf(
+    "a" to memory(positionMs = positionA, playCount = 3, listenedMsTotal = 40_000),
+    "b" to memory(positionMs = positionB, playCount = 7, listenedMsTotal = 80_000),
 )

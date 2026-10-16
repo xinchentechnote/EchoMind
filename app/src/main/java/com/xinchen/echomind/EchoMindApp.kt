@@ -21,6 +21,7 @@ import com.xinchen.echomind.data.repo.TranscriptRepositoryImpl
 import com.xinchen.echomind.data.scan.SafTreeBrowser
 import com.xinchen.echomind.data.scan.SystemAudioMetadataReader
 import com.xinchen.echomind.domain.playback.PlaybackController
+import com.xinchen.echomind.domain.transcript.LiveTranscriptStore
 import com.xinchen.echomind.domain.transcript.TranscriptRepository
 import com.xinchen.echomind.playback.EchoMindMediaService
 import com.xinchen.echomind.playback.Media3PlaybackController
@@ -50,6 +51,7 @@ class AppGraph(
     val modelsRoot: File,
     val transcriptCoordinator: TranscriptCoordinator,
     val transcriptWork: TranscriptWorkScheduler,
+    val liveTranscriptStore: LiveTranscriptStore,
     val appScope: CoroutineScope,
     val playbackScope: CoroutineScope,
 )
@@ -80,6 +82,7 @@ class EchoMindApp : Application() {
         )
         val transcriptRepository = TranscriptRepositoryImpl(db, timeSource)
         val modelsRoot = File(filesDir, ModelCatalog.MODELS_DIR_NAME)
+        val liveTranscriptStore = LiveTranscriptStore()
         graph = AppGraph(
             database = db,
             timeSource = timeSource,
@@ -100,8 +103,10 @@ class EchoMindApp : Application() {
                 repository = transcriptRepository,
                 modelsRoot = modelsRoot,
                 clock = timeSource,
+                liveStore = liveTranscriptStore,
             ),
             transcriptWork = TranscriptWorkScheduler(this, transcriptRepository),
+            liveTranscriptStore = liveTranscriptStore,
             playbackController = Media3PlaybackController(
                 player = PlayerHolder.get(this),
                 repository = playbackRepository,

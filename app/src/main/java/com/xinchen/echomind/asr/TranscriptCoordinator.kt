@@ -18,6 +18,7 @@ import com.xinchen.echomind.domain.model.TokenTiming
 import com.xinchen.echomind.domain.model.TranscriptFailure
 import com.xinchen.echomind.domain.model.TranscriptJobStatus
 import com.xinchen.echomind.domain.model.TranscriptionTarget
+import com.xinchen.echomind.domain.transcript.LiveTranscriptStore
 import com.xinchen.echomind.domain.transcript.TranscriptRepository
 import java.io.File
 
@@ -46,6 +47,11 @@ class TranscriptCoordinator(
     private val repository: TranscriptRepository,
     private val modelsRoot: File,
     private val clock: TimeSource,
+    /**
+     * 实时预览的落点（「首次播放实时转录并显示」）。每识别完一个 VAD 段就把该段切出的句子追加进去，
+     * 播放页边转边显示；null（部分测试场景）= 不发布，其余行为不变。
+     */
+    private val liveStore: LiveTranscriptStore? = null,
 ) {
 
     /**
@@ -102,18 +108,19 @@ class TranscriptCoordinator(
             engine.release()
             return fail(jobId, TranscriptFailure.ModelMissing, "VAD 打不开（${vadModel.path}）：${e.javaClass.simpleName} ${e.message}")
         }
-        try {
+        val outcome: TranscriptOutcome = try {
             run.recognizeAll(target, isCancelled, onProgress)
+            if (run.wasCancelled) TranscriptOutcome.Cancelled else settle(jobId, run)
         } catch (e: PcmDecodeException) {
-            return fail(jobId, TranscriptFailure.DecodeFailed, e.message ?: "解码失败")
+            fail(jobId, TranscriptFailure.DecodeFailed, e.message ?: "解码失败")
         } catch (e: OutOfMemoryError) {
-            return fail(jobId, TranscriptFailure.OutOfMemory, "内存不足，转录中止（${run.summaryLine()}）：${e.message}")
+            fail(jobId, TranscriptFailure.OutOfMemory, "内存不足，转录中止（${run.summaryLine()}）：${e.message}")
         } finally {
             run.releaseAll()
+            // 实时预览退场，所有结局一致：提交场景库里已是新一轮字幕（Room 流紧随其后），失败/取消本就不该留
+            liveStore?.clear(target.audioId)
         }
-
-        if (run.wasCancelled) return TranscriptOutcome.Cancelled
-        return settle(jobId, run)
+        return outcome
     }
 
     /** 解码 → VAD → 逐块识别。VAD 每吐一段就立刻识别完，所以同时在内存里的只有当前这一段（≤20 s ≈ 1.28 MB）。 */
@@ -128,15 +135,15 @@ class TranscriptCoordinator(
                 wasCancelled = true
                 false
             } else {
-                vad.push(samples).forEach { utterance -> consume(utterance, onProgress) }
+                vad.push(samples).forEach { utterance -> consume(utterance, target, onProgress) }
                 true
             }
         }
-        if (!wasCancelled) vad.finish().forEach { utterance -> consume(utterance, onProgress) }
+        if (!wasCancelled) vad.finish().forEach { utterance -> consume(utterance, target, onProgress) }
     }
 
     /** 一个 VAD 段：切成 ≤20 s 的块逐块识别，字攒成 [RecognizedSegment]（一个段一组候选字，§6 第 1 条）。 */
-    private fun Attempt.consume(utterance: VadUtterance, onProgress: (Int, Int) -> Unit) {
+    private fun Attempt.consume(utterance: VadUtterance, target: TranscriptionTarget, onProgress: (Int, Int) -> Unit) {
         val tokens = mutableListOf<TokenTiming>()
         for (chunk in AsrChunkPlanner.plan(listOf(utterance.span))) {
             totalChunks++
@@ -152,14 +159,31 @@ class TranscriptCoordinator(
             if (wasCancelled) return
         }
         if (tokens.isNotEmpty()) {
-            segments += RecognizedSegment(
+            val segment = RecognizedSegment(
                 startMs = AsrChunkPlanner.msOf(utterance.startSample, AudioFormats.ASR_SAMPLE_RATE),
                 endMs = AsrChunkPlanner.msOf(utterance.endSample, AudioFormats.ASR_SAMPLE_RATE),
                 tokens = tokens,
             )
+            segments += segment
         }
         doneSegments++
+        if (tokens.isNotEmpty()) {
+            publishLive(target, segments.last(), doneSegments)
+        }
         reportProgress(onProgress)
+    }
+
+    /**
+     * 一个段识别完就切句发进实时预览（「首次播放实时转录并显示」）。
+     * 切句按**单个段**做：跨段合并过度切分只有收尾的整本切分做得到，所以预览偶尔比正式字幕略碎——
+     * 已知差别，收尾以 `commitSubtitles` 的整本结果为准。
+     */
+    private fun publishLive(target: TranscriptionTarget, segment: RecognizedSegment, doneSegments: Int) {
+        val store = liveStore ?: return
+        val sentences = SentenceSplitter.split(listOf(segment)).map { draft ->
+            SubtitleSegment(index = 0, startMs = draft.startMs, endMs = draft.endMs, text = draft.text)
+        }
+        store.append(target.audioId, sentences, doneSegments)
     }
 
     private fun Attempt.reportProgress(onProgress: (Int, Int) -> Unit) {

@@ -668,6 +668,28 @@ FR-707（只在当前句变化时更新）用**设备 + 单测两头**取证：�
 - 「转录页 `MODEL_MISSING` 文案 → 按指引去设置页恢复 → 回来重试成功」的完整闭环没连起来走（三段各自都有证据）。
 - assets 被打包工具弄坏（内容坏了但大小恰好对上）只有 JVM 用例（SHA-256 闸门），设备上没有对应场景。
 
+### Phase 6g（首次播放实时转录并显示 + APPEND 毒化链修复，2026-10-16 11:00 ~ 12:00）
+
+生产改动：新增 `domain/transcript/LiveTranscriptStore`（纯 Kotlin 内存预览账本）；`TranscriptCoordinator` 每识别完一个 VAD 段单段切句发布、收尾 `clear`（放 `finally`，所有结局一致）；`EchoMindApp`/`AppGraph` 装配；`PlayerViewModel` 新增自动发起判定（三无才发）+ 实时窗口流 + 状态行四态（`startTranscription` 做成 lambda 是为了 JVM 可测）；`PlayerScreen` 字幕区接状态行与实时预览窗口；**`TranscriptWorkScheduler` 的 `APPEND` → `APPEND_OR_REPLACE`、`TranscriptWorker` 失败返回 `success`（真雷，见下）**。
+
+| 验收点 | 结果 | 凭据 |
+| --- | --- | --- |
+| **自动发起（三无判定）** | SAF 文件夹 `cp` 一份真语音 → 重扫出新书（NONE、无任务、无字幕）→ 进播放页自动入队开跑；转过/取消过/有测试字幕/已 READY 的书都不发（4 条 JVM 判定用例） | 设备端到端 + `PlayerViewModelTest` |
+| **实时预览逐段增长、收尾清场** | 仪器化新用例（收集器必须在 `Dispatchers.IO` 上：`runBlocking` 的事件循环在阻塞解码期间不会跑别的协程——写这条用例时踩的第一个坑）：运行中快照序列只涨不缩、run 返回后预览清空、库里 35 句 | 单类 `OK (1 test)` + 整套件 `OK (103 tests)` |
+| **播放页实时显示（UI）** | t+3s「正在转录：已识别 0 段 · 已出 0 句」（模型装载中，如实显示不画假进度）；t+12s「已识别 1 段 · 已出 6 句」+ 歌词实时流出、当前句高亮；t+20s SUCCESS、状态行退场、「35 句」正式字幕接管（点句跳转/七句窗口复用） | 截图 `/tmp/shot_live_1.png`（0 段）、`/tmp/shot_live_4.png`（1 段 6 句）+ UI dump 三连 |
+| **入库与状态** | 24 段全部识别、35 句 `source=ASR` 落库、书变 READY（有一轮 7.2 s 跑完 24 段，RTF≈0.05——链路无人为减速） | `run-as sqlite3` 查询 |
+| **APPEND 毒化链（真雷）** | 第一次端到端时任务卡 QUEUED、worker 从不启动、logcat 无任何 worker 日志、`work_request_id` 已正常写回——**链里有 6d 的一次取消，`APPEND` 把新任务连带取消**（与 WorkManager 文档注记一致；技术债表里旧注「引用文档」的语义此前被理解反了）。修：`APPEND_OR_REPLACE` + worker 失败返回 `success`；复测自动转录即时开跑 | 修复前后 DB 对比（QUEUED 不动 → SUCCESS）；`architecture.md` D36 补修正 |
+| 构建与测试 | `:app:assembleDebug` + `:app:testDebugUnitTest` **BUILD SUCCESSFUL**；JVM **22 个类 / 250 用例 / 0 failures**（241 → 250：`LiveTranscriptStoreTest` 6 + `PlayerViewModelTest` 重写 +9）；仪器化 **OK (103 tests)**（102 → 103：协调器实时预览用例） | XML 汇总 + instrument 尾行 |
+
+**诊断过程（「排队中」假象）**：UI 显示「转录排队中（另一本书正在转录）」→ 查库**没有任何 RUNNING 行** → `work_request_id` 已写回说明 `schedule()` 正常执行 → WorkManager 完全没有 worker 日志 → 唯一特殊史是 6d 的一次用户取消 → 查 WorkManager 文档：`APPEND` 下「链被取消则新任务连带取消」。这条正是技术债表里「`APPEND` 排队无用例（引用文档）」欠下的那笔。
+**测试痕迹清理**：卡住的 QUEUED 行靠 `recoverInterrupted()` 在重启时标 `FAILED(INTERRUPTED)`（顺带验证了它），再用 `run-as sqlite3` 删行、书状态复位 NONE 后重测（模拟器有 `/system/bin/sqlite3`，`run-as` 下直接可写 App 数据库）。
+
+**这一轮没做 / 做不了**：
+- 实时转录 + 播放同时跑的掉帧采样（FR-509）没测——这个功能让「播放 + 转录同时跑」成了产品默认路径，Phase 7 的 gfxinfo 采样优先级上调。
+- 预览期间拖动进度条跳到未识别区域没专门验（窗口走「首句之前不补位」的既有逻辑）。
+- `MODEL_MISSING` 失败在播放页的文案只有 JVM 用例（模型已内置，设备上造不出来）。
+- 上一轮（6e/6f）遗留：删除按钮本体、`MODEL_MISSING` 三段闭环——继续挂账。
+
 ## 5. 待补的自动化测试清单（按阶段）
 
 | Phase | 用例 |

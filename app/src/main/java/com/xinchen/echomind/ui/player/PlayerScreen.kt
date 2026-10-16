@@ -79,6 +79,8 @@ fun PlayerScreen(
     val subtitles by viewModel.subtitles.collectAsStateWithLifecycle()
     val summary by viewModel.subtitleSummary.collectAsStateWithLifecycle()
     val notice by viewModel.subtitleNotice.collectAsStateWithLifecycle()
+    val liveTranscript by viewModel.liveTranscript.collectAsStateWithLifecycle()
+    val liveWindow by viewModel.liveWindow.collectAsStateWithLifecycle()
 
     // FR-302 的通知栏控制在 Android 13+ 需要运行时通知权限：没有它服务照样播，但用户看不到任何控制入口
     val context = LocalContext.current
@@ -135,6 +137,8 @@ fun PlayerScreen(
                     subtitles = subtitles,
                     summary = summary,
                     notice = notice,
+                    liveTranscript = liveTranscript,
+                    liveWindow = liveWindow,
                 )
             }
         }
@@ -149,6 +153,8 @@ private fun PlayerBody(
     subtitles: SubtitleWindow,
     summary: SubtitleSummary,
     notice: String?,
+    liveTranscript: PlayerTranscriptState,
+    liveWindow: SubtitleWindow?,
 ) {
     // 拖动期间用本地值：松手才 seek，否则每帧都在打断播放器并写库
     var dragTo by remember { mutableStateOf<Float?>(null) }
@@ -219,7 +225,7 @@ private fun PlayerBody(
         )
 
         Card(modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) {
-            SubtitleSection(viewModel, subtitles, summary, notice)
+            SubtitleSection(viewModel, subtitles, summary, notice, liveTranscript, liveWindow)
         }
     }
 }
@@ -227,7 +233,9 @@ private fun PlayerBody(
 /**
  * 字幕区（FR-701/702/706）。窗口只有最多 7 句，所以直接铺开，不用滚动列表。
  *
- * 没有字幕时如实说「还没有」，并给出真正的原因（本地 ASR 在 Phase 6），不显示任何占位文本。
+ * 转录进行中（「首次播放实时转录并显示」）优先显示实时预览窗口，顶部给状态行；
+ * 失败/取消给可执行文案（与转录页同一套 [com.xinchen.echomind.ui.transcript.TranscriptDisplay]）。
+ * 没有字幕也没有转录时如实说「还没有」，不显示任何占位假字幕。
  */
 @Composable
 private fun SubtitleSection(
@@ -235,6 +243,8 @@ private fun SubtitleSection(
     window: SubtitleWindow,
     summary: SubtitleSummary,
     notice: String?,
+    liveTranscript: PlayerTranscriptState,
+    liveWindow: SubtitleWindow?,
 ) {
     val context = LocalContext.current
     // 只给 debug 包装开：正式包里不能有一个「凭空造字幕」的入口（AGENTS.md §5）
@@ -278,10 +288,25 @@ private fun SubtitleSection(
             }
         }
 
+        // 转录状态行（转录中/排队中）与失败/取消的降级文案：两者不并存，都是如实陈述
+        liveTranscript.statusLine?.let {
+            Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+        }
+        liveTranscript.failureLine?.let {
+            Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+        }
+
         when {
+            // 转录进行中：实时预览优先（它是「正在产出的最新结果」，转完由库里的正式字幕接管）
+            liveWindow != null -> {
+                liveWindow.before.forEach { SubtitleLine(it, current = false, onSeek = viewModel::seekTo) }
+                liveWindow.current?.let { SubtitleLine(it, current = true, onSeek = viewModel::seekTo) }
+                liveWindow.after.forEach { SubtitleLine(it, current = false, onSeek = viewModel::seekTo) }
+            }
+
             summary.count == 0 -> {
                 Text(
-                    "还没有字幕。本地转录（Phase 6 的 sherpa-onnx）接入后这里会自动出现，之前不会放任何假字幕。",
+                    "还没有字幕。第一次播放会自动开始转录，识别出的句子会边转边出现在这里；任务管理在「转录」页。",
                     style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.padding(top = 4.dp),
                 )

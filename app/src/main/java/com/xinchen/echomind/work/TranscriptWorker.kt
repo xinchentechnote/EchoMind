@@ -86,7 +86,10 @@ class TranscriptWorker(
 
             is TranscriptOutcome.Failed -> {
                 Log.w(TAG, "转录失败（${outcome.failure}）：${outcome.message}")
-                Result.failure(Data.Builder().putString(KEY_ERROR, outcome.message).build())
+                // 返回 success 而不是 failure：失败**已经写进库里那一行**（唯一事实来源，FR-507 的
+                // 「不自动重试」由用户点重试体现）；WorkManager 的 Result.failure 会把唯一名链条判成
+                // failed，后面 APPEND_OR_REPLACE 排上来的人会被连带处理，链条状态我们不需要它记。
+                Result.success()
             }
 
             // 用户点了取消：库里那行已经是 CANCELLED（是 `cancel()` 改的，不是这里），worker 收工。

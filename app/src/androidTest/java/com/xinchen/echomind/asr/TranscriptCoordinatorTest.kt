@@ -24,6 +24,8 @@ import com.xinchen.echomind.domain.model.EnqueueOutcome
 import com.xinchen.echomind.domain.model.TranscriptFailure
 import com.xinchen.echomind.domain.model.TranscriptJobStatus
 import java.io.File
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -379,6 +381,49 @@ class TranscriptCoordinatorTest {
         assertEquals(TranscriptJobEntity.Status.Running, jobRow(jobId).status)
         assertNull(jobRow(jobId).errorCode)
         assertEquals(0, subtitles().size)
+    }
+
+    /**
+     * 「首次播放实时转录并显示」的协调器半边：识别进行中预览要**逐段增长**（不是憋到最后一次性给出），
+     * 收尾（无论成败）预览清场、由库里那份正式字幕接管。
+     *
+     * 收集器必须放在**另一个真实线程**上：`recognizeAll` 全程阻塞测试线程（解码回调里逐段识别），
+     * runBlocking 的事件循环在中途没有机会跑别的协程；StateFlow 的更新发生在回调线程上，
+     * IO 线程上的收集者才能实时看到。中间值允许被 conflated，只要看得到增长与清场就足够。
+     */
+    @Test
+    fun 识别过程中实时预览逐段增长收尾清场() = runBlocking {
+        val durationMs = DeviceAsrFixtures.REAL_MP3_DURATION_MS
+        val jobId = enqueueBook(fileUriOf(DeviceAsrFixtures.REAL_MP3), durationMs = durationMs)
+        val store = com.xinchen.echomind.domain.transcript.LiveTranscriptStore()
+        val snapshots = java.util.concurrent.CopyOnWriteArrayList<Int>()
+        val collector = launch(Dispatchers.IO) {
+            store.live.collect { map ->
+                map[AUDIO_ID]?.let { live ->
+                    if (snapshots.isEmpty() || snapshots.last() != live.sentences.size) {
+                        snapshots += live.sentences.size
+                    }
+                }
+            }
+        }
+
+        val outcome = try {
+            TranscriptCoordinator(context, audioRepository, grants, repository, modelsRoot, SteppingClock(), liveStore = store)
+                .run(jobId)
+        } finally {
+            collector.cancel()
+        }
+
+        val committed = outcome as? TranscriptOutcome.Committed
+            ?: error("端到端没跑成（$outcome），预览的增长无从谈起")
+        Log.i(TAG, "实时预览快照序列=$snapshots，收尾句数=${committed.sentences}")
+
+        assertTrue("运行中预览一次都没出现：$snapshots", snapshots.isNotEmpty())
+        assertTrue("预览里一句都没有：$snapshots", snapshots.last() > 0)
+        assertEquals("预览只涨不缩", snapshots, snapshots.sorted())
+        // 收尾清场：字幕此后以库里那份为准（本条用例里 in-memory Room 的行已在 committed.sentences 里）
+        assertNull("run 返回后预览必须已清空", store.live.value[AUDIO_ID])
+        assertEquals(committed.sentences.toLong(), subtitles().size.toLong())
     }
 
     private fun emptyModelsRoot(): File =
