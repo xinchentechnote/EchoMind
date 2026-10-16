@@ -755,6 +755,17 @@ MediaExtractor——前者是能力的直接证据，后者只证明容器解析
 **干净文件零变化**：`PcmDecoderTest` 4 条、协调器端到端（24 段 → 35 句、丢弃 0）、探针（漂移仍 0.0 ms）
 全部复跑一致；整套件 **OK (107 tests)**；JVM 253 → **259**。
 
+**用户真实文件已入库为常驻回归素材（2026-10-16 项目主人拍板保留）**：
+`test-data/0906 多动的孩子也能好好学【音频】.mp3`（56.2 分钟，32 kHz，117.9 kbps）与
+`test-data/如何培养孩子的社会能力.wma`（34 分 21 秒，wmav2 44.1 kHz 双声道——libwma 的真实世界素材）。
+用法：推上设备后交给时间轴探针或端到端用例——
+```
+adb push "test-data/0906 多动的孩子也能好好学【音频】.mp3" /sdcard/Android/data/com.xinchen.echomind/files/asr-fixtures/user-test.mp3
+adb push "test-data/如何培养孩子的社会能力.wma" /sdcard/Android/data/com.xinchen.echomind/files/asr-fixtures/user-test.wma
+adb shell am instrument -w -e probe_name user-test.mp3 -e class com.xinchen.echomind.asr.PcmTimelineProbeTest ...
+```
+（`test-data/` 已进 `.gitignore`：现有两份跟踪保留，目录里将来新增的文件不会被 `git add -A` 连带提交。）
+
 **用户真实文件的探针结果（test-data/ 的 56 分钟书解 mp3，32 kHz）**：解码样本数 ↔ PTS 全程漂移仅 **72 ms**
 （RTF 视角：107,956,224 样本 / 3,373 s，32000 Hz/2ch）——解码侧机制在他们自己的文件上同样**不成立**。
 PTS 锚定作为「构造上保证字幕时间轴 = 播放时钟」的加固保留；用户观察到的秒级提前若复测仍在，
