@@ -31,14 +31,29 @@ data class ModelFileSpec(
 
 enum class ModelRole { Recognizer, VoiceActivityDetector }
 
+/** 识别引擎的种类：决定 `SherpaOnnxEngine` 工厂怎么装配 sherpa-onnx 的模型配置（D41）。 */
+enum class ModelKind {
+    /** 中文 Paraformer（单文件 model.int8.onnx，逐字时间戳） */
+    PARAFORMER,
+
+    /** OpenAI Whisper（encoder + decoder 双文件，多语种；sherpa-onnx 导出无注意力权重 → 无 token 时间戳，D41） */
+    WHISPER,
+
+    /** SenseVoice（单文件 model.int8.onnx，中英日韩粤，CTC 时间戳，2025-09-09 版起支持） */
+    SENSEVOICE,
+}
+
 /**
  * 一个可独立下载/删除的模型包。设备上的目录名就是 [id]（`filesDir/models/<id>/`，见 `docs/asr-design.md` §7）。
+ *
+ * [kind] 只对 `role = Recognizer` 有意义（VAD 不经 `SherpaOnnxEngine` 装载）。
  */
 data class ModelSpec(
     val id: String,
     val displayName: String,
     val role: ModelRole,
     val files: List<ModelFileSpec>,
+    val kind: ModelKind = ModelKind.PARAFORMER,
 ) {
     val totalBytes: Long get() = files.sumOf { it.expectedBytes }
 }
@@ -65,6 +80,15 @@ object ModelCatalog {
     const val PARAFORMER_MODEL_FILE = "model.int8.onnx"
     const val PARAFORMER_TOKENS_FILE = "tokens.txt"
     const val SILERO_VAD_MODEL_FILE = "silero_vad.onnx"
+
+    const val WHISPER_BASE_ID = "whisper-base-multilingual"
+    const val WHISPER_ENCODER_FILE = "base-encoder.int8.onnx"
+    const val WHISPER_DECODER_FILE = "base-decoder.int8.onnx"
+    const val WHISPER_TOKENS_FILE = "base-tokens.txt"
+
+    const val SENSEVOICE_ID = "sense-voice-zh-en-ja-ko-yue-int8"
+    const val SENSEVOICE_MODEL_FILE = "model.int8.onnx"
+    const val SENSEVOICE_TOKENS_FILE = "tokens.txt"
 
     private const val HF_MIRROR = "https://hf-mirror.com/csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14/resolve/main"
     private const val HUGGINGFACE = "https://huggingface.co/csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14/resolve/main"
@@ -110,7 +134,85 @@ object ModelCatalog {
         ),
     )
 
-    val all: List<ModelSpec> = listOf(paraformer, sileroVad)
+    /**
+     * Whisper Base 多语种。⚠ **不在 [all]（不进下载列表）**：sherpa-onnx 的 whisper 导出不含
+     * attention 权重，`enableTokenTimestamps` 实测拿不到时间戳（D41 打样）——出不了带时间的字幕，
+     * 对本产品等于不可用。保留 spec 供打样测试（`WhisperPilotTest`）与未来自建导出后复评。
+     * 哈希为本机下载实测值（hf-mirror，2026-10-16）；官方对 int8 导出文件不发布校验值 → 本机钉住。
+     */
+    val whisperBase: ModelSpec = ModelSpec(
+        id = WHISPER_BASE_ID,
+        displayName = "Whisper Base 多语种（英文书解/歌曲）",
+        role = ModelRole.Recognizer,
+        kind = ModelKind.WHISPER,
+        files = listOf(
+            ModelFileSpec(
+                fileName = WHISPER_ENCODER_FILE,
+                url = "https://hf-mirror.com/csukuangfj/sherpa-onnx-whisper-base/resolve/main/$WHISPER_ENCODER_FILE",
+                backupUrls = listOf(
+                    "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-base/resolve/main/$WHISPER_ENCODER_FILE",
+                ),
+                expectedBytes = 29_120_534L,
+                officialSha256 = null,
+                pinnedSha256 = "0b8fb1304b6109976038efff5ace81720e00386f3ff6b54ee8c75291ca0a1e11",
+            ),
+            ModelFileSpec(
+                fileName = WHISPER_DECODER_FILE,
+                url = "https://hf-mirror.com/csukuangfj/sherpa-onnx-whisper-base/resolve/main/$WHISPER_DECODER_FILE",
+                backupUrls = listOf(
+                    "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-base/resolve/main/$WHISPER_DECODER_FILE",
+                ),
+                expectedBytes = 130_672_026L,
+                officialSha256 = null,
+                pinnedSha256 = "9759d217388a01b3a4c7c15533201067b48ae819c4daafc8624e64b9409dc02d",
+            ),
+            ModelFileSpec(
+                fileName = WHISPER_TOKENS_FILE,
+                url = "https://hf-mirror.com/csukuangfj/sherpa-onnx-whisper-base/resolve/main/$WHISPER_TOKENS_FILE",
+                backupUrls = listOf(
+                    "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-base/resolve/main/$WHISPER_TOKENS_FILE",
+                ),
+                expectedBytes = 816_730L,
+                officialSha256 = null,
+                pinnedSha256 = "b34b360dbb493e781e479794586d661700670d65564001f23024971d1f2fa126",
+            ),
+        ),
+    )
+
+    /**
+     * SenseVoice 多语种（2025-09-09 版：中英日韩粤 + 时间戳；英文书解/中英歌曲候选，D41）。
+     * 哈希为本机下载实测值（hf-mirror，2026-10-16）；官方未发布校验值 → 本机钉住。
+     */
+    val senseVoice: ModelSpec = ModelSpec(
+        id = SENSEVOICE_ID,
+        displayName = "SenseVoice 多语种（中英日韩粤）",
+        role = ModelRole.Recognizer,
+        kind = ModelKind.SENSEVOICE,
+        files = listOf(
+            ModelFileSpec(
+                fileName = SENSEVOICE_MODEL_FILE,
+                url = "https://hf-mirror.com/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09/resolve/main/$SENSEVOICE_MODEL_FILE",
+                backupUrls = listOf(
+                    "https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09/resolve/main/$SENSEVOICE_MODEL_FILE",
+                ),
+                expectedBytes = 237_115_547L,
+                officialSha256 = null,
+                pinnedSha256 = "12ca1a2ae7ecf3e0019ef2822307ee0b5cadc9196569e379b4c4026f8205276d",
+            ),
+            ModelFileSpec(
+                fileName = SENSEVOICE_TOKENS_FILE,
+                url = "https://hf-mirror.com/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09/resolve/main/$SENSEVOICE_TOKENS_FILE",
+                backupUrls = listOf(
+                    "https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09/resolve/main/$SENSEVOICE_TOKENS_FILE",
+                ),
+                expectedBytes = 315_894L,
+                officialSha256 = null,
+                pinnedSha256 = "f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc",
+            ),
+        ),
+    )
+
+    val all: List<ModelSpec> = listOf(paraformer, sileroVad, senseVoice)
 
     /**
      * 当前识别模型的身份，写进 `transcript_job` 的 `model_id` / `model_version`。

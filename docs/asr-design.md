@@ -102,6 +102,9 @@
 ```
 ModelManager                              ← 清单/下载/导入/SHA-256 校验/删除/状态 Flow   ✅ DONE（设备真 URL 验证过，见 §7）
 PcmDecoder                                ← MediaExtractor + MediaCodec（同步模式）流式解码   ✅ DONE + 4 条仪器化（真 MP3 已在设备解出）
+   ─ 多语种扩展（2026-10-16，D41）：识别模型不再只有 Paraformer——SenseVoice int8（中英日韩粤，
+     226 MB，带时间戳）进清单供英文听书/中英听歌；whisper base 实测英文质量最高但 sherpa 导出
+     无 attention 权重、拿不到时间戳，不进下载清单（spec 保留供打样）。引擎工厂按 ModelSpec.kind 装配。
 domain/asr/PcmConversion                  ← 16-bit LE PCM 字节 → 单声道 float（均值下混）  ✅ DONE + 11 条 JVM 单测
 domain/asr/SincResampler                  ← 源采样率 → 16 kHz 的抗混叠流式重采样            ✅ DONE + 12 条 JVM 单测
 asr/VadSegmenter                          ← silero VAD：float 块 → VadUtterance（全局样本起点 + 该段音频） ✅ DONE + 6 条仪器化（真模型真音频）

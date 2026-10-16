@@ -78,25 +78,40 @@ class ModelCatalogTest {
      * 所以它必须是清单里唯一 `hasOfficialChecksum == false` 的文件，UI 才能如实标注。
      */
     @Test
-    fun `只有 tokens txt 没有官方校验值`() {
+    fun `没有官方校验值的文件名单是封闭的且都本机钉住`() {
+        // 名单是**封闭**的：新增模型带非官方校验值时这里要连着改，防止「来源不明」的文件混进来（AGENTS.md §5）
         val withoutOfficial = ModelCatalog.all.flatMap { it.files }.filterNot { it.hasOfficialChecksum }
-        assertEquals(listOf("tokens.txt"), withoutOfficial.map { it.fileName })
-        val tokens = ModelCatalog.paraformer.files[1]
-        assertNull(tokens.officialSha256)
-        assertEquals(tokens.pinnedSha256, tokens.expectedSha256)
+        // whisperBase 不进 all → 其三份非官方校验值文件也退出这份名单
+        assertEquals(
+            listOf("tokens.txt", "model.int8.onnx", "tokens.txt"),
+            withoutOfficial.map { it.fileName },
+        )
+        withoutOfficial.forEach { file ->
+            assertNull("${file.fileName} 官方值应为 null", file.officialSha256)
+            assertEquals("${file.fileName} 期望值必须来自本机钉住", file.pinnedSha256, file.expectedSha256)
+        }
     }
 
     @Test
-    fun `识别模型只有支持时间戳的那一个型号`() {
-        val recognizers = ModelCatalog.all.filter { it.role == ModelRole.Recognizer }
-        assertEquals(1, recognizers.size)
-        assertEquals(ModelCatalog.paraformer, recognizers.single())
-        // 型号名必须落在 zh-2023-09-14 上：官方只有它带时间戳（docs/asr-design.md §1-A4），
-        // 换型号等于放弃句级时间，所以清单里换型号要连这条测试一起改。
+    fun `中文书解模型仍是带时间戳的zh型号`() {
+        // 中文主场景的型号不许被悄悄换掉：官方只有 zh-2023-09-14 带逐字时间戳（docs/asr-design.md §1-A4）
         assertEquals("paraformer-zh-2023-09-14-int8", ModelCatalog.PARAFORMER_ID)
+        assertEquals(ModelKind.PARAFORMER, ModelCatalog.paraformer.kind)
         ModelCatalog.paraformer.files.forEach {
             assertTrue("${it.url} 不是 zh-2023-09-14 的仓库", it.url.contains("sherpa-onnx-paraformer-zh-2023-09-14"))
         }
+    }
+
+    @Test
+    fun `whisper是多语种识别模型且时间戳开关打开`() {
+        val whisper = ModelCatalog.whisperBase
+        assertEquals(ModelKind.WHISPER, whisper.kind)
+        assertEquals(ModelRole.Recognizer, whisper.role)
+        whisper.files.forEach {
+            assertTrue("${it.url} 不是 whisper-base 的仓库", it.url.contains("sherpa-onnx-whisper-base"))
+        }
+        // 哈希是本机下载实测钉住的（hf-mirror，官方对 int8 导出不发布校验值）
+        assertTrue(whisper.files.all { !it.hasOfficialChecksum })
     }
 
     @Test
@@ -104,7 +119,11 @@ class ModelCatalogTest {
         val ids = ModelCatalog.all.map { it.id }
         assertEquals(ids.size, ids.toSet().size)
         assertEquals(ModelCatalog.sileroVad, ModelCatalog.byId(ModelCatalog.SILERO_VAD_ID))
-        assertEquals(listOf(ModelCatalog.paraformer, ModelCatalog.sileroVad), ModelCatalog.all)
+        // whisperBase 不进 all（D41：无 token 时间戳，出不了字幕）；下载列表 = 三件
+        assertEquals(
+            listOf(ModelCatalog.paraformer, ModelCatalog.sileroVad, ModelCatalog.senseVoice),
+            ModelCatalog.all,
+        )
     }
 
     @Test
@@ -116,6 +135,7 @@ class ModelCatalogTest {
     fun `总大小是各文件之和`() {
         assertEquals(243_371_218L + 75_756L, ModelCatalog.paraformer.totalBytes)
         assertEquals(643_854L, ModelCatalog.sileroVad.totalBytes)
+        assertEquals(29_120_534L + 130_672_026L + 816_730L, ModelCatalog.whisperBase.totalBytes)
     }
 
     private companion object {

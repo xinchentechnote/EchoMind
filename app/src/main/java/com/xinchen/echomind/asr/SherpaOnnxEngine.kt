@@ -4,6 +4,8 @@ import android.os.Looper
 import com.k2fsa.sherpa.onnx.FeatureConfig
 import com.k2fsa.sherpa.onnx.OfflineModelConfig
 import com.k2fsa.sherpa.onnx.OfflineParaformerModelConfig
+import com.k2fsa.sherpa.onnx.OfflineSenseVoiceModelConfig
+import com.k2fsa.sherpa.onnx.OfflineWhisperModelConfig
 import com.k2fsa.sherpa.onnx.OfflineRecognizer
 import com.k2fsa.sherpa.onnx.OfflineRecognizerConfig
 import com.xinchen.echomind.core.conf.AudioFormats
@@ -79,15 +81,14 @@ class SherpaOnnxEngine private constructor(
 
     companion object {
         /**
-         * 核对模型文件 → 加载引擎。**会阻塞几秒**（实测装载 4,100 ms），调用方必须在后台线程。
+         * 核对模型文件 → 加载引擎。**会阻塞几秒**（Paraformer 实测装载 4,100 ms），调用方必须在后台线程。
          *
-         * 识别模型固定用清单里那个中文 Paraformer（`ModelCatalog.paraformer`）：
-         * 官方只有它声明支持逐字时间戳，换型号等于放弃句级时间，所以这里不给参数口子。
+         * [spec] 决定装配哪种 sherpa-onnx 模型配置：中文书解默认用清单里的 Paraformer（逐字时间戳），
+         * 英文/歌曲用 [ModelCatalog.whisperBase]（`enableTokenTimestamps = true`、`language = ""` 自动检测）。
          * 核对走 [ModelVerifier]，也就是清单里那份 sha256，不接受「文件在就用」。
          */
-        fun open(modelsRoot: File): SherpaOnnxEngine {
+        fun open(modelsRoot: File, spec: ModelSpec = ModelCatalog.paraformer): SherpaOnnxEngine {
             check(Looper.myLooper() != Looper.getMainLooper()) { "SherpaOnnxEngine 不能在主线程打开（要加载 onnx 模型）" }
-            val spec = ModelCatalog.paraformer
             val dir = ModelVerifier.dirOf(modelsRoot, spec)
             val failures = spec.files
                 .map { fileSpec -> ModelVerifier.checkFile(File(dir, fileSpec.fileName), fileSpec) }
@@ -98,6 +99,44 @@ class SherpaOnnxEngine private constructor(
                         "模型目录 ${dir.path}"
                 )
             }
+            val tokensFile = spec.files.first { it.fileName.endsWith("tokens.txt") }.fileName
+            val modelConfig = when (spec.kind) {
+                ModelKind.PARAFORMER -> OfflineModelConfig(
+                    paraformer = OfflineParaformerModelConfig(
+                        model = File(dir, ModelCatalog.PARAFORMER_MODEL_FILE).absolutePath,
+                    ),
+                    tokens = File(dir, tokensFile).absolutePath,
+                    numThreads = AudioFormats.ASR_NUM_THREADS,
+                    debug = false,
+                    modelType = "paraformer",
+                )
+
+                ModelKind.WHISPER -> OfflineModelConfig(
+                    whisper = OfflineWhisperModelConfig().copy(
+                        encoder = File(dir, ModelCatalog.WHISPER_ENCODER_FILE).absolutePath,
+                        decoder = File(dir, ModelCatalog.WHISPER_DECODER_FILE).absolutePath,
+                        language = "", // 空 = 模型自动检测语言（实测 lang=en 检测正确）
+                        task = "transcribe",
+                        enableTokenTimestamps = true, // 实测导出无注意力权重，时间戳仍为空（D41 打样记录）
+                    ),
+                    tokens = File(dir, tokensFile).absolutePath,
+                    numThreads = AudioFormats.ASR_NUM_THREADS,
+                    debug = false,
+                    modelType = "whisper",
+                )
+
+                ModelKind.SENSEVOICE -> OfflineModelConfig(
+                    senseVoice = OfflineSenseVoiceModelConfig(
+                        model = File(dir, ModelCatalog.SENSEVOICE_MODEL_FILE).absolutePath,
+                        language = "", // 空 = 自动检测（result.lang 回读）
+                        useInverseTextNormalization = true,
+                    ),
+                    tokens = File(dir, tokensFile).absolutePath,
+                    numThreads = AudioFormats.ASR_NUM_THREADS,
+                    debug = false,
+                    modelType = "sense-voice",
+                )
+            }
             val recognizer = OfflineRecognizer(
                 assetManager = null, // null = 用文件系统绝对路径，模型不进 assets 也不进 APK
                 config = OfflineRecognizerConfig(
@@ -106,15 +145,7 @@ class SherpaOnnxEngine private constructor(
                         featureDim = AudioFormats.ASR_FEATURE_DIM,
                         dither = AudioFormats.ASR_DITHER,
                     ),
-                    modelConfig = OfflineModelConfig(
-                        paraformer = OfflineParaformerModelConfig(
-                            model = File(dir, ModelCatalog.PARAFORMER_MODEL_FILE).absolutePath,
-                        ),
-                        tokens = File(dir, ModelCatalog.PARAFORMER_TOKENS_FILE).absolutePath,
-                        numThreads = AudioFormats.ASR_NUM_THREADS,
-                        debug = false,
-                        modelType = "paraformer",
-                    ),
+                    modelConfig = modelConfig,
                 ),
             )
             return SherpaOnnxEngine(recognizer)

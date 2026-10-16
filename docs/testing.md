@@ -776,6 +776,27 @@ PTS 锚定作为「构造上保证字幕时间轴 = 播放时钟」的加固保�
 - 模拟器/蓝牙/部分真机的音频输出缓冲会让「听到的」滞后于 positionMs 若干百毫秒——
   这是播放环境的固有属性，不是字幕时间轴错误；若用户文件复测仍偏移，需要拿到那份 mp3 探针定位。
 
+### 多语种识别打样（whisper vs SenseVoice，D41，2026-10-16 21:00 ~ 21:25）
+
+新增：`ModelKind`（PARAFORMER/WHISPER/SENSEVOICE）+ `ModelCatalog.whisperBase`（**不进下载列表**）与
+`ModelCatalog.senseVoice`（进列表，哈希钉住）+ `SherpaOnnxEngine.open(modelsRoot, spec)` 工厂按 kind 装配
+（whisper：language="" 自动检测 + enableTokenTimestamps；sense-voice：language="" + ITN）+
+仪器化 `WhisperPilotTest`（英文 TTS 标准答案对照 / 用户书解 RTF / 全曲歌词 / token↔timestamp 形状）。
+
+| 实测项 | Whisper base int8（152 MB） | SenseVoice int8 2025-09-09（226 MB） |
+| --- | --- | --- |
+| 英文 TTS 质量（有标准答案） | **近完美**：60+ 词 1 错（gulls→gulps），数字归一化（forty-two→42） | 可读但有拼写级错误（LIHTHOUSE/THROUVH/WA/GULS），约 8~10 处 |
+| 中文书解质量 | 未测（中文不是 whisper 强项） | **极好**：书解转写近乎全对（56 分钟素材前 120 s） |
+| 中英歌词（全曲目检） | （未跑，无时间戳已出局） | 中文歌词几乎全对（「小声」同音与 Paraformer 一致）；英文段「HERE HAVE ALL THE FLOWERS GONE…」完整认出，拼写小错（GOE/GNE） |
+| **token 时间戳** | **无**：tokens=53、timestamps=0（`enableTokenTimestamps`/`enableSegmentTimestamps` 都开也不出——sherpa-onnx 导出缺 attention 权重，C++ 的 DTW 路径 `attention_weights.empty()` 直接跳过；导出脚本 decoder 只有 3 输出） | **有**：tokens=175/timestamps=175，秒、相对块起点——与 Paraformer 同语义，`TokenTimingMapper` 直接兼容 |
+| RTF（emulator） | 英文 TTS **0.07** | 英文 TTS 0.019；中文书解 120 s **0.019**；全曲 **0.020** |
+| 语言自动检测 | lang=en ✓ | lang=`<\|yue\|>`（普通话判成粤，不影响文本） |
+
+**结论（D41）**：多语种模型选 **SenseVoice**；whisper 不进下载列表（spec 保留）。whisper 翻案条件：自建导出
+在 decoder 加第 4 输出（`qk` 注意力权重，export_onnx.py 里已计算未导出）并升级 AAR。
+构建与测试：JVM 259 → **260 全绿**（catalog 钉子同步）；仪器化打样 4 条（2 条 whisper + 2 条 SenseVoice，属
+`WhisperPilotTest`，未计入正式套件——它是选型测量不是产品回归）。
+
 ## 5. 待补的自动化测试清单（按阶段）
 
 | Phase | 用例 |
