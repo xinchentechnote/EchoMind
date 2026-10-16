@@ -22,3 +22,6 @@ app/src/main/assets/models/
 
 # sherpa-onnx 等二进制依赖（手工取回，不入库）
 app/libs/
+
+# 用户自备的测试音频（是否入库由项目主人决定，避免被 git add -A 连带提交）
+test-data/

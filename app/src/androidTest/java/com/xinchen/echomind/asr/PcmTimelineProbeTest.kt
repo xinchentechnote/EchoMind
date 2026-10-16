@@ -26,7 +26,10 @@ class PcmTimelineProbeTest {
 
     @Test
     fun 逐段量解码样本数与容器PTS的对应关系() {
-        val uri = Uri.fromFile(DeviceAsrFixtures.fixture(context = context))
+        // 可用 -e probe_name <素材文件名> 指定任意 fixture；默认那份真 mp3
+        val name = androidx.test.platform.app.InstrumentationRegistry.getArguments()
+            .getString("probe_name") ?: DeviceAsrFixtures.REAL_MP3
+        val uri = Uri.fromFile(DeviceAsrFixtures.fixture(name, context))
         val extractor = MediaExtractor()
         var codec: MediaCodec? = null
         try {
