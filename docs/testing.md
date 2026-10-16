@@ -797,6 +797,34 @@ PTS 锚定作为「构造上保证字幕时间轴 = 播放时钟」的加固保�
 构建与测试：JVM 259 → **260 全绿**（catalog 钉子同步）；仪器化打样 4 条（2 条 whisper + 2 条 SenseVoice，属
 `WhisperPilotTest`，未计入正式套件——它是选型测量不是产品回归）。
 
+### 第二期：多语种产品化（模型选择 UI + 自动路由 + 切句英文适配，2026-10-16 21:30 ~ 23:55）
+
+生产改动：①转录确认卡片加**模型选择 chips**（自动识别/中文书解/英文·歌曲，`ModelChoice.toRef()` 映射到
+AUTO/Paraformer/SenseVoice 引用）；②协调器自动路由——任务记 `auto` 时用 SenseVoice 听开头 30 s，
+按**转写文本字符系别**路由（`domain` 无关的 `ModelRouting.resolve`），并把行上 model_id/version 从 auto
+改写为最终模型（新 DAO `updateModel`，只许 QUEUED 时改）；③切句器英文适配：sentencepiece `▁` 词界前缀
+拼句时去前缀补空格、拉丁文本句尾补「.」；④测试 fake 同步 `updateModel`。
+
+| 验收点 | 结果 | 凭据 |
+| --- | --- | --- |
+| 英文歌自动路由（设备 UI 端到端） | Taylor Swift（Love Story，拉丁人声）→ SenseVoice、40 句英文字幕落库；书解队列自动推进时 0906 中文书解 → Paraformer | `run-as sqlite3` + 转录页截图 `/tmp/taylor_en.png` |
+| 路由仪器化（双向） | 中文素材（那些花儿，探针出汉字）→ paraformer ✓；英文素材（en-tts，全拉丁）→ sensevoice ✓ | `OK (2 tests)` |
+| updateModel 守卫 | QUEUED 时可改、RUNNING 后拒绝（防篡改历史） | `OK (1 test)` |
+| 切句英文适配 | `▁` 词界拼出带空格英文句、拉丁句尾补「.」 | `SentenceSplitterTest` 两条更新 |
+| ModelRouting 多数票 | CJK≥拉丁 → Paraformer；拉丁占多/空转写 → SenseVoice；**少量幻觉汉字压不过拉丁正文**（Love Story 前奏钢琴的幻觉「我不道」不该劫持英文歌路由——初版 hasCJK 短路被这条用例抓出） | `ModelRoutingTest` 5 条 |
+| 构建与测试 | JVM 259 → **266 全绿**；仪器化全套件见尾行 | XML + instrument |
+
+**打样后修正的规则（第二轮设备实测抓出）**：初版「探针空转写 → 保守 Paraformer」把 **英文歌错路由了**——
+Love Story 开头 15 s 是钢琴前奏，SenseVoice 前 30 s 解不出文字，空探针落 Paraformer → 55 句中文乱码字幕。
+二版「探针空 → SenseVoice 兜底（中英都能解，中文质量实测极好）」+ 「少数幻觉汉字压不过拉丁正文」
+（hasCJK 短路被 ModelRoutingTest 用例抓出）→ 三版定稿。语言标签（`<|yue|>`）实测不可靠，弃用。
+
+**这一轮没做 / 做不了**：
+- LID 自动路由未做（原计划 whisper-tiny LID）：SenseVoice 兼任探测后不再需要额外 98 MB 模型；
+- 英文真实书解素材仍缺（test-data 只有中文书解 + 英文歌；英文 News TTS 已造，端到端走的是英文歌）；
+- SenseVoice 器乐幻觉句（「嗯。」@198 ms）未被质量闸门拦住（占比极低），短期接受；
+- whisper 翻案路径（自建导出加 attention 输出）仍未做。
+
 ## 5. 待补的自动化测试清单（按阶段）
 
 | Phase | 用例 |

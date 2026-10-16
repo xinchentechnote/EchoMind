@@ -90,6 +90,12 @@ object ModelCatalog {
     const val SENSEVOICE_MODEL_FILE = "model.int8.onnx"
     const val SENSEVOICE_TOKENS_FILE = "tokens.txt"
 
+    /**
+     * 「自动选模型」的哨兵 id：任务行先记它，协调器在装载引擎前用 SenseVoice 听开头 30 s 判语言，
+     * 再把行上的 model_id/version 改写为最终模型（zh/yue → Paraformer，其余 → SenseVoice，D41/ModelRouting）。
+     */
+    const val AUTO_MODEL_ID = "auto"
+
     private const val HF_MIRROR = "https://hf-mirror.com/csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14/resolve/main"
     private const val HUGGINGFACE = "https://huggingface.co/csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14/resolve/main"
 
@@ -233,4 +239,19 @@ object ModelCatalog {
     /** 找不到就抛，清单是封闭集合：调用方拿到 null 也做不了什么，不如让它立刻炸在日志里 */
     fun byId(id: String): ModelSpec = all.firstOrNull { it.id == id }
         ?: throw IllegalArgumentException("模型清单里没有 id=$id")
+
+    /** 模型身份（写进 transcript_job 的 model_id/version）。version = 主权重文件的 sha256 前 12 位 */
+    fun refOf(spec: ModelSpec): TranscriptModelRef {
+        val weight = spec.files.maxByOrNull { it.expectedBytes }
+            ?: throw IllegalArgumentException("模型包 ${spec.id} 没有文件")
+        return TranscriptModelRef(id = spec.id, version = weight.expectedSha256.take(12))
+    }
+
+    /** 各识别模型的语言路由（ModelRouting 的判定结果落到这里） */
+    fun specForFinal(ref: TranscriptModelRef): ModelSpec = when (ref.id) {
+        PARAFORMER_ID -> paraformer
+        WHISPER_BASE_ID -> whisperBase
+        SENSEVOICE_ID -> senseVoice
+        else -> throw IllegalArgumentException("模型清单里没有 id=${ref.id}")
+    }
 }

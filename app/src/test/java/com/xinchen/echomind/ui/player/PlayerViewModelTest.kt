@@ -180,6 +180,7 @@ class PlayerViewModelTest {
         override suspend fun updateProgress(jobId: String, doneSegments: Int, totalSegments: Int): Boolean = unsupported()
         override suspend fun commitSubtitles(jobId: String, segments: List<SubtitleSegment>): Int = unsupported()
         override suspend fun markFailed(jobId: String, failure: TranscriptFailure, message: String?): Boolean = unsupported()
+        override suspend fun updateModel(jobId: String, model: com.xinchen.echomind.domain.model.TranscriptModelRef): Boolean = unsupported()
         override suspend fun recoverInterrupted(): Int = unsupported()
 
         private fun unsupported(): Nothing = throw UnsupportedOperationException()

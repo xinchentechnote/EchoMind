@@ -75,7 +75,6 @@ class WhisperPilotTest {
                         language = "",
                         task = "transcribe",
                         enableTokenTimestamps = true,
-                        enableSegmentTimestamps = true,
                     ),
                     tokens = File(dir, ModelCatalog.WHISPER_TOKENS_FILE).absolutePath,
                     numThreads = AudioFormats.ASR_NUM_THREADS,

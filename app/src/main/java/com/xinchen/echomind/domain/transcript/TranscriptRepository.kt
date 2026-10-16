@@ -45,6 +45,12 @@ interface TranscriptRepository {
     suspend fun jobById(jobId: String): TranscriptJobRow?
 
     /**
+     * 自动路由的落笔：把行上的 model_id/version 从「auto」改写为语言判定后的最终模型。
+     * 只对该行还是 QUEUED 时有效（返回 false = 已经在跑/已结束，不许改）。
+     */
+    suspend fun updateModel(jobId: String, model: TranscriptModelRef): Boolean
+
+    /**
      * 失败/取消的任务重开一轮：新建一行（旧行留着当错误上下文，见 `docs/database-design.md` §6），
      * 而不是把旧行改回 QUEUED——历史一覆盖就再没人知道上次为什么失败。
      * jobId 查不到时返回 [EnqueueOutcome.JobNotFound]。

@@ -76,6 +76,16 @@ interface TranscriptJobDao {
     suspend fun updateProgress(id: String, doneSegments: Int, totalSegments: Int): Int
 
     /**
+     * 自动路由的落笔：把「auto」改写成最终选用的模型（语言判定在装载引擎前完成）。
+     * 只许改 QUEUED 的行——开始跑之后再换模型等于篡改历史。
+     */
+    @Query(
+        "UPDATE transcript_job SET model_id = :modelId, model_version = :modelVersion " +
+            "WHERE id = :id AND status = 'QUEUED'",
+    )
+    suspend fun updateModel(id: String, modelId: String, modelVersion: String): Int
+
+    /**
      * 写回 WorkManager 的请求 id（取消要用）。同样只许改还没结束的行：
      * 一行已经 SUCCESS/FAILED 之后再挂个 work id，取消按钮就会去 cancel 一个不相干的请求。
      */

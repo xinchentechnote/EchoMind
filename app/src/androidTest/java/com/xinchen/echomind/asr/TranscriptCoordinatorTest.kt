@@ -22,6 +22,7 @@ import com.xinchen.echomind.domain.importing.TreeBrowser
 import com.xinchen.echomind.domain.importing.TreeEntry
 import com.xinchen.echomind.domain.model.EnqueueOutcome
 import com.xinchen.echomind.domain.model.TranscriptFailure
+import com.xinchen.echomind.domain.model.TranscriptModelRef
 import com.xinchen.echomind.domain.model.TranscriptJobStatus
 import java.io.File
 import kotlinx.coroutines.Dispatchers
@@ -145,6 +146,7 @@ class TranscriptCoordinatorTest {
         folderId: String = "folder-1",
         fileStatus: String = AudioBookEntity.FileStatus.Present,
         durationMs: Long = 0,
+        modelRef: TranscriptModelRef = ModelCatalog.transcriptRef,
     ): String {
         db.audioBookDao().upsert(
             AudioBookEntity(
@@ -163,7 +165,7 @@ class TranscriptCoordinatorTest {
                 updatedAtMs = 1,
             ),
         )
-        return (repository.enqueue(audioId, ModelCatalog.transcriptRef) as EnqueueOutcome.Created).jobId
+        return (repository.enqueue(audioId, modelRef) as EnqueueOutcome.Created).jobId
     }
 
     private suspend fun jobRow(id: String): TranscriptJobEntity = db.transcriptJobDao().getById(id)!!
@@ -364,6 +366,41 @@ class TranscriptCoordinatorTest {
         assertEquals(TranscriptJobEntity.ErrorCode.OutputUnreliable, row.errorCode)
         assertEquals(AudioBookEntity.TranscriptionState.Failed, bookState())
         assertEquals("没字幕可写：库里的行必须与 FAILED 一致", 0, subtitles().size)
+    }
+
+    /**
+     * 自动路由（D41）：任务行记 auto 时，协调器先用 SenseVoice 听开头 30 s 判语言，
+     * zh/yue → Paraformer、en → SenseVoice，并把行上的 model_id 改写成最终模型。
+     */
+    @Test
+    fun 自动路由把中文素材路由到paraformer并改写行上的模型() = runBlocking {
+        val durationMs = DeviceAsrFixtures.REAL_MP3_DURATION_MS
+        val jobId = enqueueBook(
+            fileUriOf(DeviceAsrFixtures.REAL_MP3),
+            durationMs = durationMs,
+            modelRef = TranscriptModelRef(ModelCatalog.AUTO_MODEL_ID, ""),
+        )
+        coordinator().run(jobId, isCancelled = { false })
+
+        val row = jobRow(jobId)
+        assertEquals("中文素材应路由到 Paraformer", ModelCatalog.PARAFORMER_ID, row.modelId)
+        assertEquals(TranscriptJobEntity.Status.Success, row.status)
+        assertEquals(35, subtitles().size)
+    }
+
+    @Test
+    fun 自动路由把英文素材路由到sensevoice() = runBlocking {
+        val jobId = enqueueBook(
+            fileUriOf("en-tts.wav"),
+            durationMs = 27_293L,
+            modelRef = TranscriptModelRef(ModelCatalog.AUTO_MODEL_ID, ""),
+        )
+        coordinator().run(jobId, isCancelled = { false })
+
+        val row = jobRow(jobId)
+        assertEquals("英文素材应路由到 SenseVoice", ModelCatalog.SENSEVOICE_ID, row.modelId)
+        assertEquals(TranscriptJobEntity.Status.Success, row.status)
+        assertTrue("英文素材应出字幕", subtitles().isNotEmpty())
     }
 
     /**

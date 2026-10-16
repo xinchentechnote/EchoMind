@@ -30,9 +30,28 @@ data class TranscriptUiState(
     val existingAsr: Map<String, ExistingAsr> = emptyMap(),
     /** 从书架「转录这本书」带进来的目标；null = 只是在看列表 */
     val pendingAudioId: String? = null,
+    /** 本次转录用哪个识别模型（确认卡片上可改，默认自动） */
+    val modelChoice: ModelChoice = ModelChoice.AUTO,
     val isBusy: Boolean = false,
     val message: String? = null,
 )
+
+/**
+ * 转录模型的选择（D41 中英文支持）。[toRef] 给出写进任务行的模型引用：
+ * AUTO 由协调器在装载引擎前探测语言并改写行上的 model_id（SenseVoice 听开头 30 s）。
+ */
+enum class ModelChoice(val label: String) {
+    AUTO("自动识别"),
+    ZH_BOOK("中文书解"),
+    MULTILINGUAL("英文/歌曲"),
+    ;
+
+    fun toRef(): TranscriptModelRef = when (this) {
+        AUTO -> TranscriptModelRef(ModelCatalog.AUTO_MODEL_ID, "")
+        ZH_BOOK -> ModelCatalog.transcriptRef
+        MULTILINGUAL -> TranscriptModelRef(ModelCatalog.SENSEVOICE_ID, "")
+    }
+}
 
 /**
  * 转录页的 ViewModel（FR-507/508）。
@@ -84,11 +103,17 @@ class TranscriptViewModel(
         _state.update { it.copy(pendingAudioId = null) }
     }
 
+    /** 确认卡片上改模型；已入队的任务不受影响（模型在入队时定型） */
+    fun onModelSelected(choice: ModelChoice) {
+        _state.update { it.copy(modelChoice = choice) }
+    }
+
     fun onMessageShown() {
         _state.update { it.copy(message = null) }
     }
 
     fun transcribe(audioId: String, force: Boolean) = runBusy {
+        val model = _state.value.modelChoice.toRef()
         when (val outcome = repository.enqueue(audioId, model, force)) {
             is EnqueueOutcome.Created -> scheduleThen(outcome.jobId, audioId)
             is EnqueueOutcome.AlreadyActive -> TranscriptOutcomeCopy.AlreadyActive

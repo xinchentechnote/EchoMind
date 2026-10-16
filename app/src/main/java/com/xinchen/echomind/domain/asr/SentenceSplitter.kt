@@ -33,8 +33,12 @@ object SentenceSplitter {
     /** 弱标点：只作为长句兜底切分点（FR-602 的第二优先级），单独不足以断句。 */
     private const val WEAK_PUNCT = "，、,："
 
-    /** 一个字 + 它的绝对时间。内部形态：`endMs` 恒等于**下一个字的起点**（末字取本段语音末尾）。 */
-    private class Timed(val token: String, val startMs: Long, val endMs: Long)
+    /**
+     * 一个 token + 它的绝对时间。内部形态：`endMs` 恒等于**下一个 token 的起点**（末 token 取本段语音末尾）。
+     * [wordStart] 标记「这是一个英文词的开头」（sentencepiece 的 ▁ 前缀，多语种模型 D41）——
+     * 拼句时它前面要补空格；中文逐字 token 此标记恒为 false。
+     */
+    private class Timed(val token: String, val startMs: Long, val endMs: Long, val wordStart: Boolean = false)
 
     /**
      * 候选句 = [items] 这段连续字。
@@ -143,10 +147,14 @@ object SentenceSplitter {
             // 起点只往回收拢到「不早于前一个字」，不往前沿：往前就是造一个模型没给的时间
             starts += if (index == 0) ordered[index].startMs else ordered[index].startMs.coerceAtLeast(starts[index - 1])
         }
-        return ordered.mapIndexed { index, token ->
+        return ordered.mapIndexed { index, timed ->
             val start = starts[index]
             val rawEnd = if (index == ordered.lastIndex) segment.endMs else starts[index + 1]
-            Timed(token = token.token.trim(), startMs = start, endMs = rawEnd.coerceAtLeast(start))
+            // sentencepiece 的 ▁ 前缀 = 词界 + 词文（▁the → the + wordStart）；中文 token 没有 ▁
+            val raw = timed.token.trim()
+            val wordStart = raw.startsWith("▁")
+            val body = raw.removePrefix("▁").trim()
+            Timed(token = body, startMs = start, endMs = rawEnd.coerceAtLeast(start), wordStart = wordStart)
         }
     }
 
@@ -293,15 +301,16 @@ object SentenceSplitter {
     }
 
     /**
-     * 句末补「。」——**展示层补的，不是模型判的句读**（A7：Paraformer 不产出标点）。
-     * 只补句号，不猜逗号和问号。
+     * 句末补句号——**展示层补的，不是模型判的句读**（A7：模型不产出标点）。
+     * 拉丁文本补「.」、中文补「。」（按末字符的码位判断，多语种模型 D41）；只补句号，不猜逗号和问号。
      */
     private fun displayText(raw: String): String {
         val trimmed = raw.trim().trimEnd { it.isWhitespace() }
         if (trimmed.isEmpty()) return ""
         val last = trimmed.last()
-        if (last in STRONG_PUNCT || last in WEAK_PUNCT) return trimmed
-        return trimmed + "。"
+        if (last in STRONG_PUNCT || last in WEAK_PUNCT || last == '.') return trimmed
+        val period = if (last.code < 0x2E80 && last.isLetterOrDigit()) "." else "。"
+        return trimmed + period
     }
 
     private fun isStrongPunct(token: String): Boolean = token.length == 1 && token[0] in STRONG_PUNCT
@@ -314,12 +323,13 @@ object SentenceSplitter {
 
     private fun countChars(token: String): Int = token.count { !it.isWhitespace() }
 
-    /** 中文直接连排；两侧都是字母/数字时插一个空格（模型给英文分词时不留空格，读起来会粘成一坨）。 */
+    /** 中文逐字连排；英文词的开头（▁ 标记或两侧都是字母/数字）补空格，否则会粘成一坨。 */
     private fun joinText(items: List<Timed>): String {
         val sb = StringBuilder()
         for (item in items) {
             if (item.token.isEmpty()) continue
-            if (sb.isNotEmpty() && needsSpace(sb.last(), item.token.first())) sb.append(' ')
+            val spaceBefore = sb.isNotEmpty() && (item.wordStart || needsSpace(sb.last(), item.token.first()))
+            if (spaceBefore) sb.append(' ')
             sb.append(item.token)
         }
         return sb.toString()

@@ -69,6 +69,8 @@ data class ChunkRecognition(
     val chunk: PcmChunkPlan,
     val text: String,
     val tokens: List<TokenTiming>,
+    /** 模型自报的语言标签（SenseVoice：zh/en/yue…；whisper：en…；Paraformer 不给 → null） */
+    val lang: String? = null,
 )
 
 /**

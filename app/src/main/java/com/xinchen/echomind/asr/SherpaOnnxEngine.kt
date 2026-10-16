@@ -66,6 +66,7 @@ class SherpaOnnxEngine private constructor(
                 chunk = chunk,
                 text = result.text,
                 tokens = TokenTimingMapper.map(result.tokens.toList(), result.timestamps, chunk),
+                lang = result.lang.takeIf { it.isNotBlank() }?.trim('|', ' ', '<', '>'),
             )
         } finally {
             stream.release()

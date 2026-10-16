@@ -44,6 +44,12 @@ internal object DeviceAsrFixtures {
     /** [REAL_WMA] 的容器时长（宿主机 ffmpeg 报告） */
     const val REAL_WMA_DURATION_MS = 148_637L
 
+    /** 用户的 56 分钟中文书解 mp3（自动路由的 zh 探针素材） */
+    const val USER_BOOK_MP3 = "user-test.mp3"
+
+    /** 英文 TTS 朗读书页（27.3 s，有标准答案，自动路由的 en 探针素材） */
+    const val EN_TTS_WAV = "en-tts.wav"
+
     /** 宿主机把 [REAL_WMA] 解到 wav 的样本数（26,214,400 B / 4 B），做设备端解码样本数的对照基准 */
     const val REAL_WMA_REF_SAMPLES_44K = 6_553_600L
 

@@ -270,6 +270,20 @@ class SentenceSplitterTest {
     }
 
     @Test
+    fun `sentencepiece词界前缀拼出带空格的英文`() {
+        // SenseVoice 的英文 token 带 ▁ 词界前缀（D41）：拼句时去前缀、词间补空格
+        val drafts = split(
+            segment(
+                0,
+                2_000,
+                listOf(token("▁Where", 0), token("have", 500), token("all", 1_000), token("▁the", 1_500), token("flowers", 2_000)),
+            ),
+        )
+
+        assertEquals(listOf("Where have all the flowers。".replace("。", ".")), drafts.texts())
+    }
+
+    @Test
     fun `只剩标点的不成句`() {
         val drafts = split(segment(0, 1_000, listOf(token("。", 0), token("！", 500))))
 
@@ -283,11 +297,12 @@ class SentenceSplitterTest {
             maxSentenceChars = 5,
         )
 
-        assertEquals(listOf("hello。", "world。"), drafts.texts())
+        // 拉丁文本句尾补「.」（D41 多语种适配）
+        assertEquals(listOf("hello.", "world."), drafts.texts())
         assertTrue("空白是模型给的证据，不算硬切", drafts.none { it.boundaryGuess })
 
         val joined = split(segment(0, 1_000, listOf(token("he", 0), token("llo", 100))))
-        assertEquals("he llo。", joined.single().text)
+        assertEquals("he llo.", joined.single().text)
     }
 
     @Test

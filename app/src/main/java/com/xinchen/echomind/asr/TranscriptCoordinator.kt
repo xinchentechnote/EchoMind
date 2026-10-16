@@ -13,10 +13,12 @@ import com.xinchen.echomind.domain.asr.SentenceSplitter
 import com.xinchen.echomind.domain.asr.TokenTimingMapper
 import com.xinchen.echomind.domain.asr.TranscriptQuality
 import com.xinchen.echomind.domain.model.RecognizedSegment
+import com.xinchen.echomind.domain.model.SpeechSpan
 import com.xinchen.echomind.domain.model.SubtitleSegment
 import com.xinchen.echomind.domain.model.TokenTiming
 import com.xinchen.echomind.domain.model.TranscriptFailure
 import com.xinchen.echomind.domain.model.TranscriptJobStatus
+import com.xinchen.echomind.domain.model.TranscriptModelRef
 import com.xinchen.echomind.domain.model.TranscriptionTarget
 import com.xinchen.echomind.domain.transcript.LiveTranscriptStore
 import com.xinchen.echomind.domain.transcript.TranscriptRepository
@@ -91,6 +93,24 @@ class TranscriptCoordinator(
             "VAD 模型缺失或与清单不符（${ModelCatalog.SILERO_VAD_ID}），请先在模型页准备好",
         )
 
+        // 「自动选模型」：任务行记的是 auto 时，用 SenseVoice 听开头 30 s 判语言，
+        // 再把行上的 model_id/version 改写成最终模型（zh/yue → Paraformer，其余 → SenseVoice，D41）。
+        // 探测放在 markRunning **之前**：行还没开始跑，改写才是合法的；判不出就落默认 Paraformer。
+        val requested = TranscriptModelRef(id = job.modelId, version = job.modelVersion)
+        val spec = if (requested.id == ModelCatalog.AUTO_MODEL_ID) {
+            val probedText = probeTranscript(target, isCancelled)
+            val resolved = ModelRouting.resolve(probedText)
+            runCatching {
+                repository.updateModel(
+                    jobId,
+                    TranscriptModelRef(id = resolved.id, version = ModelCatalog.refOf(resolved).version),
+                )
+            }
+            resolved
+        } else {
+            ModelCatalog.specForFinal(requested)
+        }
+
         if (!repository.markRunning(jobId, 0)) {
             return TranscriptOutcome.Skipped(
                 "任务 $jobId 没能进入运行态（已被取消、已结算，或**别的任务正占着模型句柄**），本轮收手",
@@ -98,7 +118,7 @@ class TranscriptCoordinator(
         }
 
         val engine = try {
-            SherpaOnnxEngine.open(modelsRoot)
+            SherpaOnnxEngine.open(modelsRoot, spec)
         } catch (e: AsrModelNotReadyException) {
             return fail(jobId, TranscriptFailure.ModelMissing, e.message ?: "识别模型不可用")
         }
@@ -238,6 +258,55 @@ class TranscriptCoordinator(
             rejectedChunks = run.rejectedChunks,
             guessedBoundaries = guessed,
         )
+    }
+
+    /**
+     * 语言探测（D41 自动路由）：SenseVoice 听开头 ≤30 s，把**转写文本**交给 ModelRouting 按字符系别路由
+     * （模型自报的语言标签实测不可靠，见 D41 打样）。探测失败返回 null（落默认 Paraformer），
+     * 探测挂了不该挡住一次本来合法的转录。
+     */
+    private suspend fun probeTranscript(target: TranscriptionTarget, isCancelled: () -> Boolean): String? {
+        val engine = try {
+            SherpaOnnxEngine.open(modelsRoot, ModelCatalog.senseVoice)
+        } catch (e: Exception) {
+            Log.w(TAG, "语言探测引擎装载失败，按默认模型继续：${e.message}")
+            return null
+        }
+        val result: String? = try {
+            val transcript = StringBuilder()
+            val collected = mutableListOf<FloatArray>()
+            var total = 0
+            val limit = 30 * AudioFormats.ASR_SAMPLE_RATE
+            PcmDecoder(context).decode(Uri.parse(target.uri)) { samples, _ ->
+                if (isCancelled()) return@decode false
+                collected += samples
+                total += samples.size
+                if (total >= limit) {
+                    val flat = FloatArray(total)
+                    var offset = 0
+                    for (c in collected) {
+                        System.arraycopy(c, 0, flat, offset, c.size)
+                        offset += c.size
+                    }
+                    val chunks = AsrChunkPlanner.plan(listOf(SpeechSpan(startSample = 0, sampleCount = total)))
+                    for (chunk in chunks) {
+                        val from = chunk.startSample.toInt()
+                        transcript.append(engine.recognize(chunk, flat.copyOfRange(from, from + chunk.sampleCount)).text)
+                    }
+                    false // 只听开头 30 s
+                } else {
+                    true
+                }
+            }
+            Log.i(TAG, "语言探测：${target.fileName} → ${transcript.take(60)}")
+            transcript.toString()
+        } catch (e: Exception) {
+            Log.w(TAG, "语言探测失败，按默认模型继续：${e.message}")
+            null
+        } finally {
+            engine.release()
+        }
+        return result
     }
 
     /**

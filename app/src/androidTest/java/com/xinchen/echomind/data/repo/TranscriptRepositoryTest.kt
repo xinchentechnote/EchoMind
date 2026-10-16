@@ -104,6 +104,18 @@ class TranscriptRepositoryTest {
     }
 
     @Test
+    fun 自动路由改写模型只许在QUEUED时() = runBlocking {
+        val created = repo.enqueue("a", model) as EnqueueOutcome.Created
+        assertTrue(repo.updateModel(created.jobId, TranscriptModelRef("sense-voice-zh-en-ja-ko-yue-int8", "abc123")))
+        assertEquals("sense-voice-zh-en-ja-ko-yue-int8", job(created.jobId).modelId)
+
+        repo.markRunning(created.jobId, totalSegments = 1)
+        // RUNNING 之后再改是篡改历史，必须拒绝
+        assertFalse(repo.updateModel(created.jobId, TranscriptModelRef("paraformer-zh-2023-09-14-int8", "xyz789")))
+        assertEquals("sense-voice-zh-en-ja-ko-yue-int8", job(created.jobId).modelId)
+    }
+
+    @Test
     fun 入队写出QUEUED行并把书架标成QUEUED() = runBlocking {
         val outcome = repo.enqueue("a", model)
         val jobId = (outcome as EnqueueOutcome.Created).jobId

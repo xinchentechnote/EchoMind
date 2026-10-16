@@ -92,6 +92,9 @@ class TranscriptRepositoryImpl(
 
     override suspend fun jobById(jobId: String): TranscriptJobRow? = jobDao.getById(jobId)?.toDomain()
 
+    override suspend fun updateModel(jobId: String, model: TranscriptModelRef): Boolean =
+        jobDao.updateModel(jobId, model.id, model.version) > 0
+
     override suspend fun markRunning(jobId: String, totalSegments: Int): Boolean = db.withTransaction {
         val job = jobDao.getById(jobId) ?: return@withTransaction false
         val now = clock.wallMs()
