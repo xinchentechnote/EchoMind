@@ -8,6 +8,7 @@ import android.media.MediaFormat
 import android.net.Uri
 import com.xinchen.echomind.core.conf.AudioFormats
 import com.xinchen.echomind.domain.asr.PcmConversion
+import com.xinchen.echomind.domain.asr.PtsTimeline
 import com.xinchen.echomind.domain.asr.SincResampler
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -109,6 +110,8 @@ class PcmDecoder(
         var channelCount = 0
         var pending = ByteArray(0)
         var resampler: SincResampler? = null
+        val timeline = PtsTimeline()
+        var pushedBytes = 0L // 已换算并交给重采样/VAD 的 PCM 字节总量（含为对齐 PTS 垫入的静音）
 
         while (!sawEos && !accumulator.stopped) {
             // 贪心喂入：只要 codec 有空输入缓冲就一直喂。先前的「一进一出」会让解码器经常没活干，
@@ -158,6 +161,19 @@ class PcmDecoder(
                         }
                         val isConfig = info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
                         if (!isConfig && info.size > 0) {
+                            // 字幕时间轴 = 播放时钟（容器 PTS）：缓冲首样本应落在流内 (pushed+pending)/(2ch) 的位置，
+                            // PTS 超前超容差（解码器对个别帧不出样本）就垫静音，把流垫到 PTS 上——
+                            // 否则样本计数短于 PTS，字幕越到后面越提前（用户实测 mp3 快一两行）。
+                            val sampler0 = resampler
+                            if (sampler0 != null) {
+                                val startIdx = (pushedBytes + pending.size) / (2L * channelCount)
+                                val gapUs = timeline.gapBefore(info.presentationTimeUs, startIdx, sourceSampleRate)
+                                if (gapUs > 0) {
+                                    val gapSamples = (gapUs * sourceSampleRate / 1_000_000L).toInt()
+                                    accumulator.append(sampler0.resample(FloatArray(gapSamples), isFinal = false), sink)
+                                    pushedBytes += gapSamples * 2L * channelCount
+                                }
+                            }
                             maxBufferBytes = maxOf(maxBufferBytes, info.size)
                             val buffer = codec.getOutputBuffer(outIndex)
                                 ?: throw PcmDecodeException("拿不到输出缓冲（index=$outIndex）")
@@ -169,6 +185,7 @@ class PcmDecoder(
                             buffer.get(bytes, pending.size, info.size)
                             val usable = bytes.size - PcmConversion.leftoverBytes(bytes.size, channelCount)
                             pending = bytes.copyOfRange(usable, bytes.size)
+                            pushedBytes += pending.size + usable
                             val mono = PcmConversion.pcm16LeToFloatMono(bytes, 0, usable, channelCount)
                             // 中途一律 isFinal=false，末尾单独一次空输入 final 调用来抽干尾巴——
                             // 这个调用形状由 SincResamplerTest 钉住（分块+空尾 == 一次性）
