@@ -18,7 +18,9 @@
 | Android SDK | `/Users/xinchen/android-dev/sdk` | `env.sh` 导出的 `ANDROID_HOME` |
 | 已安装 platform | `android-36`、`android-37.0`（注意 API 37 的目录名带 `.0`，不存在 `android-37`） | `ls $ANDROID_HOME/platforms` |
 | 已安装 build-tools | 35.0.0、36.0.0、37.0.0 | `ls $ANDROID_HOME/build-tools` |
-| NDK | **未安装** | `ls $ANDROID_HOME \| grep ndk` 为空 |
+| NDK | ~~未安装~~ → **r27c（27.2.12479018）**，2026-10-16 经 `sdkmanager "ndk;27.2.12479018"` 安装（自建 libwma.so 交叉编译用，见 §9） | `ls $ANDROID_HOME/ndk` |
+| Homebrew lame | 4.0（`/opt/homebrew/opt/lame`），2026-10-16 `brew install lame`（自建 ffmpeg 带 mp3 编码器、造静音素材用） | `brew list lame` |
+| 自建 FFmpeg | 6.1.1（`~/ffmpeg-build/`，三棵构建树：host 造 WMA 素材、host-mp3 造静音素材、build-arm64 交叉编 libwma） | `~/ffmpeg-build/build-host-mp3/ffmpeg -version` |
 | Gradle wrapper 发行缓存 | `gradle-8.14.6`、`gradle-9.4.1`、`gradle-9.6.0` | `ls $GRADLE_USER_HOME/wrapper/dists` |
 | 系统 gradle | `/opt/homebrew/bin/gradle` 9.4.1（跑在 homebrew openjdk 25 上） | `gradle --version` |
 | 运行中的设备 | `emulator-5554`：API 36 / arm64-v8a / 1080x2400 | `adb devices -l`、`getprop` |
@@ -113,9 +115,9 @@
 | R1 | ~~sherpa-onnx 无 Maven 坐标~~ **已确证**：官方搜索命中 0 条，Android 只有 GitHub release AAR（v1.13.8） | 依赖以本地 `app/libs/*.aar` 引入，需手工取回 | ~~待取~~ **已取回**（2026-10-15）：`sherpa-onnx-static-link-onnxruntime-1.13.8.aar` 已在 `app/libs/`（不入库），构建脚本在缺失时打印确切 URL/大小/SHA-256，CI 按钉住哈希自动取回（§8）。选型与体积见 `asr-design.md` §2.1 |
 | R2 | ~~Paraformer 时间戳~~ **已确证**：中文离线 Paraformer 只有 `zh-2023-09-14` 官方声明支持时间戳，其余明确不支持 | 模型清单必须钉死型号，误导入即拒绝 | `asr-design.md` §1-A4、§8 |
 | R2b | 官方要求单段音频 ≤20s（长音频必须 VAD 切段），且 Paraformer 不产出标点 | 切句只能以时间/静音为依据，标点是展示层补齐 | `asr-design.md` §5、§6 记录误差与限制 |
-| R3 | 本机无 NDK | 无法从源码编译 sherpa-onnx | 用官方预编译 AAR（自带 arm64 `.so`），不需要 NDK |
+| ~~R3~~ | ~~本机无 NDK~~ → **已装 r27c**（2026-10-16，自建 libwma.so 用；sherpa-onnx 仍用预编译 AAR） | — | 已解决 |
 | R4 | 模型 232 MiB；**GitHub release 的速度漂移极大**：Phase 0 实测 45–51 KB/s，2026-10-15 同机复测 AAR **11.8–13.0 MB/s**（50.13 MB / 4.2s 与 38.69 MB / 3.0s，`curl -sSL` 直连跟 302），hf-mirror 的 243,371,218 B 模型 **39.2 MB/s / 6.2s** | 不能拿任一次测量当常数：慢的时候直连 GitHub 取 AAR 要十几分钟，早期那次 45 KB/s 更不能当禁令 | 大下载优先 hf-mirror，**每次把实测速度记进文档**；构建脚本打印确切 URL/大小/SHA-256，失败就报失败，不静默重试 |
-| R5 | 只有模拟器（API 36 / arm64-v8a）无真机 | 焦点抢占、BECOMING_NOISY、低内存峰值无法验证 | `testing.md` 单列真机待办清单 |
+| ~~R5~~ | ~~只有模拟器无真机~~ → **2026-10-18 真机已接入**：华为 nova 13（RNA-AL00，HarmonyOS 4.2，ADB 序列号 TTDUT22303016501，USB 调试已授权）——见 §9 真机小节 | BECOMING_NOISY / 真机 RTF / 覆盖安装升级路径可以验证了 | 待办清单里的真机项逐条销账 |
 | R6 | MP3 → PCM 需自写解码（`MediaExtractor` + `MediaCodec`） | 解码与重采样是转录质量的地基 | Phase 6 拆成纯逻辑单测 + 设备验证两部分 |
 | R7 | 无 release 签名配置 | 只能装 debug 包 | MVP 可接受；签名参数只放 `GRADLE_USER_HOME/gradle.properties`，不入仓库 |
 | R8 | sherpa-onnx 在低内存设备的峰值 RSS 无官方数据 | 2–3GB RAM 机型可能 OOM | Phase 6 真机实测后再定 `numThreads`/段长，此前标注为未确证 |
@@ -125,7 +127,7 @@
 - Gradle 构建：可用（wrapper 9.6.0 已缓存，AGP 9.4.1 已缓存，androidx 走阿里云镜像）。
 - JVM 单元测试：可用（`./gradlew :app:testDebugUnitTest`）。
 - 仪器化测试：可用（有运行中的 `emulator-5554`，API 36 / arm64-v8a），Room 与 Media3 端到端验证具备条件。
-- 真机验证：**不具备**，见 R5。
+- 真机验证：~~不具备~~ → **可用**（2026-10-18，华为 nova 13 / HarmonyOS 4.2 接入，见 §9；BECOMING_NOISY 等真机待办可以销账）
 - GitHub Actions CI：**可用且已跑绿**（见 §8）。仪器化测试仍不在 CI 里——需要模拟器，本机这台才有。
 
 ## 8. GitHub Actions（远端 CI，2026-10-15 实测）
@@ -150,3 +152,116 @@
 
 1. **`gh run watch` 的退出码会被管道吃掉**：`gh run watch … | tail` 拿到的是 `tail` 的 0。要判定成败得把 watch 单独重定向后再取 `$?`，或者直接读 `gh run view --json conclusion`。
 2. **「plugin not found」通常不是没找到，是某个仓库 5xx**（§3 最后一条）。排查方法是临时加一个探测工作流，在 runner 上对同一批 URL 打 `GET`/`HEAD` 状态码矩阵；探测完立刻删掉那个工作流。
+
+## 9. 从零搭建与编译安装实录（2026-10-18 补记成文；过程均为本机实际执行）
+
+> 这节是一份**可照抄的笔记**：环境准备 → 工具安装 → 编译 → 装到设备。所有版本号都是本机实测值。
+
+### 9.1 环境准备（一次性）
+
+```bash
+# 0) 每开一个终端先做（否则 GRADLE_USER_HOME 污染别的工程，见 §2 的警告）
+source ~/android-dev/env.sh
+
+# 1) JDK 17（Temurin 17.0.18，系统已装）——AGP 9.4.1 跑在它上面，homebrew 的 gradle 9.4.1 跑在 JDK 25 上不能用
+java -version   # → 17.0.18
+
+# 2) Android SDK 已就位（~/android-dev/sdk）：platforms android-36/android-37.0、build-tools 35/36/37.0.0
+ls $ANDROID_HOME/platforms $ANDROID_HOME/build-tools
+
+# 3) 本轮新装：NDK r27c（只为自建 libwma.so 交叉编译；sherpa-onnx 用预编译 AAR 不需要它）
+"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;27.2.12479018"
+
+# 4) 本轮新装：Homebrew lame（自建 ffmpeg 带出 mp3 编码器、造静音测试素材用）
+brew install lame   # lame 4.0 → /opt/homebrew/opt/lame
+
+# 5) 自建 FFmpeg 6.1.1（源码 ffmpeg.org 直连可下，sha256 8684f4b0…；三棵构建树见 §9.4）
+mkdir -p ~/ffmpeg-build && cd ~/ffmpeg-build
+curl -sSL -o ffmpeg-6.1.1.tar.xz https://ffmpeg.org/releases/ffmpeg-6.1.1.tar.xz && tar xf ffmpeg-6.1.1.tar.xz
+```
+
+工程依赖（AGP 9.4.1 / Gradle wrapper 9.6.0 / built-in Kotlin 2.4.21 / KSP 2.3.12 / Room 2.8.5 / Media3 1.11.1 / WorkManager 2.12.0 / Compose BOM 2026.09.00）版本与镜像口径见 §3/§4——wrapper 会自动下载 Gradle 本体，依赖走阿里云镜像，**不需要手动装任何一项**。
+
+### 9.2 编译与测试
+
+```bash
+source ~/android-dev/env.sh
+./gradlew :app:assembleDebug          # 产物 app/build/outputs/apk/debug/app-debug.apk（v0.1.1 起含内置模型 ≈267 MB）
+./gradlew :app:testDebugUnitTest      # JVM 单测（266 项）
+
+# 仪器化测试的两个前提：模拟器在线 + 素材/模型已在设备（推送见 §9.4）；
+# 刻意不用 connectedDebugAndroidTest（跑完会卸应用清数据，见 §5c-8）
+./gradlew :app:assembleDebugAndroidTest
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb install -r app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+adb shell am instrument -w -e package com.xinchen.echomind \
+  com.xinchen.echomind.test/androidx.test.runner.AndroidJUnitRunner
+```
+
+构建脚本自带三道闸（缺文件直接 GradleException 并打印来源，见 `app/build.gradle.kts`）：
+sherpa-onnx AAR（38,691,998 B）、whisper/sense-voice 模型三件套（§9.4）、libwma.so（1,073,288 B）。
+CI（GitHub Actions）会自动取回这几样；本机照抄 `.github/workflows/ci.yml` 里对应步骤即可。
+
+### 9.3 装到模拟器 / 真机
+
+**模拟器**（AVD 名 `drill36`，API 36 / arm64-v8a）：
+
+```bash
+$ANDROID_HOME/emulator/emulator -avd drill36 -port 5554 -no-snapshot-save   # 后台跑
+adb install -r app/build/outputs/apk/debug/app-debug.apk                    # -r 覆盖安装保数据
+adb shell am start -n com.xinchen.echomind/.MainActivity
+```
+
+**真机：华为 nova 13（RNA-AL00，HarmonyOS 4.2）**——2026-10-18 实测接入，序列号 `TTDUT22303016501`：
+
+```bash
+# 手机侧（一次性）：
+#   设置 → 关于手机 → 「版本号」连点 7 次 → 返回找到「系统和更新 → 开发人员选项」
+#   → 打开「USB 调试」；HarmonyOS 会弹「仅充电时禁止 ADB」类提示，选传输文件模式
+#   → （要用 uiautomator/模拟点击时再开）「USB 调试（安全设置）」：允许模拟点击与输入
+# 插上 USB → 手机弹「是否允许 USB 调试（RSA 指纹）」→ 允许
+adb devices -l
+# → TTDUT22303016501   device usb:… product:RNA-AL00 model:RTE_AL00 device:HWRTE
+adb -s TTDUT22303016501 install -r app/build/outputs/apk/debug/app-debug.apk
+adb -s TTDUT22303016501 shell am start -n com.xinchen.echomind/.MainActivity
+adb -s TTDUT22303016501 logcat --pid=$(adb -s TTDUT22303016501 shell pidof com.xinchen.echomind)
+```
+
+Android Studio 侧：打开工程根目录 → 右上设备选择器选中 nova 13 → Run ▶（等价于上面两条 install+start）。
+Logcat 过滤 `package:com.xinchen.echomind`。
+
+两条红线：
+- **HarmonyOS NEXT（5.0）不兼容 APK**；nova 13 出厂是 HarmonyOS 4.2（Android 应用兼容层，`getprop ro.build.version.sdk` 会报出对应 API 级别）——买机/升级前认准这个区别；
+- 首次装 267 MB 的包要等一会；覆盖安装（`-r`）数据保留，签名一致（同一台构建机）即可直升。
+
+### 9.4 模型与素材推送（转录功能的数据准备）
+
+模型不入仓库也不进 APK；App 首次启动会引导去设置页下载，开发期可用 adb 直推（快得多）：
+
+```bash
+# 模型在 App 私有目录 filesDir/models/<spec.id>/<fileName>，adb 直写不了 → 走 /data/local/tmp + run-as
+adb push app/libs/models/<目录>/<文件> /data/local/tmp/x.bin
+adb shell "run-as com.xinchen.echomind sh -c 'mkdir -p files/models/<spec.id> && cat /data/local/tmp/x.bin > files/models/<spec.id>/<文件名>'"
+```
+
+四套模型（清单与哈希的唯一出处是 `asr/ModelCatalog.kt`）：中文 Paraformer int8（243 MB）、Silero VAD（0.6 MB）、
+SenseVoice 多语种 int8（226 MB）、Whisper base int8（152 MB，**不在下载列表**，仅打样）。
+仪器化测试素材推到 `/sdcard/Android/data/com.xinchen.echomind/files/asr-fixtures/`（这个目录可 adb 直写）：
+`pcm-fixture-real.mp3`（真歌）、`pcm-fixture-01.mp3`（30 s 静音，自建 ffmpeg 造）、`en-tts.wav`（macOS `say` 造）、
+`user-test.mp3`（用户 56 分钟书解）。
+
+### 9.5 本轮新增的坑（都有事故现场）
+
+1. **`adb shell "run-as … sh -c '…'"` 的引号**：外层双引号、内层单引号才能活；只套一层单引号时本地 shell
+   会吃掉引号，设备端 `sh -c` 只收到第一个词（表现为「命令没报错但什么都没发生」）。最稳的写法是 run-as
+   后直接跟命令、不用 sh -c；带重定向的整条命令必须整体双引号包裹。
+2. **screencap 截图是缩放显示**（900×2000），而 `input tap` 用设备像素（1080×2400）——看图估坐标永远差 1.2 倍。
+   点击坐标一律以 `uiautomator dump` 的 bounds 为准。
+3. **uiautomator dump 会返回旧文件**：连续 dump 时若界面状态没变，拉下来的还是上一份——
+   判据是文件字节数完全相同；对策是 `rm` 设备侧旧文件后再 dump，或改用 screencap 目检。
+4. **链式命令里 gradle 的失败会被 `tail`/`grep` 吞掉**：`./gradlew … | tail -1 && adb install …` 在构建失败时
+   照样装旧 APK。构建状态必须显式判定后再进下一步（`isDecoder` 编译错就这么被吞过一次）。
+5. **测试 APK 改了必须 `assembleDebugAndroidTest` + 重装**，否则 `am instrument -e class` 静默返回
+   `OK (0 tests)`——旧包里没有新类，不报错只报 0。
+6. GitHub Actions run 步骤里 `GITHUB_TOKEN` 不会自动导出（`set -u` 下直接 unbound）：
+   用 `env: GH_TOKEN: ${{ github.token }}` 注入，或用 runner 预装的 `gh`（见 ci.yml 的 libwma 步骤）。
