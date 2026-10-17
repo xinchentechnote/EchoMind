@@ -74,6 +74,7 @@ class ShelfViewModel(private val repository: AudioRepository) : ViewModel() {
             if (outcome.changed > 0) append("，更新 ${outcome.changed} 首")
             if (outcome.vanished > 0) append("，${outcome.vanished} 首文件已不在")
             if (outcome.revived > 0) append("，${outcome.revived} 首文件已回来")
+            if (outcome.preparingWma > 0) append("，${outcome.preparingWma} 首 WMA 正在后台准备，完成后可播放")
             if (outcome.truncated) append("（目录过大或过深，已截断）")
         }
     }
@@ -87,11 +88,13 @@ class ShelfViewModel(private val repository: AudioRepository) : ViewModel() {
         val revived = outcomes.sumOf { it.revived }
         val onShelf = outcomes.sumOf { it.alreadyOnShelf }
         val revoked = outcomes.count { it.permissionRevoked }
+        val preparingWma = outcomes.sumOf { it.preparingWma }
         buildString {
             append("重新扫描完成：新增 $added，更新 $changed，消失 $vanished")
             if (revived > 0) append("，$revived 首文件已回来")
             if (onShelf > 0) append("，已在书架 $onShelf")
             if (revoked > 0) append("，$revoked 个文件夹授权已失效，请重新授权")
+            if (preparingWma > 0) append("，$preparingWma 首 WMA 正在后台准备")
         }
     }
 

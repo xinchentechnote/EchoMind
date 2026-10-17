@@ -12,6 +12,7 @@ import com.xinchen.echomind.data.scan.AudioMetadataReader
 import com.xinchen.echomind.domain.importing.PermissionRevokedException
 import com.xinchen.echomind.domain.importing.TreeBrowser
 import com.xinchen.echomind.domain.importing.TreeEntry
+import java.io.File
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -57,10 +58,20 @@ class AudioRepositoryImportTest {
     }
 
     private class FakeReader(var durations: Map<String, Long?> = emptyMap()) : AudioMetadataReader {
-        override fun durationMs(uri: String): Long? = durations[uri]
+        val requested = mutableListOf<String>()
+        override fun durationMs(uri: String): Long? {
+            requested += uri
+            return durations[uri]
+        }
     }
 
-    private fun repository(browser: TreeBrowser, grants: TreeGrantStore, reader: AudioMetadataReader) =
+    private fun repository(
+        browser: TreeBrowser,
+        grants: TreeGrantStore,
+        reader: AudioMetadataReader,
+        wmaStore: WmaPlaybackStore? = null,
+        wmaPrepare: WmaImportPreparer? = null,
+    ) =
         AudioRepositoryImpl(
             audioBookDao = db.audioBookDao(),
             folderDao = db.importedFolderDao(),
@@ -69,6 +80,8 @@ class AudioRepositoryImportTest {
             metadataReader = reader,
             grants = grants,
             nowMs = { clock },
+            wmaStore = wmaStore,
+            wmaPrepare = wmaPrepare,
         )
 
     private fun file(name: String, uri: String, size: Long = 1000L) =
@@ -277,6 +290,39 @@ class AudioRepositoryImportTest {
         repository(FakeBrowser(sampleTree()), FakeGrants(), reader).importFolder(Uri.parse(treeRoot))
 
         val book = db.audioBookDao().getById(stableIdFromUri("$treeRoot/second/02 - 第二章.mp3"))!!
+        assertEquals(0L, book.durationMs)
+        assertTrue(book.durationReadFailed)
+    }
+
+    @Test
+    fun WMA先入库并交给后台准备而不阻塞整批导入() = runBlocking {
+        val wmaUri = "$treeRoot/book.wma"
+        val browser = FakeBrowser(mapOf(treeRoot to listOf(file("book.wma", wmaUri))))
+        val reader = FakeReader()
+        val scheduled = mutableListOf<Triple<String, String, Boolean>>()
+        val preparer = object : WmaImportPreparer {
+            override fun schedule(audioId: String, uri: String, force: Boolean): Boolean {
+                scheduled += Triple(audioId, uri, force)
+                return true
+            }
+
+            override fun cancel(audioId: String) = Unit
+        }
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val store = WmaPlaybackStore(File(context.cacheDir, "wma-import-test-${System.nanoTime()}"))
+
+        val outcome = repository(browser, FakeGrants(), reader, store, preparer).importFolder(Uri.parse(treeRoot))
+
+        val audioId = stableIdFromUri(wmaUri)
+        assertEquals(1, outcome.added)
+        assertEquals(1, outcome.preparingWma)
+        assertTrue("WMA 不应走可能卡住的系统元数据读取器：${reader.requested}", reader.requested.isEmpty())
+        assertEquals(
+            "新入库必须强制覆盖 v0.1.2 中断后可能遗留的半截转码文件",
+            listOf(Triple(audioId, wmaUri, true)),
+            scheduled,
+        )
+        val book = db.audioBookDao().getById(audioId)!!
         assertEquals(0L, book.durationMs)
         assertTrue(book.durationReadFailed)
     }

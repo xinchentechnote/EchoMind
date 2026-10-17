@@ -865,6 +865,38 @@ CER/WER 或器乐幻觉门槛。按 D42 收口：删除模型选择 UI、`ModelR
   `b4f304ace4b3e211e31886f6a6d4b94147dfad7d650f9304b2b57f767871e3d6`，APK SHA-256
   `7fddc2871e21de294464f58b61fbf0195847d85a31d6d212e1e3d30f37008b06`。
 
+### v0.1.3 热修：WMA 不再阻塞文件夹导入（用户真机反馈，2026-10-17）
+
+**复现与根因**：v0.1.2 首次把 WMA 纳入扫描白名单，同时在 `AudioRepositoryImpl.importFolder()` 返回前同步执行
+整本 `WMA → M4A`。书架 `isBusy` 只能在整批返回后复位，因此目录里一部长 WMA 会让其他 MP3 也一直显示导入中。
+34:20.956 / 35.5 MB 的真实中文书解 WMA 在模拟器转码已需分钟级；真机厂商 `MediaCodec` 更慢或卡住时，表现就是
+用户看到的一直转圈。WMA 之前还会先走系统元数据探测，同样存在厂商实现卡住的风险。
+
+**修复**：WMA 扫描阶段不读系统时长，先入库为 `duration_ms=0 + duration_read_failed=1`；`AsyncWmaImportPreparer`
+只负责立即调度后台 IO 任务，导入返回时提示“WMA 正在后台准备”。每次任务写独占 generation `.part`，成功后同目录
+原子替换正式 m4a，再用 `audioId + uri` 守卫的 DAO 更新回填时长；失败不暴露半截文件。删除/内容变化/快速重导入会
+让旧 generation 失效，即使底层阻塞式编码器不响应协程取消，也不能覆盖新产物。NEW/CHANGED 强制清理重做，兼容
+v0.1.2 被结束时可能留下的非空半截 m4a。
+
+**验证结果**：
+
+- `:app:assembleDebug :app:testDebugUnitTest --rerun-tasks`：最终重跑 `BUILD SUCCESSFUL in 11s`，44 个任务执行；JVM XML
+  **269 tests / 0 failures / 0 errors / 0 skipped**。新增 5 条后台准备器用例，包含失败清理、重复调度、删除后快速
+  重导入与 `force` 内容变化两个不响应取消的旧任务竞态。
+- 标准 `:app:connectedDebugAndroidTest`：最终代码重跑 `BUILD SUCCESSFUL in 10m 29s`；XML **112 / 0 / 0 / 0**。新增仓库用例
+  断言 WMA 不调用系统 metadata reader、先入库、只调度不等待，并强制覆盖 v0.1.2 残留。真实 34 分钟 WMA 用例中，
+  解码 18.149 s、转码并由系统读回 240.160 s；中文听书前两分钟回归 31.457 s。
+- 真实 UI：安装修复包 → 启动 → SAF 选择 `/sdcard/Music/EchoMind`（仅 `book.wma`）→ ALLOW。确认后首个成功层级 dump（3 秒内）
+  回到书架并出现 `book / 时长未知`，层级树无 `ProgressBar`；与此同时 `files/transcoded/*.m4a.part` 从 21 KB 增长。
+  后台完成后目录只剩 32 MB 正式 m4a，无 `.part`，书架自动显示 **34:20**。截图
+  `/tmp/echomind_wma_async_import.png`，dump 均确认包含 `</hierarchy>`。
+- 诚实边界：本轮电脑未连接用户真机，因此这里只证明明确回归已在 API 36 arm64 模拟器与自动化套件修复；
+  **不能声称真机已修复**，需要用户安装 v0.1.3 后复测原目录。WMA 后台完成前点击书籍仍可能因原始 WMA 无系统
+  解码器而提示播放失败；当前热修保证的是导入不再无限转圈，准备完成后可播。
+- v0.1.3 发布包：`versionCode=4` / `versionName=0.1.3`，debug APK **268,578,686 B**；APK SHA-256
+  `490c2075ac24c0c598068fda30c4e194f007e61dfb3ab63eb9578fa4ee234d52`，debug 证书 SHA-256
+  `b4f304ace4b3e211e31886f6a6d4b94147dfad7d650f9304b2b57f767871e3d6`。
+
 ## 5. 待补的自动化测试清单（按阶段）
 
 | Phase | 用例 |

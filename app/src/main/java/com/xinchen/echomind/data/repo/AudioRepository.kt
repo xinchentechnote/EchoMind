@@ -38,14 +38,17 @@ data class ImportOutcome(
     val truncated: Boolean,
     /** 重扫时该文件夹的授权已失效：本次跳过它，其他文件夹继续扫（FR-110） */
     val permissionRevoked: Boolean = false,
+    /** 已交给后台准备的 WMA 数量；不计入导入 busy，避免一部长书拖住整批。 */
+    val preparingWma: Int = 0,
 )
 
 /**
- * WMA 导入前转码的接缝（实现在 `asr/WmaTranscoder`，AppGraph 装配）。
- * 返回转码时长 ms；null 或抛异常 = 转码失败，该书本轮不入库（下次重扫当 NEW 重试）。
+ * WMA 后台准备的接缝（实现在 [AsyncWmaImportPreparer]，AppGraph 装配）。
+ * [schedule] 必须立即返回；耗时转码不能占住“导入中”的 UI 状态。
  */
-fun interface WmaImportPreparer {
-    suspend fun prepare(audioId: String, uri: String): Long?
+interface WmaImportPreparer {
+    fun schedule(audioId: String, uri: String, force: Boolean = false): Boolean
+    fun cancel(audioId: String)
 }
 
 interface AudioRepository {
@@ -84,7 +87,7 @@ class AudioRepositoryImpl(
     private val nowMs: () -> Long,
     /** WMA 转码产物的存放/取用约定；null（部分测试）= 不做 WMA 转码，.wma 照样导入但播放会失败 */
     private val wmaStore: WmaPlaybackStore? = null,
-    /** 转码执行器（asr/WmaTranscoder 的接缝）：返回转码时长 ms；抛异常或返回 null = 失败 */
+    /** WMA 后台准备器；null（部分测试）时只入库，不生成可播放的 m4a。 */
     private val wmaPrepare: WmaImportPreparer? = null,
 ) : AudioRepository {
 
@@ -139,7 +142,8 @@ class AudioRepositoryImpl(
         val walk = AudioTreeWalker(treeBrowser, AudioFormats.SUPPORTED_EXTENSIONS).walk(uriText)
         val scanned = walk.files.map { file ->
             // 时长读取失败不阻塞导入：durationMs=0 + durationReadFailed（architecture §8）
-            val duration = metadataReader.durationMs(file.uri)
+            // WMA 不交给系统解码器探测：真机厂商实现可能长时间卡住，真实时长由后台转码回填。
+            val duration = if (WmaPlaybackStore.isWma(file.fileName)) null else metadataReader.durationMs(file.uri)
             file to duration
         }
 
@@ -174,7 +178,6 @@ class AudioRepositoryImpl(
         val alreadyOnShelf = if (newEntities.isEmpty()) emptySet() else audioBookDao.presentIds(newEntities.map { it.id }).toSet()
         val entitiesToInsert = newEntities
             .filterNot { it.id in alreadyOnShelf }
-            .mapNotNull { entity -> prepareWma(entity) }
         audioBookDao.upsertAll(entitiesToInsert)
 
         val durationByUri = scanned.associate { it.first.uri to it.second }
@@ -182,9 +185,6 @@ class AudioRepositoryImpl(
             val duration = durationByUri[change.scanned.uri]
             val current = audioBookDao.getById(change.existing.id)
             if (current == null) continue
-            if (wmaStore != null && wmaPrepare != null && WmaPlaybackStore.isWma(change.scanned.fileName)) {
-                prepareWma(current.copy(sizeBytes = change.scanned.sizeBytes, fileLastModifiedMs = change.scanned.lastModifiedMs))
-            }
             audioBookDao.upsert(
                 current.copy(
                     relativePath = change.scanned.relativePath,
@@ -214,6 +214,15 @@ class AudioRepositoryImpl(
         if (plan.revivedIds.isNotEmpty()) {
             audioBookDao.setFileStatus(plan.revivedIds, AudioBookEntity.FileStatus.Present, now)
         }
+        // v0.1.2 同步转码被强停时可能留下非空但未完成的 `<id>.m4a`。
+        // NEW/CHANGED 都强制重做，不能只凭旧文件非空就把它当成可播放产物。
+        val forcePrepareIds = plan.changed.mapTo(HashSet()) { it.existing.id }
+        forcePrepareIds += entitiesToInsert.map { it.id }
+        val preparingWma = scanned.count { (file, _) ->
+            if (!WmaPlaybackStore.isWma(file.fileName)) return@count false
+            val audioId = stableIdFromUri(file.uri)
+            wmaPrepare?.schedule(audioId, file.uri, force = audioId in forcePrepareIds) == true
+        }
         folderDao.markScanned(folderId, now)
 
         ImportOutcome(
@@ -225,6 +234,7 @@ class AudioRepositoryImpl(
             unchanged = plan.unchangedCount,
             alreadyOnShelf = alreadyOnShelf.size,
             truncated = walk.truncated,
+            preparingWma = preparingWma,
         )
     }
 
@@ -256,8 +266,10 @@ class AudioRepositoryImpl(
 
     /** 删书：级联删播放记忆，但 listening_session 无外键，历史保留（NFR-04）；WMA 书连转码产物一起清 */
     override suspend fun removeBook(audioId: String) {
+        // 有准备器时，取消与文件清理由它在同一把 generation 锁内完成。这里再删一次会留下窗口：
+        // 快速重导入的新任务刚创建 `.part`，却被旧 removeBook 的第二次 delete 误删。
+        if (wmaPrepare != null) wmaPrepare.cancel(audioId) else wmaStore?.delete(audioId)
         audioBookDao.delete(audioId)
-        wmaStore?.delete(audioId)
     }
 
     override suspend fun removeFolder(folderId: String) {
@@ -267,33 +279,4 @@ class AudioRepositoryImpl(
     override suspend fun markPermissionRevoked(folderId: String) =
         folderDao.setPermissionState(folderId, ImportedFolderEntity.PermissionState.Revoked)
 
-    /**
-     * WMA 书的导入前准备：转码成 m4a（ExoPlayer 与转录的 MediaCodec 路线都解不了 WMA，D40）。
-     * 转码成功时用转码器回报的**真实时长**替换元数据读取的缺失值（WMA 没有 Media3 的 Extractor，
-     * `durationMs` 原本是 0 + durationReadFailed）。失败时返回 null——这一本不入库，
-     * 下次重扫会当作 NEW 再试一次，比「入库却打不开」干净。
-     */
-    private suspend fun prepareWma(entity: AudioBookEntity): AudioBookEntity? {
-        android.util.Log.i("EchoMindImport", "prepareWma 入口：${entity.fileName}（store=${wmaStore != null}，preparer=${wmaPrepare != null}）")
-        val store = wmaStore ?: return entity
-        val preparer = wmaPrepare ?: return entity
-        if (!WmaPlaybackStore.isWma(entity.fileName)) return entity
-        store.prepareDir()
-        val output = store.fileOf(entity.id)
-        return try {
-            val durationMs = withContext(Dispatchers.IO) { wmaPrepare!!.prepare(entity.id, entity.uri) }
-            if (durationMs == null) {
-                output.delete()
-                null
-            } else {
-                android.util.Log.i("EchoMindImport", "prepareWma 成功：${entity.fileName}，时长 $durationMs ms")
-                entity.copy(durationMs = entity.durationMs.takeIf { it > 0 } ?: durationMs, durationReadFailed = false)
-            }
-        } catch (e: Exception) {
-            // 吞掉是设计（跳过这本、下次重扫再试），但原因必须进 logcat，否则「为什么没导入」无从定位
-            android.util.Log.w("EchoMindImport", "WMA 转码失败，本轮跳过：${entity.fileName}：${e.javaClass.simpleName} ${e.message}", e)
-            output.delete()
-            null
-        }
-    }
 }

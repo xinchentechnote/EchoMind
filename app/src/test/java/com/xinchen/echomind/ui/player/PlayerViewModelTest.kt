@@ -41,6 +41,7 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -193,8 +194,15 @@ class PlayerViewModelTest {
         val transcript: FakeTranscriptRepo = FakeTranscriptRepo(),
         val liveStore: LiveTranscriptStore = LiveTranscriptStore(),
         val audioId: String = "a",
+        readyWmaIds: Set<String> = emptySet(),
     ) {
         val started = mutableListOf<String>()
+        val wmaStore = WmaPlaybackStore(java.nio.file.Files.createTempDirectory("player-wma").toFile()).also { store ->
+            readyWmaIds.forEach { id ->
+                store.prepareDir()
+                store.fileOf(id).writeText("ready")
+            }
+        }
         val vm: PlayerViewModel = PlayerViewModel(
             audioId,
             controller,
@@ -205,10 +213,7 @@ class PlayerViewModelTest {
             liveStore,
             startTranscription = { started += it },
             // 与生产同一个约定类：wma 书换转码产物 URI，其余原样
-            playbackUriOf = { row ->
-                WmaPlaybackStore(java.io.File("/tmp/echomind-test-transcoded"))
-                    .playbackUriFor(row.fileName, row.uri, row.id)
-            },
+            playbackUriOf = { row -> wmaStore.playbackUriFor(row.fileName, row.uri, row.id) },
         )
     }
 
@@ -263,10 +268,24 @@ class PlayerViewModelTest {
         val h = Harness(
             audio = FakeAudioRepo(listOf(row("w", "WMA 书", 30_000, 0, fileName = "w.wma"), bookB)),
             audioId = "w",
+            readyWmaIds = setOf("w"),
         )
         advanceUntilIdle()
 
-        assertEquals("file:/tmp/echomind-test-transcoded/w.m4a", h.controller.lastQueue.first { it.audioId == "w" }.uri)
+        assertEquals(h.wmaStore.fileOf("w").toURI().toString(), h.controller.lastQueue.first { it.audioId == "w" }.uri)
+    }
+
+    @Test
+    fun `wma后台准备完成前不把不存在的m4a交给播放器`() = runTest {
+        val h = Harness(
+            audio = FakeAudioRepo(listOf(row("w", "WMA 书", 0, 0, fileName = "w.wma"), bookB)),
+            audioId = "w",
+        )
+        advanceUntilIdle()
+
+        val uri = h.controller.lastQueue.first { it.audioId == "w" }.uri
+        assertEquals("content://audio/w", uri)
+        assertFalse(h.wmaStore.isReady("w"))
     }
 
     @Test

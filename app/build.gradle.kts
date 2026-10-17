@@ -14,8 +14,8 @@ android {
         applicationId = "com.xinchen.echomind"
         minSdk = 26
         targetSdk = 36
-        versionCode = 3
-        versionName = "0.1.2"
+        versionCode = 4
+        versionName = "0.1.3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         // D42 后多语种打样不属于产品回归。不能用 JUnit @Ignore：当前 AGP 9.4.1

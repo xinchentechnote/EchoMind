@@ -35,15 +35,15 @@
 | --- | --- | --- | --- |
 | FR-101 | 用 `ACTION_OPEN_DOCUMENT_TREE` 选文件夹，`takePersistableUriPermission` 持久化授权 | 杀进程重开仍不需重新授权；书架不丢 | **DONE**（`dumpsys activity permissions` 实测 `persistable=0x3 persisted=0x1`；force-stop 后重启书架 6 首仍在。`testing.md` §4） |
 | FR-102 | 支持多个文件夹；已授权文件夹列表在设置页可见 | 列表显示 URI 的显示名、上次扫描时间 | **PARTIAL**（多文件夹导入/去重/跨文件夹归属已实现并有仪器化测试；`displayName`+`lastScanAtMs` 已入库；设置页的文件夹列表 UI 未做 → Phase 7） |
-| FR-103 | 递归扫描子目录，识别音频文件（大小写不敏感）；扩展名白名单集中配置（`core/conf/AudioFormats`，**只列实测过的格式**） | 白名单内的格式都能入库、能播、能转录 | **DONE（2026-10-16 两步扩展）**：白名单 = `mp3 / m4a / aac / flac / wav / wma`。m4a/flac/wav 各造一份真语音素材端到端实测（入库 → 播放 → 转录 38 句 → READY）。`wma` 走**自建 libwma**（FFmpeg 6.1.1 最小裁剪 + JNI，LGPL-2.1-or-later，D40）：Android 无 WMA 解码器（`DeviceCodecProbeTest` 探针为证），故导入时经 libwma 转码成 m4a（ExoPlayer 播转码产物）、转录由 libwma 直接解码——设备端到端实测：入库（时长 148,636 ms 来自转码器）→ 首播自动转录 → SUCCESS、26 段 42 句、READY，播放位置持续推进（播的是转码 m4a）。**仍不放行**：`ogg`/`opus`（探针证实解码器存在，缺本机测试素材）。walker 用例钉住六种格式收、ogg/txt 丢 |
+| FR-103 | 递归扫描子目录，识别音频文件（大小写不敏感）；扩展名白名单集中配置（`core/conf/AudioFormats`，**只列实测过的格式**） | 白名单内的格式都能入库、能播、能转录 | **DONE（2026-10-17 修正 WMA 导入生命周期）**：白名单 = `mp3 / m4a / aac / flac / wav / wma`。m4a/flac/wav 各造一份真语音素材端到端实测（入库 → 播放 → 转录 38 句 → READY）。`wma` 走**自建 libwma**（FFmpeg 6.1.1 最小裁剪 + JNI，LGPL-2.1-or-later，D40）：扫描阶段不调用可能卡住的系统元数据读取器，先以“时长未知”入库并立即结束导入 busy，再由后台生成 m4a、原子就位并回填真实时长；完成后 ExoPlayer 才换用该产物。34:20.956 的真实中文书解 WMA 在模拟器实测：确认目录后首个成功层级 dump（3 秒内）已出现书架记录，后台 `.part` 持续增长，最终得到 32 MB m4a、书架回填 34:20；完整设备套件也用同一素材验证解码与转码。转录仍由 libwma 直接解码。**仍不放行**：`ogg`/`opus`（探针证实解码器存在，缺本机测试素材）。walker 用例钉住六种格式收、ogg/txt 丢 |
 | FR-104 | 提取文件名、URI、size、lastModified，并用 Media3 `MetadataRetriever`/`MediaExtractor` 读取时长 | 时长与系统播放器读数误差 < 1s | **PARTIAL**（四个字段均入库，时长读取失败标 `duration_read_failed` 不阻塞导入；「与系统播放器对比误差」未实测 → Phase 7） |
 | FR-105 | 标题默认从文件名生成（去扩展名、去前导集数 `03_`、下划线转空格），用户可改标题且不被重扫描覆盖 | 改名后重新扫描仍保留用户标题 | **DONE**（设备：改成 `ManualRename` 后重扫仍保留，`title_is_manual=1`；`TitleDeriverTest` 7 项） |
 | FR-106 | 首次导入、手动重新扫描、新增文件识别；**同一 URI 不重复建记录** | 连续扫描 3 次，记录数不变 | **DONE**（设备连续重扫 `count(*)` 恒为 6；planner + 仓库测试各覆盖） |
 | FR-107 | 文件变更检测：同一 URI 的 size 或 lastModified 变化 → 标记需要重新转录，进度保留 | 替换同名文件后，字幕状态转为「已过期」 | **PARTIAL**（变更识别 + `Ready→Expired` + 手动标题不被覆盖有仪器化测试；「进度保留」要等 Phase 4 有进度可保留后才能验） |
 | FR-108 | 文件消失（删除/移走）→ 标记 `MISSING`，不删除历史统计；UI 上灰显且不可播放 | 移走文件后重扫，统计页历史仍在 | **PARTIAL**（MISSING 灰显 + 行不可点 + 不删行，设备与测试均确认；「统计页历史仍在」依赖 Phase 4 会话表。反向的「文件回来 → PRESENT」也已实测） |
-| FR-109 | 不复制音频到 App 私有目录（默认直接读 SAF URI） | `filesDir` 不出现音频副本 | **DONE**（`run-as ls files` 只有 `profileInstalled`，代码里也没有任何复制路径） |
+| FR-109 | 不复制音频到 App 私有目录（默认直接读 SAF URI）；WMA 因系统播放器无解码能力，允许生成一份可播放的 m4a 转码产物 | 非 WMA 不产生副本；WMA 只保留成功原子就位的 `<audioId>.m4a`，删除书籍时一并清理 | **DONE**（普通格式仍直接读 SAF URI；WMA 产物集中在 `filesDir/transcoded/`，后台只写任务独占 `.part`，成功后原子替换，失败/取消/删书清理；设备上观察到 `.part → 32 MB m4a` 且无临时文件残留） |
 | FR-110 | 授权撤销（`SecurityException`）→ 播放/扫描给出「重新授权」入口，历史保留 | 撤销授权后进入 App 显示可操作的提示而不是崩溃 | **PARTIAL**（扫描侧：`PermissionRevokedException` → 提示「文件夹授权已失效，请重新授权」，重扫只跳过失效文件夹；系统侧真实撤销未实测，播放侧入口待 Phase 4） |
-| FR-111 | 扫描在后台线程/协程调度器执行，UI 有进度与可取消 | 大目录扫描不卡主线程（`Dispatchers.IO`） | **PARTIAL**（`withContext(Dispatchers.IO)` + 顶栏转圈忙态；**没有取消**，也没有逐项进度 → Phase 4 与转录任务一起做） |
+| FR-111 | 扫描在后台线程/协程调度器执行，UI 有进度与可取消 | 大目录扫描不卡主线程（`Dispatchers.IO`） | **PARTIAL**（扫描在 `Dispatchers.IO`；WMA 的分钟级转码已移出导入 busy，确认目录后先回书架并提示“正在后台准备”，不会再拖住整批导入。扫描本身仍**没有取消**，也没有逐项进度 → Phase 7） |
 
 ## 2. 本地书架
 

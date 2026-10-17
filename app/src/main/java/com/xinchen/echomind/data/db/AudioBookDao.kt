@@ -45,6 +45,13 @@ interface AudioBookDao {
     @Query("UPDATE audio_book SET is_favorite = :favorite, updated_at_ms = :nowMs WHERE id = :audioId")
     suspend fun setFavorite(audioId: String, favorite: Boolean, nowMs: Long)
 
+    /** WMA 后台转码成功后回填真实时长；URI 守卫防止旧任务覆盖同 id 的新文件。 */
+    @Query(
+        "UPDATE audio_book SET duration_ms = :durationMs, duration_read_failed = 0, updated_at_ms = :nowMs " +
+            "WHERE id = :audioId AND uri = :uri",
+    )
+    suspend fun setPreparedDuration(audioId: String, uri: String, durationMs: Long, nowMs: Long): Int
+
     @Query("DELETE FROM audio_book WHERE id = :audioId")
     suspend fun delete(audioId: String)
 }

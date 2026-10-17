@@ -13,6 +13,7 @@ import com.xinchen.echomind.data.db.EchoMindDatabase
 import com.xinchen.echomind.data.db.Migrations
 import com.xinchen.echomind.data.repo.AudioRepository
 import com.xinchen.echomind.data.repo.AudioRepositoryImpl
+import com.xinchen.echomind.data.repo.AsyncWmaImportPreparer
 import com.xinchen.echomind.data.repo.WmaImportPreparer
 import com.xinchen.echomind.data.repo.WmaPlaybackStore
 import com.xinchen.echomind.data.repo.PlaybackRepository
@@ -73,10 +74,24 @@ class EchoMindApp : Application() {
             .build()
         val timeSource = AndroidTimeSource()
         val playbackScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+        val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val playbackRepository = PlaybackRepositoryImpl(db, timeSource)
         val grants = SafTreeGrantStore(this)
         val wmaTranscoder = WmaTranscoder(this)
         val wmaStore = WmaPlaybackStore(File(filesDir, "transcoded"))
+        val wmaPreparer = AsyncWmaImportPreparer(
+            scope = appScope,
+            store = wmaStore,
+            transcode = { uri, output ->
+                wmaTranscoder.transcodeToM4a(android.net.Uri.parse(uri), output)
+            },
+            onPrepared = { audioId, uri, durationMs ->
+                db.audioBookDao().setPreparedDuration(audioId, uri, durationMs, timeSource.wallMs()) == 1
+            },
+            onFailure = { audioId, error ->
+                android.util.Log.w("EchoMindImport", "WMA 后台准备失败：$audioId", error)
+            },
+        )
         val audioRepository = AudioRepositoryImpl(
             audioBookDao = db.audioBookDao(),
             folderDao = db.importedFolderDao(),
@@ -86,9 +101,7 @@ class EchoMindApp : Application() {
             grants = grants,
             nowMs = timeSource::wallMs,
             wmaStore = wmaStore,
-            wmaPrepare = WmaImportPreparer { audioId, uri ->
-                wmaTranscoder.transcodeToM4a(android.net.Uri.parse(uri), wmaStore.fileOf(audioId))
-            },
+            wmaPrepare = wmaPreparer,
         )
         val transcriptRepository = TranscriptRepositoryImpl(db, timeSource)
         val modelsRoot = File(filesDir, ModelCatalog.MODELS_DIR_NAME)
@@ -127,7 +140,7 @@ class EchoMindApp : Application() {
                 // 所以每场会话开始时自己拉一次，否则没有会话注册也没有通知栏（实测）。
                 startSessionService = { startService(Intent(this, EchoMindMediaService::class.java)) },
             ),
-            appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+            appScope = appScope,
             playbackScope = playbackScope,
         )
         // 上次进程被杀留下的 ACTIVE 会话在这里结算，否则它会永远占着「正在听」的位置
