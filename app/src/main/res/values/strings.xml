@@ -4,5 +4,8 @@
     <string name="notification_channel_transcript">转录任务</string>
     <string name="transcript_notification_title">正在转录</string>
     <string name="transcript_notification_preparing">准备模型与解码…</string>
-    <string name="transcript_notification_progress">已识别 %1$d 段（总段数要等解码跑完才知道）</string>
+    <string name="transcript_notification_transcoding">WMA 转码中 %1$d%%（转成 mp3 后开始识别）</string>
+    <string name="transcript_notification_transcoding_indeterminate">WMA 转码中…（转成 mp3 后开始识别）</string>
+    <string name="transcript_notification_recognizing">识别中 %1$d%% · 已识别 %2$d 段</string>
+    <string name="transcript_notification_progress">已识别 %1$d 段</string>
 </resources>

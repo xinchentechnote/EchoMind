@@ -13,6 +13,8 @@ import com.xinchen.echomind.data.db.EchoMindDatabase
 import com.xinchen.echomind.data.db.Migrations
 import com.xinchen.echomind.data.repo.AudioRepository
 import com.xinchen.echomind.data.repo.AudioRepositoryImpl
+import com.xinchen.echomind.data.repo.AppSettings
+import com.xinchen.echomind.data.repo.SharedPreferencesAppSettings
 import com.xinchen.echomind.data.repo.AsyncWmaImportPreparer
 import com.xinchen.echomind.data.repo.WmaImportPreparer
 import com.xinchen.echomind.data.repo.WmaPlaybackStore
@@ -57,6 +59,7 @@ class AppGraph(
     val transcriptWork: TranscriptWorkScheduler,
     val liveTranscriptStore: LiveTranscriptStore,
     val wmaStore: WmaPlaybackStore,
+    val appSettings: AppSettings,
     val appScope: CoroutineScope,
     val playbackScope: CoroutineScope,
 )
@@ -79,12 +82,18 @@ class EchoMindApp : Application() {
         val grants = SafTreeGrantStore(this)
         val wmaTranscoder = WmaTranscoder(this)
         val wmaStore = WmaPlaybackStore(File(filesDir, "transcoded"))
+        val appSettings: AppSettings = SharedPreferencesAppSettings(this)
         val wmaPreparer = AsyncWmaImportPreparer(
             scope = appScope,
             store = wmaStore,
-            transcode = { uri, output ->
-                wmaTranscoder.transcodeToM4a(android.net.Uri.parse(uri), output)
+            transcode = { uri, output, ext ->
+                if (ext == "mp3") {
+                    wmaTranscoder.transcodeToMp3(android.net.Uri.parse(uri), output)
+                } else {
+                    wmaTranscoder.transcodeToM4a(android.net.Uri.parse(uri), output)
+                }
             },
+            targetExt = { if (appSettings.wmaTranscodeToMp3) "mp3" else "m4a" },
             onPrepared = { audioId, uri, durationMs ->
                 db.audioBookDao().setPreparedDuration(audioId, uri, durationMs, timeSource.wallMs()) == 1
             },
@@ -127,10 +136,16 @@ class EchoMindApp : Application() {
                 modelsRoot = modelsRoot,
                 clock = timeSource,
                 liveStore = liveTranscriptStore,
+                // D44：WMA 先转 mp3 再识别，产物与播放共用一个目录；转码出的时长顺手回填给书（与导入准备同一道 uri 守卫）
+                wmaStore = wmaStore,
+                onWmaPrepared = { audioId, uri, durationMs ->
+                    db.audioBookDao().setPreparedDuration(audioId, uri, durationMs, timeSource.wallMs())
+                },
             ),
             transcriptWork = TranscriptWorkScheduler(this, transcriptRepository),
             liveTranscriptStore = liveTranscriptStore,
             wmaStore = wmaStore,
+            appSettings = appSettings,
             playbackController = Media3PlaybackController(
                 player = PlayerHolder.get(this),
                 repository = playbackRepository,
@@ -148,7 +163,11 @@ class EchoMindApp : Application() {
         // 同一条规矩管转录：挂着的任务行标成 INTERRUPTED，用户在转录页看到它并点重试（FR-507）。
         // WorkManager 可能会自己把 worker 重跑一遍，那一轮会在 markRunning 的守卫前收手——
         // 这里刻意**不**去 cancelAllWorkByTag：那个调用是异步的，会连用户刚点的「转录」一起取消。
-        graph.appScope.launch { graph.transcriptRepository.recoverInterrupted() }
+        // 随后把升级前「一本书多行」的历史收口成一行（只留最新；正常运行期间入队自己维持一本书一行）。
+        graph.appScope.launch {
+            graph.transcriptRepository.recoverInterrupted()
+            graph.transcriptRepository.collapseHistory()
+        }
         // 模型随安装包内置（FR-511）：把缺的文件从 assets 拷进 filesDir 并逐文件校验。
         // 文件都齐时它只是一遍哈希核对（~1-2 秒，后台线程），不阻塞任何界面；
         // assets 缺文件不会炸启动——原因写进该包的状态，设置页会显示出来

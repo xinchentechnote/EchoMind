@@ -13,6 +13,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -52,6 +53,7 @@ fun SettingsScreen(
     viewModel: SettingsViewModel = viewModel(factory = SettingsViewModel.Factory),
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val wmaTargetMp3 by viewModel.wmaTargetMp3.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
 
     state.message?.let { message ->
@@ -90,6 +92,29 @@ fun SettingsScreen(
                     onRestore = { viewModel.restore(status.spec.id) },
                     onDelete = { deleteTarget = status },
                 )
+            }
+            item {
+                // WMA 导入转码目标（D42）：M4A 默认；MP3 是用户可选的兼容性支路（之后导入的书生效）
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Text("WMA 转码格式", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "WMA 书在导入时自动转码成本格式；只影响之后导入的书，已导入的不受影响。",
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 6.dp)) {
+                        FilterChip(
+                            selected = !wmaTargetMp3,
+                            onClick = { viewModel.onWmaTargetMp3Selected(false) },
+                            label = { Text("M4A（默认）") },
+                        )
+                        FilterChip(
+                            selected = wmaTargetMp3,
+                            onClick = { viewModel.onWmaTargetMp3Selected(true) },
+                            label = { Text("MP3") },
+                        )
+                    }
+                }
             }
             item {
                 Text(

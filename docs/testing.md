@@ -865,6 +865,67 @@ CER/WER 或器乐幻觉门槛。按 D42 收口：删除模型选择 UI、`ModelR
   `b4f304ace4b3e211e31886f6a6d4b94147dfad7d650f9304b2b57f767871e3d6`，APK SHA-256
   `7fddc2871e21de294464f58b61fbf0195847d85a31d6d212e1e3d30f37008b06`。
 
+### WMA 转录根因修复 + 一书一行 + 时间口径进度（用户真机反馈，2026-10-24）
+
+**用户症状与根因**：真机上同一本 WMA（0415给孩子一生的安全感）反复「转录失败：WMA 解码中途失败（libwma 返回
+错误）」，且卡片显示「已识别 0 段」；同目录另一本（0418）却能成功。排查（ASF 头解析 + FFmpeg wmadec 源码）：
+`wma_jni.c` 的 pending 缓冲固定 32 KB，而 wmav2 带比特储备的超帧一次吐 `nb_frames(4bit,≤15)×frame_len` 个样本，
+低码率书解一个超帧的 PCM 就超过 32 KB，`appendFrame` 溢出返回 -1 → **第一包就中止整次解码**（所以是 0 段而不是
+中途）；能否失败取决于每本书的码率/编码器（能过的 0418 与仓库素材恰好是「每超帧 1 帧、flags2=1 无比特储备」的
+ffmpeg 编码形态）。另外复核发现上一轮的 LAME mp3 支路从未真正链接进 .so（`nm` 无 `nativeMp3*` 导出），
+设置里的「转成 mp3」一调就会 `UnsatisfiedLinkError`。
+
+**修复与改动**（D44/D45，细节见 `architecture.md` §10）：
+
+1. `wma_jni.c`：pending 按需增长（上限 16 MB 防御）；单个坏包 `avcodec_send_packet/receive_frame` 失败只记数跳过，
+   整条流一个样本都没解出才返回 -1；新增 `nativeBadPackets` 把跳过数透给 Kotlin 写 logcat（不静默）。
+2. 重建 `libwma.so`（1,329,656 B，SHA-256 `e12081cb…ad15513b5`，FFmpeg 6.1.1 裁剪 + LAME 3.100 交叉编译，
+   `-Wl,-z,defs` / `-Wl,-z,max-page-size=16384`）；LAME 交叉编译时上一轮 `CC=` 留空导致编出宿主 Mach-O
+   （链接期只报 "neither ET_REL" 警告），本轮用 NDK clang 重编并以 `llvm-readelf` 验 Machine=AArch64；
+   全套脚本落进 `app/libs/wma/README.md`，`build.gradle.kts` 闸门换新字节数。
+3. 转录管线：`.wma` 先 `transcodeToMp3` 落 `WmaPlaybackStore`（`<audioId>.mp3`，与播放共用；已有产物复用），
+   再走 `PcmDecoder`（MediaCodec）；转码阶段单独报进度（`phase=TRANSCODING`，分子=已解样本时间，分母=WMA 容器时长）；
+   转码出的时长经 `onWmaPrepared` 回填书（`setPreparedDuration` 同款 uri 守卫）。「自动选模型」的 30 秒探测挪到
+   `markRunning` 之后（SenseVoice 不与别的引擎并存，D36），`updateModel` 相应放行 RUNNING 行。
+4. `transcript_job` v3→v4：加 `phase` / `position_ms` / `duration_ms`（显式 Migration + `4.json` + 迁移测试）；
+   进度分母换成**容器时长**（`PcmDecoder.containerDurationMs` 解码前先读），转录/播放页/通知都渲染
+   「WMA 转码中 N%」/「识别中 N% · 已识别 M 段」，分母未知时只报段数不给百分比（诚实性规矩不变）。
+5. 一本书一行：`enqueue/retry` 入队事务里删同书已结束旧行；启动 `collapseHistory()` 收口升级前的重复行；
+   新增删除（确认框，成功记录连该轮 ASR 字幕一起删、书架状态按剩余字幕回退）。
+6. 播放页残留错误修复：`Media3PlaybackController` 的 `error` 按出错那本书限定（`erroredAudioId`），
+   换书即消失、同书重新播放成功（STATE_READY）即清除。
+
+**验证结果**：
+
+- `:app:assembleDebug :app:testDebugUnitTest`：`BUILD SUCCESSFUL`，JVM XML **282 / 0 / 0**（新增
+  `TranscriptDisplayTest` 进度/删除文案 8 条、`PlayerViewModelTest` 状态行改写后 2 条）。
+- 仪器化（手动装双 APK + `am instrument -e class`，未用 connectedDebugAndroidTest，避免清数据）：
+  `Migration_3_4_Test` 3 条（结构对账 / 旧值保留 + 默认列 / 新 DAO 可写可读）、`Migration_2_3_Test` 5 条、
+  `Migration_1_2_Test` 3 条、`TranscriptRepositoryTest` **25** 条（新增：重试顶掉旧行 / 入队只清本书 /
+  删成功连字幕 / 删失败不碰别轮字幕 / 活动行拒删 / 启动收口幂等）、`WmaDecodeTest` 3 条（新增 mp3 支路：
+  产物被 `MediaExtractor` 认作 `audio/mpeg`、时长一致、位置回调单调走到结尾、`containerDurationMs > 0`）、
+  `TranscriptCoordinatorTest` **12** 条（新增：`wma先转mp3再识别且进度分两个阶段`——150 s WMA 端到端 36 段 27 句、
+  进度先 TRANSCODING 后 RECOGNIZING、回填 150,000 ms、第二轮复用产物不再转码；`自动选模型在抢到车道后探测并把
+  行上的模型改写为真正执行的那个`）、`AudioRepositoryImportTest/SubtitleRepositoryTest/PlaybackRepositoryTest/
+  AudioBookDaoTest/TranscriptForegroundServiceTypeTest` 48 条。全部 OK。
+- 用户 34 分钟真实 WMA（`user-book.wma`）探针：`transcodeToMp3` wall 11,454 ms（**RTF 0.0056**），
+  输出 32,975,724 B，位置回调 5,548 次末次 2,060,910 ms，`MediaExtractor` 读回 2,060,982 ms；
+  m4a 支路 wall 101,123 ms（RTF 0.049，厂商 AAC 编码器慢一个量级）。
+- 真实 UI（emulator-5554，SAF 导入 `/sdcard/Music`：150 s WMA + 150 s mp3 + 34:20 用户 WMA）：
+  ①导入后 WMA 书几秒内拿到时长（后台 m4a 转码就绪）；②点开 34 分钟 WMA → 先弹「无法播放
+  （ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED）」（m4a 未就绪时原始 WMA 播不了，如实显示）+ 字幕区
+  「正在转录：识别中 2% · 已识别 11 段 · 已出 16 句」+ 实时字幕流出；③**切到正常的 mp3 书播放页：
+  无残留错误 tips**（本轮修复的用户 bug），播放正常，其转录显示「排队中」；④转录页：34 分钟书
+  「识别中 92% · 已识别 557 段」→ 收口「共 609 段全部识别」，两本书各只有一行（一本书一行），
+  「删除」按钮出现；⑤删除 → 确认框（写明「41 段字幕会一起删除」）→ 确认后记录消失、书架该行回「未转录」；
+  ⑥34 分钟书播完转码后可正常播放（已播到 2:31/34:20），时长回填成功。全程 logcat 无 FATAL。
+  截图（宿主机 /tmp）：`shot-player-wma-phase1.png`、`shot-player-normal-book.png`、
+  `shot-transcript-running1.png`、`shot-transcript-running3.png`、`shot-delete-dialog.png`、
+  `shot-after-delete.png`、`shot-shelf-final.png`。
+- 诚实边界：**用户真机（nova 13）未连接本轮验证**，以上是 API 36 arm64 模拟器证据；新 libwma.so 也尚未
+  上传为 release 资产（CI 的取回步会被 Gradle 闸门按设计拦下，`ci.yml` 里留了替换指引）。真机复测清单：
+  0415 那本 WMA 直接点重试应能转完；旧版本积下的重复失败行会在启动时被收口成一行。
+
 ### v0.1.3 热修：WMA 不再阻塞文件夹导入（用户真机反馈，2026-10-17）
 
 **复现与根因**：v0.1.2 首次把 WMA 纳入扫描白名单，同时在 `AudioRepositoryImpl.importFolder()` 返回前同步执行

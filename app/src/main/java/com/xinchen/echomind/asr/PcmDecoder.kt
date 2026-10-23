@@ -297,5 +297,25 @@ class PcmDecoder(
          * 真走到这一步是设备/解码器的问题，但不能让它把转录任务无限挂住。
          */
         const val MAX_STALLED_ROUNDS = 3_000
+
+        /**
+         * 只读容器时长（ms），不解码：转录进度的分母要在**开始解码之前**就拿到（FR-507）。
+         * 容器没给（或打不开）返回 -1——调用方据此不显示百分比，而不是编一个。
+         */
+        fun containerDurationMs(context: Context, uri: Uri): Long {
+            val extractor = MediaExtractor()
+            return try {
+                extractor.setDataSource(context, uri, null)
+                val track = (0 until extractor.trackCount).firstOrNull {
+                    extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true
+                } ?: return -1L
+                val format = extractor.getTrackFormat(track)
+                if (format.containsKey(MediaFormat.KEY_DURATION)) format.getLong(MediaFormat.KEY_DURATION) / 1000 else -1L
+            } catch (e: Exception) {
+                -1L
+            } finally {
+                runCatching { extractor.release() }
+            }
+        }
     }
 }

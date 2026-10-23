@@ -69,17 +69,14 @@ data class PlayerTranscriptState(
 
 /**
  * 活动任务的进度行文案（纯函数，JVM 可断言）。
- * 分母未知（VAD 没跑完，`totalSegments==0`）时只说「已识别 N 段」，不画假百分比——
- * 与转录页同一条规矩（FR-507）。
+ * 进度那半句与转录页同一来源（[TranscriptDisplay.runningPhrase]）：分母是容器时长，
+ * 容器没给时长就只报段数、不画假百分比（FR-507）。
  */
 internal fun liveStatusLine(job: TranscriptJobRow?, sentenceCount: Int): String? = when {
     job == null -> null
     job.status == TranscriptJobStatus.Queued -> "转录排队中（另一本书正在转录），轮到后自动开始"
-    job.status == TranscriptJobStatus.Running -> buildString {
-        append("正在转录：已识别 ${job.doneSegments}")
-        if ((job.totalSegments ?: 0) > 0) append("/${job.totalSegments}")
-        append(" 段 · 已出 $sentenceCount 句（转完自动入库）")
-    }
+    job.status == TranscriptJobStatus.Running ->
+        "正在转录：${TranscriptDisplay.runningPhrase(job)} · 已出 $sentenceCount 句（转完自动入库）"
 
     else -> null
 }

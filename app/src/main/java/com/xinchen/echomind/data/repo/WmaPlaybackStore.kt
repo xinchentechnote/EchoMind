@@ -13,22 +13,27 @@ import java.nio.file.StandardCopyOption
  */
 class WmaPlaybackStore(private val dir: File) {
 
-    fun fileOf(audioId: String): File = File(dir, "$audioId.m4a")
+    fun fileOf(audioId: String, ext: String = "m4a"): File = File(dir, "$audioId.$ext")
 
     /**
      * 后台转码只写本次任务独占的临时文件；成功后才替换正式产物。
      *
      * generation 让已取消但仍卡在厂商 MediaCodec 里的旧任务与新任务隔离，
      * 否则删除后快速重导入时，两次转码可能同时写同一个 `.part`。
+     * [ext] 是转码目标扩展名（D42：m4a 默认 / mp3 可选），part 与正式产物同扩展名。
      */
-    fun partFileOf(audioId: String, generation: String): File =
-        File(dir, "$audioId.$generation.m4a.part")
+    fun partFileOf(audioId: String, generation: String, ext: String = "m4a"): File =
+        File(dir, "$audioId.$generation.$ext.part")
 
-    fun isReady(audioId: String): Boolean = fileOf(audioId).let { it.isFile && it.length() > 0L }
+    fun isReady(audioId: String, ext: String = "m4a"): Boolean = fileOf(audioId, ext).let { it.isFile && it.length() > 0L }
 
-    /** 播放用的 URI：WMA 书换成本地转码产物，其余原样返回 */
-    fun playbackUriFor(fileName: String, originalUri: String, audioId: String): String =
-        if (isWma(fileName) && isReady(audioId)) fileOf(audioId).toURI().toString() else originalUri
+    /** 播放用的 URI：WMA 书换成本地转码产物（m4a 优先、mp3 兜底，谁在播谁），其余原样返回 */
+    fun playbackUriFor(fileName: String, originalUri: String, audioId: String): String {
+        if (!isWma(fileName)) return originalUri
+        val existing = listOf("m4a", "mp3").map { fileOf(audioId, it) }.firstOrNull { it.isFile }
+            ?: return originalUri
+        return existing.toURI().toString()
+    }
 
     /** 转码完成后把转码出来的时长放回书（WMA 读不到 Media3 的时长，导入编排用它替换 durationReadFailed 口径） */
     fun prepareDir() {
@@ -36,9 +41,9 @@ class WmaPlaybackStore(private val dir: File) {
     }
 
     /** 同目录原子替换；文件系统不支持 ATOMIC_MOVE 时退化为同目录覆盖移动。 */
-    fun commit(audioId: String, generation: String) {
-        val source = partFileOf(audioId, generation).toPath()
-        val target = fileOf(audioId).toPath()
+    fun commit(audioId: String, generation: String, ext: String = "m4a") {
+        val source = partFileOf(audioId, generation, ext).toPath()
+        val target = fileOf(audioId, ext).toPath()
         try {
             Files.move(source, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
         } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
@@ -48,12 +53,12 @@ class WmaPlaybackStore(private val dir: File) {
 
     fun deleteParts(audioId: String) {
         dir.listFiles()
-            ?.filter { it.name.startsWith("$audioId.") && it.name.endsWith(".m4a.part") }
+            ?.filter { it.name.startsWith("$audioId.") && it.name.endsWith(".part") }
             ?.forEach(File::delete)
     }
 
     fun delete(audioId: String) {
-        fileOf(audioId).delete()
+        listOf("m4a", "mp3").forEach { fileOf(audioId, it).delete() }
         deleteParts(audioId)
     }
 

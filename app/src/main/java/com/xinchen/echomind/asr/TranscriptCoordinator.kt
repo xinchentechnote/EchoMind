@@ -8,19 +8,25 @@ import com.xinchen.echomind.core.conf.PlaybackPolicy
 import com.xinchen.echomind.core.time.TimeSource
 import com.xinchen.echomind.data.repo.AudioRepository
 import com.xinchen.echomind.data.repo.TreeGrantStore
+import com.xinchen.echomind.data.repo.WmaPlaybackStore
 import com.xinchen.echomind.domain.asr.AsrChunkPlanner
 import com.xinchen.echomind.domain.asr.SentenceSplitter
 import com.xinchen.echomind.domain.asr.TokenTimingMapper
 import com.xinchen.echomind.domain.asr.TranscriptQuality
 import com.xinchen.echomind.domain.model.RecognizedSegment
+import com.xinchen.echomind.domain.model.SpeechSpan
 import com.xinchen.echomind.domain.model.SubtitleSegment
 import com.xinchen.echomind.domain.model.TokenTiming
 import com.xinchen.echomind.domain.model.TranscriptFailure
+import com.xinchen.echomind.domain.model.TranscriptModelRef
 import com.xinchen.echomind.domain.model.TranscriptJobStatus
+import com.xinchen.echomind.domain.model.TranscriptPhase
+import com.xinchen.echomind.domain.model.TranscriptProgress
 import com.xinchen.echomind.domain.model.TranscriptionTarget
 import com.xinchen.echomind.domain.transcript.LiveTranscriptStore
 import com.xinchen.echomind.domain.transcript.TranscriptRepository
 import java.io.File
+import java.util.UUID
 
 /**
  * 一轮转录从头跑到尾（`docs/asr-design.md` §5 的编排层，Phase 6 第 4b 项）。
@@ -30,15 +36,20 @@ import java.io.File
  * `PcmDecoder` 的 sink 不是 suspend，而「识别必须紧跟解码」这个顺序正是内存峰值受控的前提（NFR-05：
  * 攒着一整本书的 PCM 再识别，一小时音频就是 230 MB），所以进度用同步回调 [run] 的 [onProgress] 传出去。
  *
- * 三条不写在注释里就会被人悄悄改掉的规矩：
+ * **WMA 先转 mp3 再识别（D44，2026-10-24）**：`.wma` 不再由 `WmaPcmDecoder` 直接解给 VAD，而是先经
+ * `WmaTranscoder.transcodeToMp3` 落到 `WmaPlaybackStore`（与播放共用一份产物），再由 `PcmDecoder`
+ * 走 MediaCodec 解码。好处是识别链路只剩一条被测试覆盖的 MediaCodec 路径，而且转码产物顺手把播放也修好了。
+ *
+ * 四条不写在注释里就会被人悄悄改掉的规矩：
  * 1. **不合格的字直接丢，不补时间**（§8 第一行）。`TokenTimingMapper.Mismatch` 抛出来的那块没有可用时间，
  *    均分填洞是 AGENTS.md §5 禁止的行为；丢弃比例过高时整本标 `OUTPUT_UNRELIABLE`，而不是交一份满是洞的「成功」。
  * 2. **状态跃迁全靠仓储的守卫**。`markRunning` 返回 false 有两种：这一行已经被取消/已结算
  *    （进程被杀后 WorkManager 会重跑 worker，而库里那行已是 FAILED），或者**别的任务正占着唯一的车道**
  *    （D36：一份 int8 模型 243 MB，同时开两份不是慢而是 OOM）。两种都立刻收手、一行都不写，
- *    而且收手发生在 `SherpaOnnxEngine.open()` **之前**——这就是它排在装载前唯一的理由。
- * 3. **进度分母在 VAD 跑完之前是未知的**（段数只能数出来），所以 `markRunning` 先写 0，
- *    UI 那侧 `progress == null` 显示「已识别 N 段」而不是 0%（FR-507；假进度比没有进度更糟）。
+ *    而且收手发生在**任何**模型装载之前——语言探测（SenseVoice 226 MB）也排在它后面，同一个理由。
+ * 3. **进度的分母是容器时长，不是段数**。解码一开始就知道时长，所以百分比从第一秒起就是真的；
+ *    容器没给时长（极少数）就不显示百分比（FR-507；假进度比没有进度更糟）。
+ * 4. **WMA 的转码也算进度**（阶段 `Transcoding`）：一本 34 分钟的书转码要一两分钟，这段时间不能让用户对着 0%。
  */
 class TranscriptCoordinator(
     private val context: Context,
@@ -52,6 +63,13 @@ class TranscriptCoordinator(
      * 播放页边转边显示；null（部分测试场景）= 不发布，其余行为不变。
      */
     private val liveStore: LiveTranscriptStore? = null,
+    /** WMA 转码产物的存放约定（D44）。null = 这次装配不处理 WMA（测试场景），遇到 .wma 直接报解码失败 */
+    private val wmaStore: WmaPlaybackStore? = null,
+    /**
+     * WMA 转码成功后把真实时长回填给书（导入时读不到 WMA 时长，书架一直显示「时长未知」）。
+     * lambda 接缝：`audio_book` 的 DAO 不该出现在 asr 包里，和 `AsyncWmaImportPreparer.onPrepared` 同一个形状。
+     */
+    private val onWmaPrepared: suspend (audioId: String, uri: String, durationMs: Long) -> Unit = { _, _, _ -> },
 ) {
 
     /**
@@ -59,12 +77,12 @@ class TranscriptCoordinator(
      * 库里该写的 SUCCESS/FAILED 在本函数里已经写完，不留「忘了调 markFailed」这种失误空间。
      *
      * @param isCancelled 每收到一块解码结果检查一次；返回 true 就停，任务状态由点取消的那一方改
-     * @param onProgress 节流后的进度回调（间隔 ≥ [PlaybackPolicy.POSITION_FLUSH_INTERVAL_MS]，AGENTS.md §4）
+     * @param onProgress 节流后的进度回调（间隔 ≥ [PlaybackPolicy.TRANSCRIPT_PROGRESS_INTERVAL_MS]，AGENTS.md §4）
      */
     suspend fun run(
         jobId: String,
         isCancelled: () -> Boolean = { false },
-        onProgress: (doneSegments: Int, totalSegments: Int) -> Unit = { _, _ -> },
+        onProgress: (TranscriptProgress) -> Unit = { },
     ): TranscriptOutcome {
         val job = repository.jobById(jobId)
         val target = job?.audioId?.let { audioRepository.transcriptionTarget(it) }
@@ -91,14 +109,10 @@ class TranscriptCoordinator(
             "VAD 模型缺失或与清单不符（${ModelCatalog.SILERO_VAD_ID}），请先在模型页准备好",
         )
 
-        // 产品范围收口为普通话听书/书解：所有新任务都应写 Paraformer；这里再兜住升级前可能残留的
-        // auto/SenseVoice 排队行，先把模型身份改成真正会执行的 Paraformer，避免历史行说一套、推理跑另一套。
-        val productModel = ModelCatalog.transcriptRef
-        if (job.modelId != productModel.id || job.modelVersion != productModel.version) {
-            if (!repository.updateModel(jobId, productModel)) {
-                return TranscriptOutcome.Skipped("任务 $jobId 已不在排队态，不能切换到中文听书模型")
-            }
-        }
+        // 显式指定的模型（中文书解/英文·歌曲）原样使用；「自动选模型」要先抢到车道再探测（规矩 2）
+        val requested = TranscriptModelRef(id = job.modelId, version = job.modelVersion)
+        val explicitSpec: ModelSpec? =
+            if (requested.id == ModelCatalog.AUTO_MODEL_ID) null else ModelCatalog.specForFinal(requested)
 
         if (!repository.markRunning(jobId, 0)) {
             return TranscriptOutcome.Skipped(
@@ -106,19 +120,49 @@ class TranscriptCoordinator(
             )
         }
 
+        val throttle = ProgressThrottle(clock)
+        // 第 1 步：定下解码来源。WMA 先转 mp3（阶段 Transcoding 的进度就在这里发出去）
+        val source = try {
+            prepareSource(target, isCancelled) { decodedMs, containerMs ->
+                if (throttle.due()) {
+                    onProgress(TranscriptProgress(TranscriptPhase.Transcoding, decodedMs, containerMs.coerceAtLeast(0), 0))
+                }
+            }
+        } catch (cancelled: WmaTranscodeCancelledException) {
+            return TranscriptOutcome.Cancelled
+        } catch (e: Exception) {
+            return fail(jobId, TranscriptFailure.DecodeFailed, "WMA 转 mp3 失败，没能走到识别：${e.message ?: e.javaClass.simpleName}")
+        }
+        if (isCancelled()) return TranscriptOutcome.Cancelled
+
+        // 第 2 步：「自动选模型」（D41）——SenseVoice 听开头 30 s 按转写文本字符系别判语言，
+        // 把行上的 model_id/version 改写为最终模型（zh/yue → Paraformer，其余 → SenseVoice）
+        val spec = explicitSpec ?: run {
+            val probedText = probeTranscript(source, isCancelled)
+            if (isCancelled()) return TranscriptOutcome.Cancelled
+            val resolved = ModelRouting.resolve(probedText)
+            runCatching {
+                repository.updateModel(
+                    jobId,
+                    TranscriptModelRef(id = resolved.id, version = ModelCatalog.refOf(resolved).version),
+                )
+            }
+            resolved
+        }
+
         val engine = try {
-            SherpaOnnxEngine.open(modelsRoot, ModelCatalog.paraformer)
+            SherpaOnnxEngine.open(modelsRoot, spec)
         } catch (e: AsrModelNotReadyException) {
             return fail(jobId, TranscriptFailure.ModelMissing, e.message ?: "识别模型不可用")
         }
         val run = try {
-            Attempt(engine = engine, vadModel = vadModel)
+            Attempt(engine = engine, vadModel = vadModel, target = target, durationMs = source.durationMs, throttle = throttle)
         } catch (e: Exception) {
             engine.release()
             return fail(jobId, TranscriptFailure.ModelMissing, "VAD 打不开（${vadModel.path}）：${e.javaClass.simpleName} ${e.message}")
         }
         val outcome: TranscriptOutcome = try {
-            run.recognizeAll(target, isCancelled, onProgress)
+            run.recognizeAll(source, isCancelled, onProgress)
             if (run.wasCancelled) TranscriptOutcome.Cancelled else settle(jobId, run)
         } catch (e: PcmDecodeException) {
             fail(jobId, TranscriptFailure.DecodeFailed, e.message ?: "解码失败")
@@ -132,32 +176,69 @@ class TranscriptCoordinator(
         return outcome
     }
 
-    /** 解码 → VAD → 逐块识别。VAD 每吐一段就立刻识别完，所以同时在内存里的只有当前这一段（≤20 s ≈ 1.28 MB）。 */
-    private fun Attempt.recognizeAll(
+    /** 解码来源：给 `PcmDecoder` 的 uri 与容器时长（未知 -1） */
+    private class Source(val uri: Uri, val durationMs: Long, val fromWma: Boolean)
+
+    /**
+     * WMA：先转成 mp3 落在 [wmaStore]（已有产物直接复用——导入时用户若选了 mp3 目标，这里零成本），
+     * 然后交给 MediaCodec；其余格式原样。转码写独占的 `.part`，成功才原子替换正式文件，
+     * 与 `AsyncWmaImportPreparer` 同一套约定，半截文件不会被播放器或下一次转录看到。
+     */
+    private suspend fun prepareSource(
         target: TranscriptionTarget,
         isCancelled: () -> Boolean,
-        onProgress: (Int, Int) -> Unit,
+        onPosition: (decodedMs: Long, containerMs: Long) -> Unit,
+    ): Source {
+        val original = Uri.parse(target.uri)
+        if (!WmaPlaybackStore.isWma(target.fileName)) {
+            return Source(original, PcmDecoder.containerDurationMs(context, original), fromWma = false)
+        }
+        val store = wmaStore
+            ?: throw java.io.IOException("这次装配没有 WMA 转码目录（wmaStore 为空），无法先转 mp3")
+        if (!store.isReady(target.audioId, "mp3")) {
+            store.prepareDir()
+            val generation = UUID.randomUUID().toString()
+            val part = store.partFileOf(target.audioId, generation, "mp3")
+            try {
+                val durationMs = WmaTranscoder(context).transcodeToMp3(original, part, isCancelled, onPosition)
+                store.commit(target.audioId, generation, "mp3")
+                Log.i(TAG, "WMA → mp3 完成：${target.fileName}，时长 $durationMs ms，产物 ${store.fileOf(target.audioId, "mp3").length()} B")
+                if (durationMs > 0) {
+                    runCatching { onWmaPrepared(target.audioId, target.uri, durationMs) }
+                        .onFailure { Log.w(TAG, "WMA 时长回填失败（不影响转录）：${it.message}") }
+                }
+            } finally {
+                part.delete()
+            }
+        }
+        val mp3 = Uri.fromFile(store.fileOf(target.audioId, "mp3"))
+        return Source(mp3, PcmDecoder.containerDurationMs(context, mp3), fromWma = true)
+    }
+
+    /** 解码 → VAD → 逐块识别。VAD 每吐一段就立刻识别完，所以同时在内存里的只有当前这一段（≤20 s ≈ 1.28 MB）。 */
+    private fun Attempt.recognizeAll(
+        source: Source,
+        isCancelled: () -> Boolean,
+        onProgress: (TranscriptProgress) -> Unit,
     ) {
-        val sink = PcmChunkSink { samples, _ ->
+        val sink = PcmChunkSink { samples, startSample ->
             if (isCancelled()) {
                 wasCancelled = true
                 false
             } else {
-                vad.push(samples).forEach { utterance -> consume(utterance, target, onProgress) }
+                // 位置记到本块末尾：进度条跟着解码走，哪怕这一块没切出任何语音段
+                positionMs = (startSample + samples.size) * 1000L / AudioFormats.ASR_SAMPLE_RATE
+                vad.push(samples).forEach { utterance -> consume(utterance, onProgress) }
+                reportProgress(onProgress)
                 true
             }
         }
-        // .wma 走自建 libwma（D40，系统无 WMA 解码器），其余走 MediaCodec；输出契约完全一致
-        decodeSummary = if (target.fileName.endsWith(".wma", ignoreCase = true)) {
-            WmaPcmDecoder().decode(context, Uri.parse(target.uri), sink)
-        } else {
-            PcmDecoder(context).decode(Uri.parse(target.uri), sink)
-        }
-        if (!wasCancelled) vad.finish().forEach { utterance -> consume(utterance, target, onProgress) }
+        decodeSummary = PcmDecoder(context).decode(source.uri, sink)
+        if (!wasCancelled) vad.finish().forEach { utterance -> consume(utterance, onProgress) }
     }
 
     /** 一个 VAD 段：切成 ≤20 s 的块逐块识别，字攒成 [RecognizedSegment]（一个段一组候选字，§6 第 1 条）。 */
-    private fun Attempt.consume(utterance: VadUtterance, target: TranscriptionTarget, onProgress: (Int, Int) -> Unit) {
+    private fun Attempt.consume(utterance: VadUtterance, onProgress: (TranscriptProgress) -> Unit) {
         val tokens = mutableListOf<TokenTiming>()
         for (chunk in AsrChunkPlanner.plan(listOf(utterance.span))) {
             totalChunks++
@@ -182,7 +263,7 @@ class TranscriptCoordinator(
         }
         doneSegments++
         if (tokens.isNotEmpty()) {
-            publishLive(target, segments.last(), doneSegments)
+            publishLive(segments.last(), doneSegments)
         }
         reportProgress(onProgress)
     }
@@ -192,7 +273,7 @@ class TranscriptCoordinator(
      * 切句按**单个段**做：跨段合并过度切分只有收尾的整本切分做得到，所以预览偶尔比正式字幕略碎——
      * 已知差别，收尾以 `commitSubtitles` 的整本结果为准。
      */
-    private fun publishLive(target: TranscriptionTarget, segment: RecognizedSegment, doneSegments: Int) {
+    private fun Attempt.publishLive(segment: RecognizedSegment, doneSegments: Int) {
         val store = liveStore ?: return
         val sentences = SentenceSplitter.split(listOf(segment)).map { draft ->
             SubtitleSegment(index = 0, startMs = draft.startMs, endMs = draft.endMs, text = draft.text)
@@ -200,11 +281,9 @@ class TranscriptCoordinator(
         store.append(target.audioId, sentences, doneSegments)
     }
 
-    private fun Attempt.reportProgress(onProgress: (Int, Int) -> Unit) {
-        // 段数分母在 VAD 跑完前会一直涨，写「N/N」只会画出永远 100% 的假进度，所以中途 total 一律给 0
-        if (clock.monotonicMs() - lastProgressWriteMs < PlaybackPolicy.POSITION_FLUSH_INTERVAL_MS) return
-        lastProgressWriteMs = clock.monotonicMs()
-        onProgress(doneSegments, 0)
+    private fun Attempt.reportProgress(onProgress: (TranscriptProgress) -> Unit) {
+        if (!throttle.due()) return
+        onProgress(TranscriptProgress(TranscriptPhase.Recognizing, positionMs, durationMs.coerceAtLeast(0), doneSegments))
     }
 
     /** 切句 + 质量闸门 + 单事务入库（§5 第 6~7 步）。 */
@@ -238,15 +317,63 @@ class TranscriptCoordinator(
         val segments = drafts.sortedBy { draft -> draft.startMs }.mapIndexed { index, draft ->
             SubtitleSegment(index = index, startMs = draft.startMs, endMs = draft.endMs, text = draft.text)
         }
-        // 收尾这一次不节流：最后的数字必须落库，否则进度条停在 90% 而字幕已经在库里
-        repository.updateProgress(jobId, doneSegments = run.doneSegments, totalSegments = run.doneSegments)
-        val written = repository.commitSubtitles(jobId, segments)
+        // 段数的终值随 SUCCESS 一起落库（done = total = 实跑段数），不再依赖节流中的最后一次进度写
+        val written = repository.commitSubtitles(jobId, segments, totalSegments = run.doneSegments)
         return TranscriptOutcome.Committed(
             sentences = written,
             segments = run.doneSegments,
             rejectedChunks = run.rejectedChunks,
             guessedBoundaries = guessed,
         )
+    }
+
+    /**
+     * 语言探测（D41 自动路由）：SenseVoice 听开头 ≤30 s，把**转写文本**交给 ModelRouting
+     * 按字符系别路由（模型自报的语言标签实测不可靠，见 D41 打样）。探测失败返回 null（落默认
+     * Paraformer）——探测挂了不该挡住一次本来合法的转录。解码来源与正式识别同一份（WMA 已是 mp3）。
+     */
+    private fun probeTranscript(source: Source, isCancelled: () -> Boolean): String? {
+        val engine = try {
+            SherpaOnnxEngine.open(modelsRoot, ModelCatalog.senseVoice)
+        } catch (e: Exception) {
+            Log.w(TAG, "语言探测引擎装载失败，按默认模型继续：${e.message}")
+            return null
+        }
+        val result: String? = try {
+            val transcript = StringBuilder()
+            val collected = mutableListOf<FloatArray>()
+            var total = 0
+            val limit = 30 * AudioFormats.ASR_SAMPLE_RATE
+            PcmDecoder(context).decode(source.uri) { samples, _ ->
+                if (isCancelled()) return@decode false
+                collected += samples
+                total += samples.size
+                if (total >= limit) {
+                    val flat = FloatArray(total)
+                    var offset = 0
+                    for (c in collected) {
+                        System.arraycopy(c, 0, flat, offset, c.size)
+                        offset += c.size
+                    }
+                    val chunks = AsrChunkPlanner.plan(listOf(SpeechSpan(startSample = 0, sampleCount = total)))
+                    for (chunk in chunks) {
+                        val from = chunk.startSample.toInt()
+                        transcript.append(engine.recognize(chunk, flat.copyOfRange(from, from + chunk.sampleCount)).text)
+                    }
+                    false // 只听开头 30 s
+                } else {
+                    true
+                }
+            }
+            Log.i(TAG, "语言探测：${source.uri.lastPathSegment} → ${transcript.take(60)}")
+            transcript.toString()
+        } catch (e: Exception) {
+            Log.w(TAG, "语言探测失败，按默认模型继续：${e.message}")
+            null
+        } finally {
+            engine.release()
+        }
+        return result
     }
 
     /**
@@ -269,10 +396,33 @@ class TranscriptCoordinator(
     }
 
     /**
+     * 进度写库的节流（≥ [PlaybackPolicy.TRANSCRIPT_PROGRESS_INTERVAL_MS]，AGENTS.md §4）。
+     * 转码阶段与识别阶段共用同一个：阶段切换那一下不会因为各自计时而连写两次。
+     * 初值 0 = 「第一次检查就该写」：单调时钟是开机至今的毫秒数，真跑起来必然大于节流间隔。
+     */
+    private class ProgressThrottle(private val clock: TimeSource) {
+        private var lastWriteMs = 0L
+
+        fun due(): Boolean {
+            val now = clock.monotonicMs()
+            if (now - lastWriteMs < PlaybackPolicy.TRANSCRIPT_PROGRESS_INTERVAL_MS) return false
+            lastWriteMs = now
+            return true
+        }
+    }
+
+    /**
      * 一次跑的中间状态。做成一个对象只为两件事：`release()` 成对（AGENTS.md §5），
      * 以及把「VAD 与引擎跟着这次跑走」写死——识别引擎全 App 同一时刻只许一个句柄，装载要花几秒，不能逐段开。
      */
-    private class Attempt(val engine: SherpaOnnxEngine, vadModel: File) {
+    private class Attempt(
+        val engine: SherpaOnnxEngine,
+        vadModel: File,
+        val target: TranscriptionTarget,
+        /** 容器时长（进度分母），未知 -1 */
+        val durationMs: Long,
+        val throttle: ProgressThrottle,
+    ) {
         val vad: VadSegmenter = VadSegmenter(vadModel)
         val segments = mutableListOf<RecognizedSegment>()
         var totalChunks = 0
@@ -281,8 +431,8 @@ class TranscriptCoordinator(
         var wasCancelled = false
         var decodeSummary: PcmDecodeSummary? = null
 
-        /** 0 = 「第一次检查就该写」：单调时钟是开机至今的毫秒数，真跑起来必然大于节流间隔。 */
-        var lastProgressWriteMs = 0L
+        /** 已解到的音频位置（ms），进度分子 */
+        var positionMs = 0L
 
         fun releaseAll() {
             runCatching { vad.release() }

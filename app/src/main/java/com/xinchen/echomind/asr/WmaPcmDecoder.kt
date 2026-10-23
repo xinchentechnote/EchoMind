@@ -3,6 +3,7 @@ package com.xinchen.echomind.asr
 import android.content.Context
 import android.net.Uri
 import android.os.ParcelFileDescriptor
+import android.util.Log
 import com.xinchen.echomind.core.conf.AudioFormats
 import com.xinchen.echomind.domain.asr.PcmConversion
 import com.xinchen.echomind.domain.asr.SincResampler
@@ -63,7 +64,7 @@ class WmaPcmDecoder(
         while (!accumulator.stopped) {
             val n = WmaJni.nativeRead(handle, buffer)
             when {
-                n < 0 -> throw PcmDecodeException("WMA 解码中途失败（libwma 返回错误）")
+                n < 0 -> throw PcmDecodeException("WMA 解码失败（libwma 一个样本都没解出来）")
                 n == 0 -> break
                 else -> {
                     maxReadBytes = maxOf(maxReadBytes, n)
@@ -75,6 +76,10 @@ class WmaPcmDecoder(
         if (!accumulator.stopped) {
             accumulator.append(resampler.resample(FloatArray(0), isFinal = true), sink)
             accumulator.flush(sink)
+        }
+        val skipped = WmaJni.nativeBadPackets(handle)
+        if (skipped > 0) {
+            Log.w(TAG, "WMA 解码跳过了 $skipped 个坏包：交付的是能解出来的那部分（${accumulator.deliveredSamples} 样本）")
         }
         return PcmDecodeSummary(
             sourceSampleRate = sourceSampleRate,
@@ -88,6 +93,8 @@ class WmaPcmDecoder(
     }
 
     companion object {
+        private const val TAG = "EchoMindWma"
+
         /** 64 KB：约 44.1kHz 双声道 186ms，一次 JNI 往返的量级与转码器一致 */
         const val READ_CHUNK_BYTES = 64 * 1024
     }

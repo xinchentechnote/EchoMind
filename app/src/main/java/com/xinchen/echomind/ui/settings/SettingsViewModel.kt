@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.xinchen.echomind.EchoMindApp
+import com.xinchen.echomind.data.repo.AppSettings
 import com.xinchen.echomind.asr.ModelImportException
 import com.xinchen.echomind.asr.ModelManager
 import com.xinchen.echomind.asr.ModelStatus
@@ -37,10 +38,20 @@ data class SettingsUiState(
 class SettingsViewModel(
     private val modelManager: ModelManager,
     private val openAsset: (assetPath: String) -> InputStream?,
+    private val appSettings: AppSettings,
 ) : ViewModel() {
 
     private val _state = MutableStateFlow(SettingsUiState())
     val state: StateFlow<SettingsUiState> = _state.asStateFlow()
+
+    /** WMA 导入转码目标（D42）：M4A 默认，MP3 是用户可选的兼容性支路 */
+    private val _wmaTargetMp3 = MutableStateFlow(appSettings.wmaTranscodeToMp3)
+    val wmaTargetMp3: StateFlow<Boolean> = _wmaTargetMp3.asStateFlow()
+
+    fun onWmaTargetMp3Selected(mp3: Boolean) {
+        appSettings.wmaTranscodeToMp3 = mp3
+        _wmaTargetMp3.value = mp3
+    }
 
     init {
         viewModelScope.launch {
@@ -115,6 +126,7 @@ class SettingsViewModel(
                     openAsset = { path ->
                         runCatching { app.assets.open(path) }.getOrNull()
                     },
+                    appSettings = app.graph.appSettings,
                 )
             }
         }

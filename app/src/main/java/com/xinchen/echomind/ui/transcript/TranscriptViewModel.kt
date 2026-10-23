@@ -7,6 +7,8 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.xinchen.echomind.EchoMindApp
 import com.xinchen.echomind.asr.ModelCatalog
+import com.xinchen.echomind.asr.ModelCatalog.AUTO_MODEL_ID
+import com.xinchen.echomind.asr.ModelCatalog.SENSEVOICE_ID
 import com.xinchen.echomind.data.db.AudioBookEntity
 import com.xinchen.echomind.data.repo.AudioRepository
 import com.xinchen.echomind.data.repo.ShelfTab
@@ -22,6 +24,23 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
+/**
+ * 转录模型的选择（D41/D42 中英文支持）。[toRef] 给出写进任务行的模型引用：
+ * AUTO 由协调器在装载引擎前探测语言并改写行上的 model_id（SenseVoice 听开头 30 s 按字符系别判）。
+ */
+enum class ModelChoice(val label: String) {
+    AUTO("自动识别"),
+    ZH_BOOK("中文书解"),
+    MULTILINGUAL("英文/歌曲"),
+    ;
+
+    fun toRef(): TranscriptModelRef = when (this) {
+        AUTO -> TranscriptModelRef(AUTO_MODEL_ID, "")
+        ZH_BOOK -> ModelCatalog.transcriptRef
+        MULTILINGUAL -> TranscriptModelRef(SENSEVOICE_ID, "")
+    }
+}
+
 data class TranscriptUiState(
     val jobs: List<TranscriptJobRow> = emptyList(),
     /** audioId → 书名。列表要显示书的名字，而任务行里只有 id */
@@ -30,6 +49,8 @@ data class TranscriptUiState(
     val existingAsr: Map<String, ExistingAsr> = emptyMap(),
     /** 从书架「转录这本书」带进来的目标；null = 只是在看列表 */
     val pendingAudioId: String? = null,
+    /** 本次转录用哪个识别模型（确认卡片上可改，默认自动） */
+    val modelChoice: ModelChoice = ModelChoice.AUTO,
     val isBusy: Boolean = false,
     val message: String? = null,
 )
@@ -88,7 +109,13 @@ class TranscriptViewModel(
         _state.update { it.copy(message = null) }
     }
 
+    /** 确认卡片上改模型；已入队的任务不受影响（模型在入队时定型） */
+    fun onModelSelected(choice: ModelChoice) {
+        _state.update { it.copy(modelChoice = choice) }
+    }
+
     fun transcribe(audioId: String, force: Boolean) = runBusy {
+        val model = _state.value.modelChoice.toRef()
         when (val outcome = repository.enqueue(audioId, model, force)) {
             is EnqueueOutcome.Created -> scheduleThen(outcome.jobId, audioId)
             is EnqueueOutcome.AlreadyActive -> TranscriptOutcomeCopy.AlreadyActive
@@ -98,8 +125,9 @@ class TranscriptViewModel(
         }
     }
 
-    /** 重试 = 新建一行（旧行留着当错误上下文），再把新的那一行交给 WorkManager */
+    /** 重试 = 对同一本书再入队（新行顶掉这一行，一本书一行），再把新的那一行交给 WorkManager */
     fun retry(jobId: String) = runBusy {
+        val model = _state.value.modelChoice.toRef()
         when (val outcome = repository.retry(jobId, model)) {
             is EnqueueOutcome.Created -> {
                 val audioId = repository.jobById(outcome.jobId)?.audioId
@@ -121,6 +149,11 @@ class TranscriptViewModel(
     fun cancel(jobId: String) = runBusy {
         val row = _state.value.jobs.firstOrNull { it.id == jobId } ?: return@runBusy TranscriptOutcomeCopy.JobGone
         if (workScheduler.cancel(row)) TranscriptOutcomeCopy.Cancelled else TranscriptOutcomeCopy.AlreadySettled
+    }
+
+    /** 删记录：只删已结束的行（仓储那侧对 RUNNING 拒删）；成功记录连它产出的字幕一起走，确认框已经说过了 */
+    fun delete(jobId: String) = runBusy {
+        if (repository.delete(jobId)) TranscriptOutcomeCopy.Deleted else TranscriptOutcomeCopy.DeleteRefused
     }
 
     private suspend fun scheduleThen(jobId: String, audioId: String): TranscriptOutcomeCopy {

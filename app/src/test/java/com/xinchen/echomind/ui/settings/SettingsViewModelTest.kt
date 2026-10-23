@@ -76,10 +76,21 @@ class SettingsViewModelTest {
         ioDispatcher = Dispatchers.Unconfined,
     )
 
-    private fun viewModel(assets: Map<String, ByteArray> = emptyMap()): SettingsViewModel = SettingsViewModel(
+    private fun viewModel(
+        assets: Map<String, ByteArray> = emptyMap(),
+        mp3Target: Boolean = false,
+    ): SettingsViewModel = SettingsViewModel(
         modelManager = manager(),
         openAsset = { path -> assets[path]?.let { ByteArrayInputStream(it) } },
+        appSettings = FakeAppSettings(mp3Target),
     )
+
+    /** 内存版设置：测试里可读写，验证「设置项落进 AppSettings 并被转码路径读到」 */
+    private class FakeAppSettings(var mp3: Boolean = false) : com.xinchen.echomind.data.repo.AppSettings {
+        override var wmaTranscodeToMp3: Boolean
+            get() = mp3
+            set(value) { mp3 = value }
+    }
 
     /** assets 布局与生产一致：models/<specId>/<fileName> */
     private fun assetPathOf(fileName: String) = "models/${spec.id}/$fileName"
@@ -169,6 +180,25 @@ class SettingsViewModelTest {
         vm.restore(spec.id)
         advanceUntilIdle()
         assertTrue(vm.state.value.models.single().verification!!.isReady)
+    }
+
+    // -- 转码目标设置（D42）--------------------------------------------------------
+
+    @Test
+    fun `设置项写进AppSettings并被VM状态回读`() {
+        val settings = FakeAppSettings(mp3 = false)
+        val vm = SettingsViewModel(
+            modelManager = manager(),
+            openAsset = { null },
+            appSettings = settings,
+        )
+        org.junit.Assert.assertFalse(vm.wmaTargetMp3.value)
+
+        vm.onWmaTargetMp3Selected(true)
+        assertTrue(settings.wmaTranscodeToMp3)
+
+        vm.onWmaTargetMp3Selected(false)
+        assertFalse(settings.wmaTranscodeToMp3)
     }
 
     // -- 删除 --------------------------------------------------------------------

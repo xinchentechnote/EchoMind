@@ -14,6 +14,8 @@ import com.xinchen.echomind.EchoMindApp
 import com.xinchen.echomind.R
 import com.xinchen.echomind.asr.TranscriptOutcome
 import com.xinchen.echomind.domain.model.TranscriptFailure
+import com.xinchen.echomind.domain.model.TranscriptPhase
+import com.xinchen.echomind.domain.model.TranscriptProgress
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
@@ -63,9 +65,9 @@ class TranscriptWorker(
                     isCancelled = { isStopped },
                     // 进度写库来自解码回调（不是 suspend 上下文），只能在这里同步等一次：
                     // 异步发出去两次写库会乱序，进度条反而可能倒退
-                    onProgress = { done, total ->
-                        runBlocking { repository.updateProgress(jobId, done, total) }
-                        notificationManager().notify(notificationId, notification(bookTitle, done))
+                    onProgress = { progress ->
+                        runBlocking { repository.updateProgress(jobId, progress) }
+                        notificationManager().notify(notificationId, notification(bookTitle, progress))
                     },
                 )
             }
@@ -118,21 +120,34 @@ class TranscriptWorker(
     }
 
     /**
-     * 进度文案只显示「已识别 N 段」，不显示百分比：总段数要等解码跑完才知道，
-     * 编一个分母就是假进度（FR-507，`TranscriptJobRow.progress` 在分母为 0 时给 null 是同一个理由）。
+     * 进度文案：分母是容器时长，所以百分比是真的（已解到的音频位置 / 总时长）；
+     * 容器没给时长时只报段数，不编百分比（FR-507，`TranscriptJobRow.progress` 在分母为 0 时给 null 是同一个理由）。
+     * WMA 的转码阶段单独说，用户才知道那一两分钟在干什么。
      */
-    private fun notification(bookTitle: String, doneSegments: Int?) =
+    private fun notification(bookTitle: String, progress: TranscriptProgress?) =
         NotificationCompat.Builder(applicationContext, CHANNEL_ID)
             // 小图标暂时复用 App 图标：真正的「转录中」图标属于 Phase 7 的图标打磨
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentTitle(bookTitle)
-            .setContentText(
-                doneSegments?.let { applicationContext.getString(R.string.transcript_notification_progress, it) }
-                    ?: applicationContext.getString(R.string.transcript_notification_preparing)
-            )
+            .setContentText(progressText(progress))
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .build()
+
+    private fun progressText(progress: TranscriptProgress?): String {
+        val res = applicationContext
+        if (progress == null) return res.getString(R.string.transcript_notification_preparing)
+        val percent = progress.percent
+        return when (progress.phase) {
+            TranscriptPhase.Transcoding ->
+                if (percent != null) res.getString(R.string.transcript_notification_transcoding, percent)
+                else res.getString(R.string.transcript_notification_transcoding_indeterminate)
+
+            TranscriptPhase.Recognizing ->
+                if (percent != null) res.getString(R.string.transcript_notification_recognizing, percent, progress.doneSegments)
+                else res.getString(R.string.transcript_notification_progress, progress.doneSegments)
+        }
+    }
 
     private fun missingInput(key: String) =
         Data.Builder().putString(KEY_ERROR, "工作请求的输入数据缺少 $key").build()

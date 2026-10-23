@@ -21,6 +21,8 @@ import com.xinchen.echomind.domain.model.TranscriptFailure
 import com.xinchen.echomind.domain.model.TranscriptJobRow
 import com.xinchen.echomind.domain.model.TranscriptModelRef
 import com.xinchen.echomind.domain.model.TranscriptJobStatus
+import com.xinchen.echomind.domain.model.TranscriptPhase
+import com.xinchen.echomind.domain.model.TranscriptProgress
 import com.xinchen.echomind.domain.model.TranscriptionTarget
 import com.xinchen.echomind.domain.playback.PlaybackController
 import com.xinchen.echomind.domain.playback.PlaybackUiState
@@ -178,11 +180,13 @@ class PlayerViewModelTest {
         override suspend fun jobById(jobId: String): TranscriptJobRow? = unsupported()
         override suspend fun retry(jobId: String, model: TranscriptModelRef): EnqueueOutcome = unsupported()
         override suspend fun markRunning(jobId: String, totalSegments: Int): Boolean = unsupported()
-        override suspend fun updateProgress(jobId: String, doneSegments: Int, totalSegments: Int): Boolean = unsupported()
-        override suspend fun commitSubtitles(jobId: String, segments: List<SubtitleSegment>): Int = unsupported()
+        override suspend fun updateProgress(jobId: String, progress: TranscriptProgress): Boolean = unsupported()
+        override suspend fun commitSubtitles(jobId: String, segments: List<SubtitleSegment>, totalSegments: Int): Int = unsupported()
         override suspend fun markFailed(jobId: String, failure: TranscriptFailure, message: String?): Boolean = unsupported()
         override suspend fun updateModel(jobId: String, model: com.xinchen.echomind.domain.model.TranscriptModelRef): Boolean = unsupported()
         override suspend fun recoverInterrupted(): Int = unsupported()
+        override suspend fun collapseHistory(): Int = unsupported()
+        override suspend fun delete(jobId: String): Boolean = unsupported()
 
         private fun unsupported(): Nothing = throw UnsupportedOperationException()
     }
@@ -312,6 +316,7 @@ class PlayerViewModelTest {
                     TranscriptJobRow(
                         id = "j1", audioId = "a", modelId = "m", modelVersion = "v",
                         status = TranscriptJobStatus.Failed, totalSegments = 0, doneSegments = 0,
+                        phase = null, positionMs = 0, durationMs = 0,
                         failure = TranscriptFailure.Cancelled, errorMessage = "用户取消",
                         createdAtMs = 1, startedAtMs = 2, finishedAtMs = 3,
                     ),
@@ -343,9 +348,16 @@ class PlayerViewModelTest {
 
     // -- 转录中的实时显示 --------------------------------------------------------------
 
-    private fun runningJob(audioId: String, done: Int, total: Int = 0) = TranscriptJobRow(
+    private fun runningJob(
+        audioId: String,
+        done: Int,
+        phase: TranscriptPhase? = TranscriptPhase.Recognizing,
+        positionMs: Long = 0,
+        durationMs: Long = 0,
+    ) = TranscriptJobRow(
         id = "j-$audioId", audioId = audioId, modelId = "m", modelVersion = "v",
-        status = TranscriptJobStatus.Running, totalSegments = total, doneSegments = done,
+        status = TranscriptJobStatus.Running, totalSegments = 0, doneSegments = done,
+        phase = phase, positionMs = positionMs, durationMs = durationMs,
         failure = null, errorMessage = null, createdAtMs = 1, startedAtMs = 2, finishedAtMs = null,
     )
 
@@ -399,6 +411,7 @@ class PlayerViewModelTest {
                     TranscriptJobRow(
                         id = "j1", audioId = "a", modelId = "m", modelVersion = "v",
                         status = TranscriptJobStatus.Failed, totalSegments = 0, doneSegments = 0,
+                        phase = null, positionMs = 0, durationMs = 0,
                         failure = TranscriptFailure.ModelMissing, errorMessage = "模型不可用",
                         createdAtMs = 1, startedAtMs = 2, finishedAtMs = 3,
                     ),
@@ -416,19 +429,26 @@ class PlayerViewModelTest {
 
     @Test
     fun `分母未知不报百分比`() {
-        val line = liveStatusLine(runningJob("a", done = 4, total = 0), sentenceCount = 2)
+        val line = liveStatusLine(runningJob("a", done = 4, positionMs = 9_000, durationMs = 0), sentenceCount = 2)
         assertTrue("$line", line!!.contains("已识别 4 段"))
         assertTrue(!line.contains("/"))
         assertTrue(!line.contains("%"))
     }
 
     @Test
-    fun `分母已知报进度排队中不报段数`() {
-        assertTrue(liveStatusLine(runningJob("a", done = 3, total = 10), 1)!!.contains("已识别 3/10 段"))
+    fun `分母已知按音频位置报百分比转码阶段说在转mp3排队中不报段数`() {
+        val recognizing = liveStatusLine(runningJob("a", done = 3, positionMs = 30_000, durationMs = 100_000), 1)!!
+        assertTrue(recognizing, recognizing.contains("识别中 30%") && recognizing.contains("已识别 3 段") && recognizing.contains("已出 1 句"))
+        val transcoding = liveStatusLine(
+            runningJob("a", done = 0, phase = TranscriptPhase.Transcoding, positionMs = 50_000, durationMs = 100_000),
+            0,
+        )!!
+        assertTrue(transcoding, transcoding.contains("WMA 转码中 50%"))
         val queued = liveStatusLine(
             TranscriptJobRow(
                 id = "j", audioId = "a", modelId = "m", modelVersion = "v",
                 status = TranscriptJobStatus.Queued, totalSegments = 0, doneSegments = 0,
+                phase = null, positionMs = 0, durationMs = 0,
                 failure = null, errorMessage = null, createdAtMs = 1, startedAtMs = null, finishedAtMs = null,
             ),
             sentenceCount = 0,

@@ -150,7 +150,7 @@ v3 补 FK 的做法（`Migrations.MIGRATION_2_3`）：
 
 `latestAsrCreatedAtMs` 与 `audio_book.file_last_modified_ms` 比大小，就是「这副字幕跟当前文件对不对得上」的判据（FR-107）——用的还是扫描路径那套 mtime 规则，不新造第二种口径。任务被取消后书架回哪个状态（NONE / READY / EXPIRED）由它决定，见 `TranscriptRepositoryImpl.stateAfterRollback()`。
 
-## 6. transcript_job（转录任务，v3 起）
+## 6. transcript_job（转录任务，v3 起；v4 加进度三列）
 
 | 列 | 类型 | 约束 | 说明 |
 | --- | --- | --- | --- |
@@ -158,27 +158,30 @@ v3 补 FK 的做法（`Migrations.MIGRATION_2_3`）：
 | `audio_id` | TEXT | FK→audio_book CASCADE, 索引 | |
 | `model_id` / `model_version` | TEXT | | 用哪个模型跑的版本化记录 |
 | `status` | TEXT | | `QUEUED`/`RUNNING`/`SUCCESS`/`FAILED`/`CANCELLED` |
-| `total_segments` | INTEGER | | 分段总数（规划后才知道，初始 0） |
-| `done_segments` | INTEGER | | 进度分子（≥1s 节流写库） |
+| `total_segments` | INTEGER | | VAD 段总数：SUCCESS 收尾时由 `commitSubtitles(…, totalSegments)` 写终值（展示「共 N 段全部识别」）；中途不再用它当进度分母 |
+| `done_segments` | INTEGER | | 已识别完的 VAD 段数（随进度写入顺带更新） |
+| `phase` | TEXT | 可空（v4） | RUNNING 时的阶段：`TRANSCODING`（WMA → mp3）/ `RECOGNIZING`（解码 + 识别）；入队与终态为 null |
+| `position_ms` | INTEGER | NOT NULL DEFAULT 0（v4） | **进度分子**：已解到的音频位置（ms），来自解码器/转码器实测，不是估算 |
+| `duration_ms` | INTEGER | NOT NULL DEFAULT 0（v4） | **进度分母**：容器时长（ms），解码一开始就知道；容器没给就是 0，UI 不显示百分比 |
 | `error_code` | TEXT | | `MODEL_MISSING`/`DECODE_FAILED`/`OUT_OF_MEMORY`/`PERMISSION_REVOKED`/`OUTPUT_UNRELIABLE`/`CANCELLED`/`INTERRUPTED`/`UNKNOWN`。`INTERRUPTED` = 进程被杀/重启时还挂着，不是模型或文件出了问题。`OUTPUT_UNRELIABLE` = **模型跑完了但字不够格当字幕**（时间戳不合格的块超过 `AudioFormats.ASR_MAX_REJECTED_CHUNK_PERCENT`，或一句都产不出，含「这段音频本来就没有语音」）；判它的是 `domain/asr/TranscriptQuality`，取舍见 `architecture.md` D34——**不给 SUCCESS、也不写空字幕**，因为空字幕会让书在书架上显示「已有字幕」 |
 | `error_message` | TEXT | | 面向用户的说明，直接取异常原文，不做二次加工 |
-| `work_request_id` | TEXT | | WorkManager 请求 ID，用于取消与重启对账。**v3 建列，写入方是 `TranscriptRepositoryImpl.attachWorkRequest()`（2026-10-15 落地）**：只认还没结束的行，写不回返回 `false`，由 `TranscriptWorkScheduler` 翻译成「刚入队的请求立刻 `cancelWorkById` 撤掉」（用例 `按id取行并把工作请求id写回活动任务` / `已结束的任务写不回工作请求id`）。⚠ 这条写入路径**只有仓储用例、没有 worker 级证据**——真正的入队方还没有生产调用方 |
+| `work_request_id` | TEXT | | WorkManager 请求 ID，用于取消与重启对账。写入方是 `TranscriptRepositoryImpl.attachWorkRequest()`：只认还没结束的行，写不回返回 `false`，由 `TranscriptWorkScheduler` 翻译成「刚入队的请求立刻 `cancelWorkById` 撤掉」（用例 `按id取行并把工作请求id写回活动任务` / `已结束的任务写不回工作请求id`）；生产调用方是转录页 ViewModel 与播放页的自动转录 |
 | `created_at_ms` / `started_at_ms` / `finished_at_ms` | INTEGER | | |
 
 索引：`(audio_id)`、`(status)`、`(audio_id, created_at_ms)`。
 
-历史按版本保留（不做「一书一行」覆盖），失败重试会产生新行，旧行保留错误上下文——`retry()` 是「再入队一次」，不是把旧行改回 `QUEUED`。
+**一本书一行（2026-10-24 起，用户口径；覆盖 v3 的「历史按版本保留」）**：`enqueue()`（含 `retry()`）在同一个事务里先 `DELETE … WHERE audio_id=? AND status NOT IN ('QUEUED','RUNNING')` 再插新行，所以列表里每本书只看得到最近一次的结果；活动行另有 `AlreadyActive` 守卫不会被删。旧行产出的字幕不动（`subtitle_segment.job_id` 由外键 SET NULL），新一轮成功时 `commitSubtitles` 才整本替换——失败/取消时上一轮的好字幕仍在。用户也可以手动删一行（`delete()`：只删已结束的行，**连它产出的 ASR 字幕一起删**——`DELETE FROM subtitle_segment WHERE job_id=?`，手工测试字幕 `job_id` 为 null 不受影响——然后书架状态按剩余字幕回退，与取消同一个 `stateAfterRollback`）。升级前积累的多行由启动时的 `collapseHistory()` 收口（每本书只留 `created_at_ms` 最新的已结束行，活动行不动，幂等）。用例：`重试用新行顶掉失败的旧行` / `入队只清这本书已结束的行不碰别的书` / `删成功记录连同它的字幕并把书架回到NONE` / `删失败记录不碰别的轮次留下的字幕` / `正在跑的行拒绝删除` / `启动收口只留每本书最新的一行且不碰活动行`。
 
-**实现现状（v3）**：DAO 是 `TranscriptJobDao`，每条跃迁语句都带 `WHERE status IN (...)` 守卫并返回受影响行数，所以重复结算第二次是 0 行、已取消的任务被 worker 写回 RUNNING 在 SQL 层面就改不动；0 行由 `TranscriptRepositoryImpl` 翻译成 `false` 交给调用方，而不是抛异常打断 worker。
+**实现现状（v4）**：DAO 是 `TranscriptJobDao`，每条跃迁语句都带 `WHERE status IN (...)` 守卫并返回受影响行数，所以重复结算第二次是 0 行、已取消的任务被 worker 写回 RUNNING 在 SQL 层面就改不动；0 行由 `TranscriptRepositoryImpl` 翻译成 `false` 交给调用方，而不是抛异常打断 worker。
 **这套守卫现在是生产代码的承重墙**：`asr/TranscriptCoordinator` 的「抢不到行就收手」完全建在上面——`markRunning` 除了 `WHERE status='QUEUED'`
 还带一条 `AND NOT EXISTS (SELECT 1 FROM transcript_job WHERE status='RUNNING' AND id <> :id)`，一条语句挡住三种情况：第二个 worker 抢跑、
 进程被杀后 WorkManager 复活 worker 而库里那行早已被 `recoverInterrupted()` 标成 `FAILED(INTERRUPTED)`、以及**另一本书正在跑时的并发转录**
 （全机同时只允许一行 RUNNING，见 `architecture.md` D36）。三条设备用例分别对应：`正在跑的行不会被第二个worker重复跑` /
 `重启后复活的worker不再覆盖中断结论` / `别的任务正在跑时第二本书的任务抢不到运行中的行`。
+`updateModel`（自动选模型把 `auto` 改写为真正执行的模型）对 QUEUED **与 RUNNING** 的行有效——探测发生在 `markRunning` 之后（引擎句柄要先抢到车道），已结束的行仍不许改。
 唯一的例外是 `commitSubtitles()`：那条路径只有成功分支，跃迁失败意味着这批字幕不该落库，于是 `check` 抛出、事务回滚——宁可一句都不写，也不能留下「字幕是新的、任务还在 RUNNING」的账。
-状态跃迁与 `audio_book.transcription_state` 的写在同一个 `withTransaction` 里（§9），行为由 `TranscriptRepositoryTest`（**19 条**仪器化用例）覆盖。
-`total_segments` 存的是 **VAD 段数**而不是句数：一句字幕可能来自多个块，把分母改成句数会让进度条倒退，所以 SUCCESS 时也只把 `done_segments` 追平到入库前那个 `total_segments`。
-⚠ **中途 `total_segments` 恒为 0，是刻意的而不是没写**：VAD 是流式的，读到最后一段之前没人知道总段数，而写「N/N」会画出一条永远 100% 的假进度。所以 `TranscriptJobRow.progress` 在分母为 0 时给 **null**（用例 `分段数未知时没有百分比`），UI 那侧的契约是 `progress == null` → 显示「已识别 N 段」而不是百分比（FR-507；通知栏已经按这个写，见 `TranscriptWorker.notification`）。
+状态跃迁与 `audio_book.transcription_state` 的写在同一个 `withTransaction` 里（§9），行为由 `TranscriptRepositoryTest`（**25 条**仪器化用例）覆盖。
+**进度口径（v4，FR-507）**：分母从「VAD 段数」改成**容器时长**——VAD 是流式的，读到最后一段之前没人知道总段数，旧口径只能长期显示「已识别 N 段（总段数要等解码跑完才知道）」；容器时长在解码开始前就能从 `MediaExtractor`（或 WMA 容器）读到，所以百分比从第一秒起就是真的。`TranscriptJobRow.progress = position_ms / duration_ms`，只在 RUNNING 且 `duration_ms > 0` 时非 null（用例 `分段数未知时没有百分比` 守的是 QUEUED → null；JVM `TranscriptDisplayTest` 守「分母为 0 不出百分号」）。`total_segments` 仍存 **VAD 段数**而不是句数，SUCCESS 时 `done_segments = total_segments = 实跑段数`，供「共 N 段全部识别」展示。
 
 ## 7. settings（键值）
 
@@ -246,11 +249,12 @@ SELECT COUNT(*) FROM listening_session WHERE ended_at_ms > 0 AND completed = 1; 
 2. **正式版禁止** `fallbackToDestructiveMigration()`；开发期 v1 内部演进除外（本文与 roadmap 里明确标注）。
 3. 每个后续版本变更：写 `Migration(OLD, NEW)`，含索引/外键重建（SQLite 改表要建新表再 rename，字幕这类有索引的表尤其注意）。
 4. 仪器化测试用 `MigrationTestHelper` + 导出 JSON 校验每条迁移。
-   **两条真实迁移都已落地**：
+   **三条真实迁移都已落地**：
    - v1→v2（Phase 5a）：`Migrations.MIGRATION_1_2` 手写建 `subtitle_segment` + 两条索引，DDL 与 `2.json` 逐字对齐；`Migration_1_2_Test` 三项全绿（结构校验 / 已有书籍与收听历史保留 / `PRAGMA foreign_key_list` 确认 FK）。
    - v2→v3（Phase 6）：`Migrations.MIGRATION_2_3` 建 `transcript_job` + 三条索引，并**整表重建** `subtitle_segment` 以补 `job_id` 外键（做法与理由见 §5.1）；`Migration_2_3_Test` 五条覆盖了结构对账、字幕逐句不丢、两条 FK 的存在与**行为**（级联删、SET NULL）、三条索引。
+   - v3→v4（2026-10-24，转录进度改时间口径）：`Migrations.MIGRATION_3_4` 三条 `ALTER TABLE transcript_job ADD COLUMN`（`phase TEXT` / `position_ms INTEGER NOT NULL DEFAULT 0` / `duration_ms INTEGER NOT NULL DEFAULT 0`），不重建表、不碰已有行；`Migration_3_4_Test` 三条（结构对账 / 任务与字幕原值保留且老行新列为默认值 / 新进度 DAO 可写可读）。⚠ 带 `DEFAULT` 的列，实体上必须同时写 `@ColumnInfo(defaultValue = "0")`——Room 把默认值当 schema 的一部分对账，少一边 `runMigrationsAndValidate` 直接判「不一致」。
    写手写 DDL 的固定动作：先 `./gradlew :app:kspDebugKotlin` 导出 `N.json`，把 Room 生成的 `createSql` 与索引语句逐条抄进 Migration——注意 TEXT 主键落成表级 `PRIMARY KEY(\`id\`)`（SQLite 因此会额外建一个 `sqlite_autoindex_*`，它不是 Room 的索引，测试做集合断言时要剔掉）。
    `MigrationTestHelper` 的 `recreateTableOnMigrationError` 传 `false`——传 `true` 等于把「迁移失败就重建表」这条破坏性后路偷偷请回来。
    helper 从 assets 读 schema，路径是 `"$databaseClassName/$version.json"`（没有 `schemas/` 前缀），所以 `build.gradle.kts` 里是 `assets.directories.add("$projectDir/schemas")`。
-5. 迁移里对统计类字段的变更（例如改 `is_counted` 定义）必须同时提供数据回填 SQL，且回填口径写进本文，不留「静默改变历史数字」。MIGRATION_1_2 与 MIGRATION_2_3 都只新增表（后者搬的是字幕原值，不改任何统计列），因此无需回填。
+5. 迁移里对统计类字段的变更（例如改 `is_counted` 定义）必须同时提供数据回填 SQL，且回填口径写进本文，不留「静默改变历史数字」。MIGRATION_1_2 与 MIGRATION_2_3 都只新增表（后者搬的是字幕原值，不改任何统计列），MIGRATION_3_4 只加带默认值的列，因此都无需回填。
 6. `Migrations.ALL` 是 `Room.databaseBuilder` 唯一注册的迁移集（`EchoMindApp`），加新版本时往这个数组里追加，不要漏——漏了就是运行时 `IllegalStateException`。

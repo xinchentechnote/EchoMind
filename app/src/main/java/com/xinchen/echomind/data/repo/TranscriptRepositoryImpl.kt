@@ -12,6 +12,8 @@ import com.xinchen.echomind.domain.model.TranscriptFailure
 import com.xinchen.echomind.domain.model.TranscriptJobRow
 import com.xinchen.echomind.domain.model.TranscriptJobStatus
 import com.xinchen.echomind.domain.model.TranscriptModelRef
+import com.xinchen.echomind.domain.model.TranscriptPhase
+import com.xinchen.echomind.domain.model.TranscriptProgress
 import com.xinchen.echomind.domain.transcript.TranscriptRepository
 import java.util.UUID
 import kotlinx.coroutines.flow.Flow
@@ -57,6 +59,9 @@ class TranscriptRepositoryImpl(
 
             val now = clock.wallMs()
             val jobId = UUID.randomUUID().toString()
+            // 一本书一行：旧的终态行在同一个事务里让位。它产出的字幕不动（job_id 由外键置空），
+            // 新一轮成功时 commitSubtitles 才整本替换——失败/取消时上一轮的好字幕还在
+            jobDao.deleteSettledOf(audioId)
             jobDao.insert(
                 TranscriptJobEntity(
                     id = jobId,
@@ -78,9 +83,22 @@ class TranscriptRepositoryImpl(
         true
     }
 
+    override suspend fun delete(jobId: String): Boolean = db.withTransaction {
+        val job = jobDao.getById(jobId) ?: return@withTransaction false
+        // 先删字幕再删行：行一删外键会把字幕的 job_id 置空，之后就找不到「这一轮产出的是哪些句」了
+        subtitleDao.deleteByJob(jobId)
+        if (jobDao.deleteSettled(jobId) == 0) {
+            // 行还在跑：字幕不可能指向一个 RUNNING 的行（commitSubtitles 才写 job_id），上面那一步必然删了 0 句，
+            // 事务里什么都没变，直接回绝
+            return@withTransaction false
+        }
+        bookDao.setTranscriptionState(listOf(job.audioId), stateAfterRollback(job.audioId), clock.wallMs())
+        true
+    }
+
     /**
      * 重试 = 对同一本书再入队一次（`force=true`，因为上一轮刚失败/取消时状态不是 READY）。
-     * 旧行不动，新一轮是新的一行——失败历史留得住（database-design.md §6）。
+     * 旧行由 enqueue 的事务删掉，新行取而代之（一本书一行）。
      */
     override suspend fun retry(jobId: String, model: TranscriptModelRef): EnqueueOutcome {
         val audioId = jobDao.getById(jobId)?.audioId ?: return EnqueueOutcome.JobNotFound
@@ -103,10 +121,16 @@ class TranscriptRepositoryImpl(
         true
     }
 
-    override suspend fun updateProgress(jobId: String, doneSegments: Int, totalSegments: Int): Boolean =
-        jobDao.updateProgress(jobId, doneSegments, totalSegments) > 0
+    override suspend fun updateProgress(jobId: String, progress: TranscriptProgress): Boolean =
+        jobDao.updateProgress(
+            id = jobId,
+            doneSegments = progress.doneSegments,
+            phase = progress.phase.toDbString(),
+            positionMs = progress.positionMs,
+            durationMs = progress.durationMs,
+        ) > 0
 
-    override suspend fun commitSubtitles(jobId: String, segments: List<SubtitleSegment>): Int =
+    override suspend fun commitSubtitles(jobId: String, segments: List<SubtitleSegment>, totalSegments: Int): Int =
         db.withTransaction {
             require(segments.isNotEmpty()) { "空字幕不能标成转录成功" }
             val job = jobDao.getById(jobId) ?: error("任务不存在，无法提交字幕：$jobId")
@@ -127,9 +151,8 @@ class TranscriptRepositoryImpl(
                     )
                 },
             )
-            // 分母沿用 VAD 那轮定下的段数：一句字幕可能来自多块，把分母改成句数会画出倒退的进度
-            val total = job.totalSegments
-            check(jobDao.markSuccess(jobId, now, doneSegments = total, totalSegments = total) > 0) {
+            // 分母是 VAD 数出来的语音段数：一句字幕可能来自多块，把分母改成句数会画出倒退的进度
+            check(jobDao.markSuccess(jobId, now, doneSegments = totalSegments, totalSegments = totalSegments) > 0) {
                 "任务 $jobId 不在 RUNNING，字幕已回滚"
             }
             bookDao.setTranscriptionState(listOf(job.audioId), AudioBookEntity.TranscriptionState.Ready, now)
@@ -153,6 +176,8 @@ class TranscriptRepositoryImpl(
         bookDao.setTranscriptionState(audioIds, AudioBookEntity.TranscriptionState.Failed, now)
         rows
     }
+
+    override suspend fun collapseHistory(): Int = jobDao.deleteOutdatedDuplicates()
 
     /**
      * 任务被取消后书架该显示什么。字幕没被动过（删旧只发生在 commitSubtitles 的事务里），所以：
@@ -181,6 +206,9 @@ private fun TranscriptJobEntity.toDomain() = TranscriptJobRow(
     status = status.toDomainStatus(),
     totalSegments = totalSegments,
     doneSegments = doneSegments,
+    phase = phase?.toDomainPhase(),
+    positionMs = positionMs,
+    durationMs = durationMs,
     failure = errorCode?.toDomainFailure(),
     errorMessage = errorMessage,
     createdAtMs = createdAtMs,
@@ -188,6 +216,17 @@ private fun TranscriptJobEntity.toDomain() = TranscriptJobRow(
     finishedAtMs = finishedAtMs,
     workRequestId = workRequestId,
 )
+
+private fun String.toDomainPhase(): TranscriptPhase? = when (this) {
+    TranscriptJobEntity.Phase.Transcoding -> TranscriptPhase.Transcoding
+    TranscriptJobEntity.Phase.Recognizing -> TranscriptPhase.Recognizing
+    else -> null
+}
+
+private fun TranscriptPhase.toDbString(): String = when (this) {
+    TranscriptPhase.Transcoding -> TranscriptJobEntity.Phase.Transcoding
+    TranscriptPhase.Recognizing -> TranscriptJobEntity.Phase.Recognizing
+}
 
 private fun String.toDomainStatus(): TranscriptJobStatus = when (this) {
     TranscriptJobEntity.Status.Queued -> TranscriptJobStatus.Queued

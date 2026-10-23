@@ -119,6 +119,22 @@ object Migrations {
         }
     }
 
+    /**
+     * v3 → v4：`transcript_job` 加三列进度字段（`phase` / `position_ms` / `duration_ms`，FR-507 的时间口径进度）。
+     *
+     * 纯 `ADD COLUMN`，不重建表、不碰任何已有行：`phase` 可空无默认（终态行本就该是 null），
+     * 两个数值列 `NOT NULL DEFAULT 0`——实体上对应 `@ColumnInfo(defaultValue = "0")`，少写一边
+     * `MigrationTestHelper` 会以「默认值不一致」拒收（Room 把 DEFAULT 当 schema 的一部分对账）。
+     * 老的 RUNNING 行在启动恢复里会被标 INTERRUPTED，所以不需要给历史行回填进度。
+     */
+    val MIGRATION_3_4: Migration = object : Migration(3, 4) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE `transcript_job` ADD COLUMN `phase` TEXT")
+            db.execSQL("ALTER TABLE `transcript_job` ADD COLUMN `position_ms` INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE `transcript_job` ADD COLUMN `duration_ms` INTEGER NOT NULL DEFAULT 0")
+        }
+    }
+
     /** 装配进 `Room.databaseBuilder(...).addMigrations(...)`；顺序无关，Room 按 startVersion/endVersion 排路径 */
-    val ALL: Array<Migration> = arrayOf(MIGRATION_1_2, MIGRATION_2_3)
+    val ALL: Array<Migration> = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
 }

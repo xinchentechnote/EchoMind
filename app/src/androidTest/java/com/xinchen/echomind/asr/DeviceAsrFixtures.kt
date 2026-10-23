@@ -37,14 +37,17 @@ internal object DeviceAsrFixtures {
      */
     const val SILENT_WAV = "pcm-fixture-silent.wav"
 
-    /** [REAL_MP3] 的容器时长，宿主机数出来的（字幕时间越界检查要用它当上界） */
+    /**
+     * [REAL_MP3] 原始素材（44.1 kHz 那版）的容器时长。⚠ 设备上的这份素材 2026-10-24 已换成 150 s / 32 kHz 的版本
+     * （与 [REAL_WMA] 同源），所以**越界类断言请用 `PcmDecoder.containerDurationMs` 在设备上现读**，这个常量只给摆书时填字段用。
+     */
     const val REAL_MP3_DURATION_MS = 148_303L
 
-    /** 用户的 34 分钟中文书解 WMA（wmav2 44.1 kHz 双声道，仓库 `test-data/` 的真实世界素材）。 */
+    /** 真歌的 WMA 版（`test-data/fixtures/real148.wma`，wmav2 32 kHz 双声道 128 kbps，ffmpeg 转自 [REAL_MP3]）。 */
     const val REAL_WMA = "pcm-fixture-real.wma"
 
-    /** [REAL_WMA] 的容器时长；设备 libwma 与导入转码器独立读出相同值。 */
-    const val REAL_WMA_DURATION_MS = 2_060_956L
+    /** [REAL_WMA] 的容器时长（ASF play_duration − preroll，宿主机解析 ASF 头得出）；设备 libwma 与转码器读出同一值。 */
+    const val REAL_WMA_DURATION_MS = 150_000L
 
     /** 用户的 56 分钟中文书解 mp3（中文识别质量打样素材） */
     const val USER_BOOK_MP3 = "user-test.mp3"

@@ -20,7 +20,9 @@ import kotlinx.coroutines.ensureActive
 class AsyncWmaImportPreparer(
     private val scope: CoroutineScope,
     private val store: WmaPlaybackStore,
-    private val transcode: suspend (uri: String, output: java.io.File) -> Long,
+    private val transcode: suspend (uri: String, output: java.io.File, ext: String) -> Long,
+    /** 转码目标扩展名（D42："m4a" 默认 / "mp3" 用户可选），schedule 时取一次，任务内恒定 */
+    private val targetExt: () -> String = { "m4a" },
     private val onPrepared: suspend (audioId: String, uri: String, durationMs: Long) -> Boolean,
     private val onFailure: (audioId: String, error: Throwable) -> Unit = { _, _ -> },
     private val dispatcher: CoroutineDispatcher = Dispatchers.IO,
@@ -44,11 +46,12 @@ class AsyncWmaImportPreparer(
         }
 
         val generation = UUID.randomUUID().toString()
+        val ext = targetExt()
         val job = scope.launch(dispatcher, start = CoroutineStart.LAZY) {
-            val part = store.partFileOf(audioId, generation)
+            val part = store.partFileOf(audioId, generation, ext)
             store.prepareDir()
             try {
-                val durationMs = transcode(uri, part)
+                val durationMs = transcode(uri, part, ext)
                 coroutineContext.ensureActive()
                 check(durationMs > 0) { "WMA 转码没有返回有效时长：$durationMs ms" }
                 val committed = synchronized(jobs) {

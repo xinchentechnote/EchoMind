@@ -36,6 +36,29 @@ interface TranscriptJobDao {
     suspend fun insert(job: TranscriptJobEntity)
 
     /**
+     * 「每本书只保留一行」（用户口径，2026-10-24）：入队前清掉这本书**已结束**的历史行。
+     * 活动行不在清理范围——它由 `activeOf` 的「不重复排队」守卫处理。返回删了几行。
+     */
+    @Query("DELETE FROM transcript_job WHERE audio_id = :audioId AND status NOT IN ('QUEUED', 'RUNNING')")
+    suspend fun deleteSettledOf(audioId: String): Int
+
+    /**
+     * 启动时的一次性收口：同一本书有多行时，只留最新的那一行（升级前的历史行与中断恢复留下的）。
+     * 只删已结束的行；活动行即便更旧也不动——它可能正被 worker 写着。幂等。
+     */
+    @Query(
+        "DELETE FROM transcript_job WHERE status NOT IN ('QUEUED', 'RUNNING') AND EXISTS (" +
+            "SELECT 1 FROM transcript_job newer WHERE newer.audio_id = transcript_job.audio_id " +
+            "AND (newer.created_at_ms > transcript_job.created_at_ms " +
+            "OR (newer.created_at_ms = transcript_job.created_at_ms AND newer.id > transcript_job.id)))",
+    )
+    suspend fun deleteOutdatedDuplicates(): Int
+
+    /** 用户删记录：只许删已结束的行（活动行先取消）。返回 0 = 行不存在或还在跑 */
+    @Query("DELETE FROM transcript_job WHERE id = :id AND status NOT IN ('QUEUED', 'RUNNING')")
+    suspend fun deleteSettled(id: String): Int
+
+    /**
      * QUEUED → RUNNING。分段总数此时才由 VAD 的结果填进去。
      *
      * `NOT EXISTS (... status = 'RUNNING')` 是**全机同时只跑一个转录**的那道闸：模型句柄一份 243 MB，
@@ -71,17 +94,24 @@ interface TranscriptJobDao {
     )
     suspend fun markCancelled(id: String, finishedAtMs: Long, errorMessage: String?): Int
 
-    /** 进度节流写库（≥1s，AGENTS.md §4），只在 RUNNING 时有效 */
-    @Query("UPDATE transcript_job SET done_segments = :doneSegments, total_segments = :totalSegments WHERE id = :id AND status = 'RUNNING'")
-    suspend fun updateProgress(id: String, doneSegments: Int, totalSegments: Int): Int
+    /**
+     * 进度节流写库（≥1s，AGENTS.md §4），只在 RUNNING 时有效。
+     * 分子分母是音频时间（`position_ms`/`duration_ms`），`done_segments` 顺带更新；`total_segments` 在收尾时才由 markSuccess 写。
+     */
+    @Query(
+        "UPDATE transcript_job SET done_segments = :doneSegments, phase = :phase, position_ms = :positionMs, " +
+            "duration_ms = :durationMs WHERE id = :id AND status = 'RUNNING'",
+    )
+    suspend fun updateProgress(id: String, doneSegments: Int, phase: String, positionMs: Long, durationMs: Long): Int
 
     /**
-     * 推理前归一模型身份：当前把升级前遗留的 auto/多语种任务改为中文听书模型。
-     * 只许改 QUEUED 的行——开始跑之后再换模型等于篡改历史。
+     * 推理前归一模型身份：「自动选模型」的任务在语言探测后把 auto 改写为真正执行的模型。
+     * 探测在 markRunning **之后**做（引擎句柄要先抢到车道，D36），所以 RUNNING 的行也许改；
+     * 只有写它的协调器本人会调，已结束的行仍然不许改——那是篡改历史。
      */
     @Query(
         "UPDATE transcript_job SET model_id = :modelId, model_version = :modelVersion " +
-            "WHERE id = :id AND status = 'QUEUED'",
+            "WHERE id = :id AND status IN ('QUEUED', 'RUNNING')",
     )
     suspend fun updateModel(id: String, modelId: String, modelVersion: String): Int
 

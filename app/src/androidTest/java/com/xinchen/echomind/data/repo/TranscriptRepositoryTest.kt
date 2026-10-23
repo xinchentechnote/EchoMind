@@ -14,6 +14,8 @@ import com.xinchen.echomind.domain.model.SubtitleSegment
 import com.xinchen.echomind.domain.model.TranscriptFailure
 import com.xinchen.echomind.domain.model.TranscriptJobStatus
 import com.xinchen.echomind.domain.model.TranscriptModelRef
+import com.xinchen.echomind.domain.model.TranscriptPhase
+import com.xinchen.echomind.domain.model.TranscriptProgress
 import com.xinchen.echomind.domain.transcript.TranscriptRepository
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -103,16 +105,23 @@ class TranscriptRepositoryTest {
         SubtitleSegment(index = index, startMs = index * 1_000L, endMs = index * 1_000L + 900, text = text)
     }
 
+    private fun progress(positionMs: Long, durationMs: Long, done: Int, phase: TranscriptPhase = TranscriptPhase.Recognizing) =
+        TranscriptProgress(phase = phase, positionMs = positionMs, durationMs = durationMs, doneSegments = done)
+
+    /** 自动选模型的改写发生在抢到车道（RUNNING）之后，所以 RUNNING 也许改；已结束的行是历史，不许动 */
     @Test
-    fun 推理前归一模型只许在QUEUED时() = runBlocking {
+    fun 归一模型在QUEUED与RUNNING时可改结束后不可改() = runBlocking {
         val created = repo.enqueue("a", model) as EnqueueOutcome.Created
         assertTrue(repo.updateModel(created.jobId, TranscriptModelRef("sense-voice-zh-en-ja-ko-yue-int8", "abc123")))
         assertEquals("sense-voice-zh-en-ja-ko-yue-int8", job(created.jobId).modelId)
 
         repo.markRunning(created.jobId, totalSegments = 1)
-        // RUNNING 之后再改是篡改历史，必须拒绝
-        assertFalse(repo.updateModel(created.jobId, TranscriptModelRef("paraformer-zh-2023-09-14-int8", "xyz789")))
-        assertEquals("sense-voice-zh-en-ja-ko-yue-int8", job(created.jobId).modelId)
+        assertTrue(repo.updateModel(created.jobId, TranscriptModelRef("paraformer-zh-2023-09-14-int8", "xyz789")))
+        assertEquals("paraformer-zh-2023-09-14-int8", job(created.jobId).modelId)
+
+        repo.markFailed(created.jobId, TranscriptFailure.DecodeFailed, "x")
+        assertFalse(repo.updateModel(created.jobId, TranscriptModelRef("sense-voice-zh-en-ja-ko-yue-int8", "abc123")))
+        assertEquals("paraformer-zh-2023-09-14-int8", job(created.jobId).modelId)
     }
 
     @Test
@@ -146,7 +155,7 @@ class TranscriptRepositoryTest {
     fun 已就绪的书再入队被拦住而force放行() = runBlocking {
         val created = repo.enqueue("a", model) as EnqueueOutcome.Created
         repo.markRunning(created.jobId, totalSegments = 2)
-        repo.commitSubtitles(created.jobId, segments("甲", "乙"))
+        repo.commitSubtitles(created.jobId, segments("甲", "乙"), totalSegments = 2)
         clock.wall += 1_000
 
         assertEquals(EnqueueOutcome.AlreadyTranscribed, repo.enqueue("a", model))
@@ -179,19 +188,25 @@ class TranscriptRepositoryTest {
         assertNotNull(job(jobId).startedAtMs)
         assertEquals(AudioBookEntity.TranscriptionState.Running, bookState())
 
-        assertTrue(repo.updateProgress(jobId, doneSegments = 2, totalSegments = 6))
-        assertEquals(2, job(jobId).doneSegments)
-        assertEquals(2.0 / 6.0, repo.observeActiveJob("a").first()!!.progress!!.toDouble(), 0.0001)
+        // 进度的分子分母是音频时间（已解位置 / 容器时长），段数只是顺带记
+        assertTrue(repo.updateProgress(jobId, progress(positionMs = 20_000, durationMs = 60_000, done = 2)))
+        val running = job(jobId)
+        assertEquals(2, running.doneSegments)
+        assertEquals(TranscriptJobEntity.Phase.Recognizing, running.phase)
+        assertEquals(20_000L, running.positionMs)
+        assertEquals(60_000L, running.durationMs)
+        assertEquals(1.0 / 3.0, repo.observeActiveJob("a").first()!!.progress!!.toDouble(), 0.0001)
 
         clock.wall += 1_000
-        assertEquals(3, repo.commitSubtitles(jobId, segments("甲", "乙", "丙")))
+        assertEquals(3, repo.commitSubtitles(jobId, segments("甲", "乙", "丙"), totalSegments = 6))
 
         val row = job(jobId)
         assertEquals(TranscriptJobEntity.Status.Success, row.status)
         // 分母沿用 VAD 那轮的 6 段：3 句字幕不等于只跑了 3 段，改成句数就是假进度
         assertEquals(6, row.totalSegments)
         assertEquals(6, row.doneSegments)
-        assertEquals(1.0, repo.jobs().first().first { it.id == jobId }.progress!!.toDouble(), 0.0001)
+        // 终态不再有「进度」：百分比只属于 RUNNING（UI 对成功行显示的是段数）
+        assertNull(repo.jobs().first().first { it.id == jobId }.progress)
         assertEquals(clock.wall, row.finishedAtMs)
         assertEquals(AudioBookEntity.TranscriptionState.Ready, bookState())
 
@@ -203,20 +218,21 @@ class TranscriptRepositoryTest {
 
     /** FR-605：重转录是整本替换。旧句一句都不能留，否则用户看到半本新半本旧拼在一起 */
     @Test
-    fun 重转录整本替换旧字幕() = runBlocking {
+    fun 重转录整本替换旧字幕且一本书只剩一行() = runBlocking {
         val first = (repo.enqueue("a", model) as EnqueueOutcome.Created).jobId
         repo.markRunning(first, totalSegments = 1)
-        repo.commitSubtitles(first, segments("旧一", "旧二", "旧三"))
+        repo.commitSubtitles(first, segments("旧一", "旧二", "旧三"), totalSegments = 1)
 
         val second = (repo.enqueue("a", model, force = true) as EnqueueOutcome.Created).jobId
         repo.markRunning(second, totalSegments = 1)
-        repo.commitSubtitles(second, segments("新一"))
+        repo.commitSubtitles(second, segments("新一"), totalSegments = 1)
 
         val written = db.subtitleSegmentDao().getByAudio("a")
         assertEquals(listOf("新一"), written.map { it.text })
         assertEquals(second, written[0].jobId)
-        // 两轮任务都留着：历史不被覆盖，旧行仍然是它那一轮的记录
-        assertEquals(TranscriptJobEntity.Status.Success, job(first).status)
+        // 一本书一行：上一轮的记录在入队时让位，列表里只看得到最近一次
+        assertNull(db.transcriptJobDao().getById(first))
+        assertEquals(listOf(second), repo.jobs().first().filter { it.audioId == "a" }.map { it.id })
     }
 
     /** 0 句要么是没跑完要么是解码全失败，标 SUCCESS 就是谎报「已转录」 */
@@ -225,7 +241,7 @@ class TranscriptRepositoryTest {
         val jobId = (repo.enqueue("a", model) as EnqueueOutcome.Created).jobId
         repo.markRunning(jobId, totalSegments = 1)
 
-        val thrown = runCatching { repo.commitSubtitles(jobId, emptyList()) }.exceptionOrNull()
+        val thrown = runCatching { repo.commitSubtitles(jobId, emptyList(), totalSegments = 1) }.exceptionOrNull()
         assertTrue(thrown is IllegalArgumentException)
         assertEquals(TranscriptJobEntity.Status.Running, job(jobId).status)
         assertEquals(AudioBookEntity.TranscriptionState.Running, bookState())
@@ -237,9 +253,9 @@ class TranscriptRepositoryTest {
     fun 重复结算第二次整体失败并回滚字幕() = runBlocking {
         val jobId = (repo.enqueue("a", model) as EnqueueOutcome.Created).jobId
         repo.markRunning(jobId, totalSegments = 1)
-        repo.commitSubtitles(jobId, segments("第一句"))
+        repo.commitSubtitles(jobId, segments("第一句"), totalSegments = 1)
 
-        val thrown = runCatching { repo.commitSubtitles(jobId, segments("迟到的一句")) }.exceptionOrNull()
+        val thrown = runCatching { repo.commitSubtitles(jobId, segments("迟到的一句"), totalSegments = 1) }.exceptionOrNull()
         assertTrue(thrown is IllegalStateException)
 
         val written = db.subtitleSegmentDao().getByAudio("a")
@@ -254,7 +270,7 @@ class TranscriptRepositoryTest {
         assertTrue(repo.markFailed(jobId, TranscriptFailure.ModelMissing, "模型没准备好"))
 
         assertFalse(repo.markRunning(jobId, totalSegments = 3))
-        assertFalse(repo.updateProgress(jobId, doneSegments = 1, totalSegments = 3))
+        assertFalse(repo.updateProgress(jobId, progress(positionMs = 1_000, durationMs = 3_000, done = 1)))
         assertFalse(repo.markFailed(jobId, TranscriptFailure.Unknown, "再失败一次"))
         assertFalse(repo.cancel("不存在的任务"))
 
@@ -289,23 +305,42 @@ class TranscriptRepositoryTest {
         assertFalse(repo.markRunning(first, totalSegments = 4))
 
         // 第一轮结算完让出车道，第二轮才抢得到
-        repo.commitSubtitles(first, segments("第一轮的"))
+        repo.commitSubtitles(first, segments("第一轮的"), totalSegments = 4)
         assertTrue(repo.markRunning(second, totalSegments = 4))
     }
 
+    /** 一本书一行：重试是新行**顶掉**旧行，用户看到的永远是这本书最近一次的结果 */
     @Test
-    fun 重试新建一行并保住旧行的错误上下文() = runBlocking {
+    fun 重试用新行顶掉失败的旧行() = runBlocking {
         val failed = (repo.enqueue("a", model) as EnqueueOutcome.Created).jobId
         repo.markFailed(failed, TranscriptFailure.DecodeFailed, "解码失败")
 
         val retried = repo.retry(failed, model) as EnqueueOutcome.Created
         assertTrue(retried.jobId != failed)
-        assertEquals(TranscriptJobEntity.Status.Failed, job(failed).status)
-        assertEquals("解码失败", job(failed).errorMessage)
+        assertNull("旧行该在入队的事务里让位", db.transcriptJobDao().getById(failed))
         assertEquals(TranscriptJobEntity.Status.Queued, job(retried.jobId).status)
-        assertEquals(2, repo.jobs().first().count { it.audioId == "a" })
+        assertEquals(1, repo.jobs().first().count { it.audioId == "a" })
 
         assertEquals(EnqueueOutcome.JobNotFound, repo.retry("没有这个任务", model))
+        // 旧行已经没了，再拿它的 id 重试同样是 JobNotFound——界面上也不会再有这一行
+        assertEquals(EnqueueOutcome.JobNotFound, repo.retry(failed, model))
+    }
+
+    /** 活动行不让位：正在跑的任务不会被同一本书的再次入队删掉（那是 AlreadyActive 的事） */
+    @Test
+    fun 入队只清这本书已结束的行不碰别的书() = runBlocking {
+        upsertBook(audioId = "b")
+        val aOld = (repo.enqueue("a", model) as EnqueueOutcome.Created).jobId
+        repo.markFailed(aOld, TranscriptFailure.Unknown, "x")
+        val bOld = (repo.enqueue("b", model) as EnqueueOutcome.Created).jobId
+        repo.markFailed(bOld, TranscriptFailure.Unknown, "y")
+
+        val aNew = (repo.enqueue("a", model, force = true) as EnqueueOutcome.Created).jobId
+
+        assertNull(db.transcriptJobDao().getById(aOld))
+        assertNotNull("别的书的历史行不该被 a 的入队波及", db.transcriptJobDao().getById(bOld))
+        assertEquals(EnqueueOutcome.AlreadyActive(aNew), repo.enqueue("a", model, force = true))
+        assertNotNull(db.transcriptJobDao().getById(aNew))
     }
 
     /** 取消没跑完的任务不该把书架留在 RUNNING：按库里到底有没有 ASR 字幕回退 */
@@ -327,7 +362,7 @@ class TranscriptRepositoryTest {
     fun 取消重转录保住上一轮的好字幕() = runBlocking {
         val first = (repo.enqueue("a", model) as EnqueueOutcome.Created).jobId
         repo.markRunning(first, totalSegments = 1)
-        repo.commitSubtitles(first, segments("上一轮跑好的"))
+        repo.commitSubtitles(first, segments("上一轮跑好的"), totalSegments = 1)
 
         val second = (repo.enqueue("a", model, force = true) as EnqueueOutcome.Created).jobId
         repo.markRunning(second, totalSegments = 1)
@@ -335,7 +370,8 @@ class TranscriptRepositoryTest {
         assertTrue(repo.cancel(second))
 
         assertEquals(listOf("上一轮跑好的"), db.subtitleSegmentDao().getByAudio("a").map { it.text })
-        assertEquals(first, db.subtitleSegmentDao().getByAudio("a")[0].jobId)
+        // 上一轮的行已让位（一本书一行），字幕的 job_id 由外键置空，但字幕本身一句不少
+        assertNull(db.subtitleSegmentDao().getByAudio("a")[0].jobId)
         assertEquals(AudioBookEntity.TranscriptionState.Ready, bookState())
     }
 
@@ -347,7 +383,7 @@ class TranscriptRepositoryTest {
     fun 文件变过以后取消重转录回到EXPIRED() = runBlocking {
         val first = (repo.enqueue("a", model) as EnqueueOutcome.Created).jobId
         repo.markRunning(first, totalSegments = 1)
-        repo.commitSubtitles(first, segments("旧文件跑出来的"))
+        repo.commitSubtitles(first, segments("旧文件跑出来的"), totalSegments = 1)
         val subtitleMs = job(first).finishedAtMs
 
         // 扫描发现文件变了：mtime 比字幕新（这里直接摆 mtime，扫描路径自身有 AudioRepositoryImportTest 覆盖）
@@ -421,5 +457,74 @@ class TranscriptRepositoryTest {
 
         assertFalse(repo.attachWorkRequest(jobId, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"))
         assertNull(repo.jobById(jobId)!!.workRequestId)
+    }
+
+    // -- 删记录 / 启动收口（2026-10-24，一本书一行）-----------------------------------------
+
+    /** 删成功记录 = 这一轮产出的字幕一起走，书架按「没有 ASR 字幕」回到 NONE；手工测试字幕不受影响 */
+    @Test
+    fun 删成功记录连同它的字幕并把书架回到NONE() = runBlocking {
+        val jobId = (repo.enqueue("a", model) as EnqueueOutcome.Created).jobId
+        repo.markRunning(jobId, totalSegments = 2)
+        repo.commitSubtitles(jobId, segments("甲", "乙"), totalSegments = 2)
+        assertEquals(AudioBookEntity.TranscriptionState.Ready, bookState())
+
+        assertTrue(repo.delete(jobId))
+
+        assertNull(db.transcriptJobDao().getById(jobId))
+        assertEquals(0, db.subtitleSegmentDao().getByAudio("a").size)
+        assertEquals(AudioBookEntity.TranscriptionState.None, bookState())
+        assertTrue(repo.jobs().first().none { it.audioId == "a" })
+        // 再删一次：行已不在，如实返回 false
+        assertFalse(repo.delete(jobId))
+    }
+
+    /** 删失败记录不碰这本书留下来的（上一轮的）字幕：它们不是这一行产出的 */
+    @Test
+    fun 删失败记录不碰别的轮次留下的字幕() = runBlocking {
+        val good = (repo.enqueue("a", model) as EnqueueOutcome.Created).jobId
+        repo.markRunning(good, totalSegments = 1)
+        repo.commitSubtitles(good, segments("好字幕"), totalSegments = 1)
+        val bad = (repo.enqueue("a", model, force = true) as EnqueueOutcome.Created).jobId
+        repo.markFailed(bad, TranscriptFailure.DecodeFailed, "x")
+        assertEquals(AudioBookEntity.TranscriptionState.Failed, bookState())
+
+        assertTrue(repo.delete(bad))
+
+        assertEquals(listOf("好字幕"), db.subtitleSegmentDao().getByAudio("a").map { it.text })
+        // 没有活动行、字幕还在且不比文件旧 → 书架按真实情况回到 READY，而不是停在 FAILED
+        assertEquals(AudioBookEntity.TranscriptionState.Ready, bookState())
+    }
+
+    /** 活动行拒删：它正被 worker 写着，要先取消 */
+    @Test
+    fun 正在跑的行拒绝删除() = runBlocking {
+        val jobId = (repo.enqueue("a", model) as EnqueueOutcome.Created).jobId
+        assertFalse(repo.delete(jobId))
+        repo.markRunning(jobId, totalSegments = 1)
+        assertFalse(repo.delete(jobId))
+        assertNotNull(db.transcriptJobDao().getById(jobId))
+        assertEquals(AudioBookEntity.TranscriptionState.Running, bookState())
+    }
+
+    /** 升级前积累的多行在启动时收口：每本书只留最新一行，活动行不动，别的书不受影响 */
+    @Test
+    fun 启动收口只留每本书最新的一行且不碰活动行() = runBlocking {
+        upsertBook(audioId = "b")
+        // 直接摆历史行：入队本身现在已经不会制造重复了
+        suspend fun put(id: String, audioId: String, status: String, createdAt: Long) = db.transcriptJobDao().insert(
+            TranscriptJobEntity(id = id, audioId = audioId, modelId = model.id, modelVersion = model.version, status = status, createdAtMs = createdAt),
+        )
+        put("a-1", "a", TranscriptJobEntity.Status.Failed, 1_000)
+        put("a-2", "a", TranscriptJobEntity.Status.Failed, 2_000)
+        put("a-3", "a", TranscriptJobEntity.Status.Success, 3_000)
+        put("b-1", "b", TranscriptJobEntity.Status.Failed, 1_000)
+        put("b-2", "b", TranscriptJobEntity.Status.Running, 500) // 更旧但在跑：不能删
+
+        assertEquals(2, repo.collapseHistory())
+
+        assertEquals(setOf("a-3", "b-1", "b-2"), repo.jobs().first().map { it.id }.toSet())
+        // 幂等
+        assertEquals(0, repo.collapseHistory())
     }
 }

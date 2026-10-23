@@ -17,6 +17,7 @@ import com.xinchen.echomind.data.db.TranscriptJobEntity
 import com.xinchen.echomind.data.repo.AudioRepositoryImpl
 import com.xinchen.echomind.data.repo.TreeGrantStore
 import com.xinchen.echomind.data.repo.TranscriptRepositoryImpl
+import com.xinchen.echomind.data.repo.WmaPlaybackStore
 import com.xinchen.echomind.data.scan.AudioMetadataReader
 import com.xinchen.echomind.domain.importing.TreeBrowser
 import com.xinchen.echomind.domain.importing.TreeEntry
@@ -24,6 +25,8 @@ import com.xinchen.echomind.domain.model.EnqueueOutcome
 import com.xinchen.echomind.domain.model.TranscriptFailure
 import com.xinchen.echomind.domain.model.TranscriptModelRef
 import com.xinchen.echomind.domain.model.TranscriptJobStatus
+import com.xinchen.echomind.domain.model.TranscriptPhase
+import com.xinchen.echomind.domain.model.TranscriptProgress
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -59,8 +62,8 @@ class TranscriptCoordinatorTest {
         const val AUDIO_ID = "a"
 
         /**
-         * 每调一次前进这么多毫秒。[PlaybackPolicy.POSITION_FLUSH_INTERVAL_MS] 是 10 s，
-         * 假时钟要是静止不动，`reportProgress` 一段都不会报出去，「中途分母未知」那条断言就无从检查。
+         * 每调一次前进这么多毫秒。[PlaybackPolicy.TRANSCRIPT_PROGRESS_INTERVAL_MS] 是 2 s，
+         * 假时钟要是静止不动，`reportProgress` 一段都不会报出去，进度那几条断言就无从检查。
          */
         const val CLOCK_STEP_MS = 60_000L
     }
@@ -136,8 +139,14 @@ class TranscriptCoordinatorTest {
         db.close()
     }
 
-    private fun coordinator(root: File = modelsRoot) =
-        TranscriptCoordinator(context, audioRepository, grants, repository, root, SteppingClock())
+    private fun coordinator(
+        root: File = modelsRoot,
+        wmaStore: WmaPlaybackStore? = null,
+        onWmaPrepared: suspend (String, String, Long) -> Unit = { _, _, _ -> },
+    ) = TranscriptCoordinator(
+        context, audioRepository, grants, repository, root, SteppingClock(),
+        wmaStore = wmaStore, onWmaPrepared = onWmaPrepared,
+    )
 
     /** 直接摆行（不走导入编排，那条路径有 AudioRepositoryImportTest 守着），然后入队拿 jobId */
     private suspend fun enqueueBook(
@@ -147,14 +156,15 @@ class TranscriptCoordinatorTest {
         fileStatus: String = AudioBookEntity.FileStatus.Present,
         durationMs: Long = 0,
         modelRef: TranscriptModelRef = ModelCatalog.transcriptRef,
+        fileName: String = "a.mp3",
     ): String {
         db.audioBookDao().upsert(
             AudioBookEntity(
                 id = audioId,
                 uri = uri,
                 folderId = folderId,
-                relativePath = "a.mp3",
-                fileName = "a.mp3",
+                relativePath = fileName,
+                fileName = fileName,
                 title = "那些花儿",
                 sizeBytes = 1,
                 fileLastModifiedMs = 1,
@@ -176,12 +186,14 @@ class TranscriptCoordinatorTest {
 
     @Test
     fun 真模型跑完整首歌后字幕第一次进了数据库() = runBlocking {
-        val durationMs = DeviceAsrFixtures.REAL_MP3_DURATION_MS
+        // 时长从设备上那份素材的容器里读（素材换过版本，写死常量会把「字幕越界」断言变成素材对账）
+        val durationMs = PcmDecoder.containerDurationMs(context, Uri.parse(fileUriOf(DeviceAsrFixtures.REAL_MP3)))
+        assertTrue("素材读不到容器时长：$durationMs", durationMs > 0)
         val jobId = enqueueBook(fileUriOf(DeviceAsrFixtures.REAL_MP3), durationMs = durationMs)
-        val reported = mutableListOf<Pair<Int, Int>>()
+        val reported = mutableListOf<TranscriptProgress>()
         val startedAt = SystemClock.elapsedRealtime()
 
-        val outcome = coordinator().run(jobId) { done, total -> reported += done to total }
+        val outcome = coordinator().run(jobId) { progress -> reported += progress }
         val wallMs = SystemClock.elapsedRealtime() - startedAt
 
         val committed = outcome as? TranscriptOutcome.Committed
@@ -190,7 +202,7 @@ class TranscriptCoordinatorTest {
         Log.i(
             TAG,
             "端到端：${committed.segments} 段 → ${committed.sentences} 句（丢弃块 ${committed.rejectedChunks}、" +
-                "硬切边界 ${committed.guessedBoundaries}），wall=${wallMs}ms，进度上报 $reported",
+                "硬切边界 ${committed.guessedBoundaries}），wall=${wallMs}ms，进度上报 ${reported.size} 次，末次 ${reported.lastOrNull()}",
         )
 
         assertTrue("一句都没有：$committed", committed.sentences > 0)
@@ -210,10 +222,13 @@ class TranscriptCoordinatorTest {
             assertTrue("字幕越界（超出音频时长 $durationMs ms）：$row", row.endMs <= durationMs + 1_000)
         }
 
-        // 中途上报的进度分母一律 0：段数只有 VAD 跑完才知道，写「N/N」等于画一条永远 100% 的假进度
+        // 进度是时间口径：分母是容器时长（mp3 一开始就读得到），分子是已解到的位置，单调且不越界
         assertTrue("一次进度都没上报（节流把回调全吃了？）", reported.isNotEmpty())
-        assertTrue("中途分母不该已知：$reported", reported.all { (_, total) -> total == 0 })
-        assertTrue("上报的段数必须单调：$reported", reported.map { it.first }.zipWithNext().all { (a, b) -> b >= a })
+        assertTrue("mp3 不是 WMA，不该出现转码阶段：$reported", reported.all { it.phase == TranscriptPhase.Recognizing })
+        assertTrue("分母该是容器时长：${reported.first()}", reported.all { Math.abs(it.durationMs - durationMs) < 1_000 })
+        assertTrue("位置必须单调：$reported", reported.map { it.positionMs }.zipWithNext().all { (a, b) -> b >= a })
+        assertTrue("位置不该超过时长太多：${reported.last()}", reported.last().positionMs <= durationMs + 1_000)
+        assertTrue("段数必须单调：$reported", reported.map { it.doneSegments }.zipWithNext().all { (a, b) -> b >= a })
 
         val row = jobRow(jobId)
         assertEquals(TranscriptJobEntity.Status.Success, row.status)
@@ -227,7 +242,9 @@ class TranscriptCoordinatorTest {
 
         val uiRow = repository.jobById(jobId)!!
         assertEquals(TranscriptJobStatus.Success, uiRow.status)
-        assertEquals(1.0, uiRow.progress!!.toDouble(), 0.0001)
+        // 终态不再有百分比（进度只属于 RUNNING），UI 对成功行显示的是「共 N 段全部识别」
+        assertNull(uiRow.progress)
+        assertNull(uiRow.phase)
     }
 
     /** 同一行不该跑第二遍：跑一遍要烧掉整首的 CPU，还会把已入库的字幕整本换掉 */
@@ -368,38 +385,7 @@ class TranscriptCoordinatorTest {
         assertEquals("没字幕可写：库里的行必须与 FAILED 一致", 0, subtitles().size)
     }
 
-    @Test
-    fun 升级前遗留的auto任务统一改写为中文听书模型() = runBlocking {
-        val durationMs = DeviceAsrFixtures.REAL_MP3_DURATION_MS
-        val jobId = enqueueBook(
-            fileUriOf(DeviceAsrFixtures.REAL_MP3),
-            durationMs = durationMs,
-            // 旧版本已经可能把这个哨兵写进用户数据库；常量删除后仍要验证兼容收口。
-            modelRef = TranscriptModelRef("auto", ""),
-        )
-        coordinator().run(jobId, isCancelled = { false })
 
-        val row = jobRow(jobId)
-        assertEquals("中文素材应路由到 Paraformer", ModelCatalog.PARAFORMER_ID, row.modelId)
-        assertEquals(TranscriptJobEntity.Status.Success, row.status)
-        assertEquals(35, subtitles().size)
-    }
-
-    @Test
-    fun 升级前遗留的多语种任务也统一改写为中文听书模型() = runBlocking {
-        val jobId = enqueueBook(
-            fileUriOf(DeviceAsrFixtures.REAL_MP3),
-            durationMs = DeviceAsrFixtures.REAL_MP3_DURATION_MS,
-            modelRef = ModelCatalog.refOf(ModelCatalog.senseVoice),
-        )
-        coordinator().run(jobId, isCancelled = { false })
-
-        val row = jobRow(jobId)
-        assertEquals("产品任务只能执行中文听书模型", ModelCatalog.PARAFORMER_ID, row.modelId)
-        assertEquals(ModelCatalog.transcriptRef.version, row.modelVersion)
-        assertEquals(TranscriptJobEntity.Status.Success, row.status)
-        assertEquals(35, subtitles().size)
-    }
 
     /**
      * 取消是「点取消的那一方」改状态（`repo.cancel` 把行标 CANCELLED），协调器只负责停手：
@@ -459,6 +445,78 @@ class TranscriptCoordinatorTest {
         // 收尾清场：字幕此后以库里那份为准（本条用例里 in-memory Room 的行已在 committed.sentences 里）
         assertNull("run 返回后预览必须已清空", store.live.value[AUDIO_ID])
         assertEquals(committed.sentences.toLong(), subtitles().size.toLong())
+    }
+
+    /**
+     * D44：`.wma` 不再直接解给 VAD，而是先转成 mp3 落到 `WmaPlaybackStore`，再走 MediaCodec。
+     * 断言四件事：字幕真的进库了；mp3 产物在约定位置（播放也能直接用）；进度先报转码阶段再报识别阶段、
+     * 分母是容器时长；转码出的时长回填给了书。第二轮同一本书复用产物（不再转码、不再回填）。
+     */
+    @Test
+    fun wma先转mp3再识别且进度分两个阶段() = runBlocking {
+        val durationMs = DeviceAsrFixtures.REAL_WMA_DURATION_MS
+        val jobId = enqueueBook(fileUriOf(DeviceAsrFixtures.REAL_WMA), durationMs = 0, fileName = "a.wma")
+        val store = WmaPlaybackStore(File(context.cacheDir, "coordinator-wma-${System.nanoTime()}"))
+        val prepared = mutableListOf<Triple<String, String, Long>>()
+        val reported = mutableListOf<TranscriptProgress>()
+        val coordinator = coordinator(wmaStore = store, onWmaPrepared = { id, uri, ms -> prepared += Triple(id, uri, ms) })
+
+        val outcome = coordinator.run(jobId) { progress -> reported += progress }
+
+        val committed = outcome as? TranscriptOutcome.Committed
+            ?: error("WMA 端到端没跑成（$outcome）：转码或识别有一环断了")
+        Log.i(TAG, "WMA 端到端：${committed.segments} 段 → ${committed.sentences} 句，进度 ${reported.size} 次，回填 $prepared")
+        assertTrue("一句都没有：$committed", committed.sentences > 0)
+        assertEquals(TranscriptJobEntity.Status.Success, jobRow(jobId).status)
+        assertTrue("mp3 产物不在约定位置", store.isReady(AUDIO_ID, "mp3"))
+        assertTrue("part 临时文件没清", store.fileOf(AUDIO_ID, "mp3").parentFile!!.listFiles()!!.none { it.name.endsWith(".part") })
+
+        val phases = reported.map { it.phase }
+        assertEquals("第一次上报该是转码阶段：$phases", TranscriptPhase.Transcoding, phases.first())
+        assertTrue("识别阶段一次都没报：$phases", TranscriptPhase.Recognizing in phases)
+        assertEquals("阶段只许从转码走向识别，不许回头", phases, phases.sortedBy { it.ordinal })
+        reported.filter { it.phase == TranscriptPhase.Transcoding }.let { transcoding ->
+            assertTrue("转码分母该是 WMA 容器时长：${transcoding.first()}", transcoding.all { Math.abs(it.durationMs - durationMs) < 1_000 })
+            assertTrue("转码位置必须单调", transcoding.map { it.positionMs }.zipWithNext().all { (a, b) -> b >= a })
+        }
+        reported.filter { it.phase == TranscriptPhase.Recognizing }.let { recognizing ->
+            assertTrue("识别分母该是 mp3 的时长：${recognizing.first()}", recognizing.all { Math.abs(it.durationMs - durationMs) < 1_500 })
+        }
+        assertEquals(listOf(AUDIO_ID), prepared.map { it.first })
+        assertTrue("回填的时长不对：${prepared[0]}", Math.abs(prepared[0].third - durationMs) < 500)
+        // 导入时 WMA 读不到时长，这里通过回填 lambda 写回（生产装配里接的是 setPreparedDuration）
+        assertEquals(fileUriOf(DeviceAsrFixtures.REAL_WMA), prepared[0].second)
+
+        // 第二轮（重试）：产物复用，不再转码、不再回填，进度直接从识别阶段开始
+        val second = (repository.enqueue(AUDIO_ID, ModelCatalog.transcriptRef, force = true) as EnqueueOutcome.Created).jobId
+        val reportedAgain = mutableListOf<TranscriptProgress>()
+        val again = coordinator.run(second) { progress -> reportedAgain += progress }
+        assertTrue("第二轮没跑成：$again", again is TranscriptOutcome.Committed)
+        assertEquals("第二轮不该再转码", 1, prepared.size)
+        assertTrue("第二轮不该有转码阶段：${reportedAgain.map { it.phase }}", reportedAgain.none { it.phase == TranscriptPhase.Transcoding })
+    }
+
+    /**
+     * 「自动选模型」：探测在抢到车道（RUNNING）之后做（D36：SenseVoice 226 MB 不能与别的引擎同时在内存），
+     * 所以 `updateModel` 必须对 RUNNING 行也有效——否则行上会一直挂着 `auto`，字幕是谁跑出来的就说不清了。
+     * 中文素材 → Paraformer（`ModelRouting` 的汉字多数票）。
+     */
+    @Test
+    fun 自动选模型在抢到车道后探测并把行上的模型改写为真正执行的那个() = runBlocking {
+        val jobId = enqueueBook(
+            fileUriOf(DeviceAsrFixtures.REAL_MP3),
+            modelRef = TranscriptModelRef(ModelCatalog.AUTO_MODEL_ID, ""),
+        )
+        assertEquals(ModelCatalog.AUTO_MODEL_ID, jobRow(jobId).modelId)
+
+        val outcome = coordinator().run(jobId)
+
+        assertTrue("自动路由端到端没跑成：$outcome", outcome is TranscriptOutcome.Committed)
+        val row = jobRow(jobId)
+        assertEquals(TranscriptJobEntity.Status.Success, row.status)
+        assertEquals(ModelCatalog.paraformer.id, row.modelId)
+        assertEquals(ModelCatalog.refOf(ModelCatalog.paraformer).version, row.modelVersion)
+        assertTrue(subtitles().isNotEmpty())
     }
 
     private fun emptyModelsRoot(): File =

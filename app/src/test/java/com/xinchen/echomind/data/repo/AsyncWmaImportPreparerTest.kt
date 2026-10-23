@@ -26,7 +26,7 @@ class AsyncWmaImportPreparerTest {
         val preparer = AsyncWmaImportPreparer(
             scope = this,
             store = store,
-            transcode = { _, output -> output.writeText("complete"); 12_345L },
+            transcode = { _, outputFile, _ -> outputFile.writeText("complete"); 12_345L },
             onPrepared = { id, uri, duration -> prepared += Triple(id, uri, duration); true },
             dispatcher = StandardTestDispatcher(testScheduler),
         )
@@ -49,8 +49,8 @@ class AsyncWmaImportPreparerTest {
         val preparer = AsyncWmaImportPreparer(
             scope = this,
             store = store,
-            transcode = { _, output ->
-                output.writeText("partial")
+            transcode = { _, outputFile, _ ->
+                outputFile.writeText("partial")
                 error("codec stuck")
             },
             onPrepared = { _, _, _ -> true },
@@ -73,7 +73,7 @@ class AsyncWmaImportPreparerTest {
         val preparer = AsyncWmaImportPreparer(
             scope = this,
             store = store,
-            transcode = { _, output -> transcodes++; output.writeText("done"); 1_000L },
+            transcode = { _, outputFile, _ -> transcodes++; outputFile.writeText("done"); 1_000L },
             onPrepared = { _, _, _ -> false },
             dispatcher = StandardTestDispatcher(testScheduler),
         )
@@ -95,7 +95,7 @@ class AsyncWmaImportPreparerTest {
         val preparer = AsyncWmaImportPreparer(
             scope = this,
             store = store,
-            transcode = { uri, output ->
+            transcode = { uri, output, _ ->
                 if (uri.endsWith("old.wma")) {
                     oldStarted.complete(Unit)
                     // 模拟不响应协程取消的厂商 MediaCodec：cancel 后仍会把旧文件写完。
@@ -134,7 +134,7 @@ class AsyncWmaImportPreparerTest {
         val preparer = AsyncWmaImportPreparer(
             scope = this,
             store = store,
-            transcode = { uri, output ->
+            transcode = { uri, output, _ ->
                 if (uri == "same-uri-old-content") {
                     oldStarted.complete(Unit)
                     withContext(NonCancellable) { releaseOld.await() }

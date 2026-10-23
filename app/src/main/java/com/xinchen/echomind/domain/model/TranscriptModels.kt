@@ -39,6 +39,33 @@ enum class TranscriptFailure {
     Unknown,
 }
 
+/**
+ * RUNNING 任务的阶段（FR-507 的进度显示，2026-10-24）。
+ *
+ * 分母来自**容器时长**而不是 VAD 的段数：容器时长在解码一开始就知道，
+ * 所以进度条不用再等「解码跑完才知道总段数」——那是旧口径长期 0% 的根源。
+ * WMA 书先转 mp3 再识别（D44），多出一个转码阶段。
+ */
+enum class TranscriptPhase {
+    /** WMA → mp3 转码中；[TranscriptJobRow.positionMs] 是已解出的音频位置 */
+    Transcoding,
+
+    /** 解码 + 识别中 */
+    Recognizing,
+}
+
+/** 一次进度写入的快照（协调器节流后发出，worker 落库并刷通知）。 */
+data class TranscriptProgress(
+    val phase: TranscriptPhase,
+    val positionMs: Long,
+    val durationMs: Long,
+    val doneSegments: Int,
+) {
+    /** 整数百分比（0..99，收尾前不给 100）；分母未知为 null */
+    val percent: Int?
+        get() = if (durationMs <= 0) null else (positionMs * 100 / durationMs).toInt().coerceIn(0, 99)
+}
+
 data class TranscriptJobRow(
     val id: String,
     val audioId: String,
@@ -46,9 +73,15 @@ data class TranscriptJobRow(
     /** 模型权重身份（SHA-256 前 12 位），字幕是这份权重跑出来的证据 */
     val modelVersion: String,
     val status: TranscriptJobStatus,
-    /** VAD 跑完才知道，入队时 0 */
+    /** VAD 跑完才知道，入队时 0；只在 SUCCESS 终态展示（「共 N 段全部识别」） */
     val totalSegments: Int,
     val doneSegments: Int,
+    /** RUNNING 时的阶段；终态行恒为 null */
+    val phase: TranscriptPhase?,
+    /** 已解到的音频位置（毫秒）。进度分子，来自解码器实测位置，不是估算 */
+    val positionMs: Long,
+    /** 容器时长（毫秒）。进度分母；容器没给就是 0，此时不显示百分比（假进度比没有进度更糟） */
+    val durationMs: Long,
     val failure: TranscriptFailure?,
     /** 面向用户的原文，来自异常消息，不做二次加工 */
     val errorMessage: String?,
@@ -58,9 +91,16 @@ data class TranscriptJobRow(
     /** WorkManager 那一侧的请求 id；没进队列（或写入失败）时 null，取消就只能改库 */
     val workRequestId: String? = null,
 ) {
-    /** 进度显示用：分母还没出来时不显示百分比，而不是显示 0%（那是假进度） */
+    /**
+     * 进度显示用：分子分母都是**音频时间**（已解位置 / 容器时长），转录一开始就可知，
+     * 所以 RUNNING 中不再有「分母未知」的空窗。分母为 0（容器没给时长）时返回 null——
+     * 不显示百分比，也不编一个。
+     */
     val progress: Float?
-        get() = if (totalSegments <= 0) null else (doneSegments.toFloat() / totalSegments).coerceIn(0f, 1f)
+        get() {
+            if (status != TranscriptJobStatus.Running || durationMs <= 0) return null
+            return (positionMs.toFloat() / durationMs).coerceIn(0f, 1f)
+        }
 }
 
 /**

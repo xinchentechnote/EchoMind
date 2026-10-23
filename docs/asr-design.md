@@ -165,6 +165,13 @@ Phase 6d 之后这些行为有了**设备证据**（人工从界面点出来：�
 > 样本计数器短于 PTS，字幕越到后面越提前（用户实测「mp3 播到后面字幕比语音快一两行」）。
 > 因此 `PcmDecoder` 用 `domain/asr/PtsTimeline` 把流锚到 PTS：输出缓冲的 PTS 超前流内位置超过 20 ms
 > 就垫等长静音（静音进 VAD 是非语音，无副作用），PTS 倒退则重锚。干净文件零变化（回归全绿）。
+>
+> **WMA 先转 mp3 再识别（2026-10-24，D44）**：`.wma` 目标不再直接解（旧 `WmaPcmDecoder` 直解路径在
+> 用户真机上「WMA 解码中途失败、已识别 0 段」，根因是 libwma JNI 壳的 32 KB 固定缓冲装不下 wmav2 带比特储备的
+> 超帧）。现在编排层先把 WMA 经 `WmaTranscoder.transcodeToMp3`（LAME）转成 `filesDir/transcoded/<audioId>.mp3`
+> （与播放共用 `WmaPlaybackStore`；已有产物直接复用），再走与 mp3/m4a 同一条 `PcmDecoder`（MediaCodec）路径。
+> 转码是识别进度的一个独立阶段（`phase=TRANSCODING`，分母 = WMA 容器时长）；libwma 壳对单个坏包只记数跳过
+> （`nativeBadPackets`），整条流一个样本都解不出才算失败。
 
 ```
 1. 打开 SAF InputStream（只读，不复制文件）
@@ -245,6 +252,10 @@ Phase 6d 之后这些行为有了**设备证据**（人工从界面点出来：�
    （`recoverInterrupted()` 已把那行标成 `FAILED(INTERRUPTED)`）、以及**另一本书占了模型句柄时的并发转录**（D36）。
    第三档必须写在 SQL 里：「先 SELECT 看有没有 RUNNING 再 UPDATE」在查与改之间就是并发窗口，两个 worker 都能读到「没有」，
    于是各自开一份 243 MB 的引擎。用例 `别的任务正在跑时第二本书的任务抢不到运行中的行` / `别的书正在跑时第二个协调器收手且不写字幕`。
+   **WMA 的 mp3 转码与「自动选模型」的语言探测都排在它之后**（2026-10-24）：转码不用引擎但要用 RUNNING 行写进度
+   （`updateProgress` 只认 RUNNING），探测要开 SenseVoice 226 MB——排在前面就与别的书正在跑的引擎并存了（D36）。
+   连带 `updateModel` 对 RUNNING 行也放行（只有协调器本人写自己的运行行；已结束的行仍然不许改）。
+   用例 `wma先转mp3再识别且进度分两个阶段` / `自动选模型在抢到车道后探测并把行上的模型改写为真正执行的那个`。
 2. 三道守护在**装载引擎之前**返回，避免为注定失败的活儿付 3~5 秒 native 装载 + 一份内存：
    文件状态（`isFilePresent=false` → `DECODE_FAILED`）、**SAF 授权**（→ `PERMISSION_REVOKED`）、模型清单核对（→ `MODEL_MISSING`）。
 3. ⚠ **授权查的是所属文件夹的树 uri，不是书的文档 uri**。可持久化授权只发在树上（`imported_folder.tree_uri`），
@@ -374,6 +385,13 @@ Phase 6d 之后这些行为有了**设备证据**（人工从界面点出来：�
 
 ## 10. 当前状态（诚实标注）
 
+- **WMA 转录管线与任务列表重做（2026-10-24，D44/D45）**：`.wma` 先转 mp3 再识别（`app/libs/wma/README.md` 有新 libwma.so
+  的构建脚本与哈希；修了 32 KB 超帧溢出、接入 LAME）；`transcript_job` v4 加 `phase/position_ms/duration_ms`，
+  进度分母换成容器时长（转码/识别两阶段、百分比从第一秒起是真的）；一本书一行任务 + 手动删除（连字幕）。
+  设备证据：34 分钟真实 WMA（用户素材）从界面导入 → 首播自动转录 → 「识别中 92% · 已识别 557 段」→ **共 609 段全部识别**、
+  时长 34:20 回填、书变 READY；删除确认框、删后书架回「未转录」；换书后播放页不再残留上一本的「无法播放」提示
+  （全过程见 `docs/testing.md` §4 2026-10-24 条）。仪器化：`Migration_3_4_Test` 3 条、`TranscriptRepositoryTest` 25 条、
+  `WmaDecodeTest` 3 条（新增 mp3 支路）、`TranscriptCoordinatorTest` 12 条（新增 WMA 端到端与自动路由）全绿。
 - **已确证/已落地**：AAR 取回并打进包（§2.1，`assembleDebug` 通过，APK 40.79 MB，只含 arm64 一份 sherpa `.so`）；
   三个模型文件已在**本机**下载并逐一核对 sha256（§3，Paraformer int8 + tokens + silero VAD，`tokens.txt` 于 2026-10-15 二次复核仍一致）；
   模型管理这层已有代码：`asr/ModelCatalog.kt`（清单，数值由 `ModelCatalogTest` 钉住）、`asr/ModelVerifier.kt`（存在/大小/SHA-256 三步核对）、

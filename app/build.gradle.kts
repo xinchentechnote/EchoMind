@@ -180,18 +180,18 @@ bundledModelFiles.forEach { model ->
 }
 
 /**
- * libwma.so（WMA 解码，D40）：FFmpeg 6.1.1 最小裁剪静态链进 `app/src/main/cpp/wma_jni.c`。
- * 与 sherpa AAR 同一套规矩——缺失时打印确切来源与哈希，不静默失败（AGENTS.md §5）。
- * 构建脚本与许可证（LGPL-2.1-or-later）记录在 `app/libs/wma/README.md` 与 `docs/architecture.md` D40。
+ * libwma.so（WMA 解码 + LAME mp3 编码，D40/D44）：FFmpeg 6.1.1 最小裁剪与 LAME 3.100 静态链进
+ * `app/src/main/cpp/wma_jni.c`。与 sherpa AAR 同一套规矩——缺失时打印确切来源与哈希，不静默失败（AGENTS.md §5）。
+ * 构建脚本与许可证（LGPL-2.1-or-later）记录在 `app/libs/wma/README.md` 与 `docs/architecture.md` D40/D44。
  */
 val wmaSo = file("libs/wma-jni/arm64-v8a/libwma.so")
-if (!wmaSo.exists() || wmaSo.length() != 1_073_288L) {
+if (!wmaSo.exists() || wmaSo.length() != 1_329_656L) {
     throw GradleException(
         """
-        |缺少或大小不符的 libwma.so：$wmaSo（期望 1,073,288 B）
-        |  来源：本仓库 release v0.1.1 资产 libwma-arm64-v8a-d9abb58d.so（CI 自动取回）
-        |  SHA-256 : d9abb58d31581c83fc932e8521329cc16d3d1768772be22e526359b8c5b14719
-        |  自建：FFmpeg 6.1.1 最小裁剪交叉编译 + app/src/main/cpp/wma_jni.c，见 docs/architecture.md D40
+        |缺少或大小不符的 libwma.so：$wmaSo（期望 1,329,656 B）
+        |  SHA-256 : e12081cbbadca796e8dfbafe8a4bf7a98a6c1cd3272d66cd77f9b38ad15513b5（2026-10-24 本机构建，含 LAME 与坏包容错）
+        |  来源：尚未发布为 release 资产（上一版 v0.1.1 的 libwma-arm64-v8a-d9abb58d.so 没有 LAME 符号、且有 32 KB 超帧溢出缺陷，不要再用）
+        |  自建：照抄 app/libs/wma/README.md 的三段脚本（FFmpeg 裁剪交叉编译 → LAME 交叉编译 → 链 wma_jni.c）
         """.trimMargin()
     )
 }

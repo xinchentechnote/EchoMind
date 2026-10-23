@@ -59,6 +59,13 @@ class Media3PlaybackController(
     private var lastFlushMonotonic = 0L
     private var waitingForUserToResume = false
 
+    /**
+     * 最近一次播放错误**属于哪本书**。错误只跟着出错的那一首走：换到别的书（用户点开另一本、队列自动前进）
+     * 就不再显示，同一本重新播成功（READY）也清掉。实测踩过：WMA 原件播不了留下的「无法播放」
+     * 一直挂在后面打开的每一本正常书的播放页上。
+     */
+    private var erroredAudioId: String? = null
+
     init {
         player.addListener(this)
         scope.launch {
@@ -168,7 +175,11 @@ class Media3PlaybackController(
         when (state) {
             Player.STATE_ENDED -> settle(SessionEndReason.Natural)
             Player.STATE_IDLE -> settle(SessionEndReason.UserStopped)
-            Player.STATE_READY -> adoptDuration()
+            Player.STATE_READY -> {
+                adoptDuration()
+                // 这一本已经能播了：上一次关于它的错误不再成立
+                if (erroredAudioId == currentItem()?.audioId) erroredAudioId = null
+            }
         }
         pushState()
     }
@@ -234,6 +245,7 @@ class Media3PlaybackController(
 
     override fun onPlayerError(error: PlaybackException) {
         Log.w(TAG, "player error", error)
+        erroredAudioId = currentItem()?.audioId
         _state.update { it.copy(error = "无法播放（${error.errorCodeName}）") }
         flushNow()
     }
@@ -356,7 +368,8 @@ class Media3PlaybackController(
                 speed = player.playbackParameters.speed,
                 queue = queue,
                 index = if (queue.isEmpty()) -1 else player.currentMediaItemIndex,
-                error = if (item == null) null else current.error,
+                // 错误只属于出错的那一本：当前在播的不是它，就不显示
+                error = if (item != null && item.audioId == erroredAudioId) current.error else null,
             )
         }
     }

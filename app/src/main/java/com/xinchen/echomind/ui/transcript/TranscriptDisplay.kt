@@ -4,6 +4,7 @@ import com.xinchen.echomind.core.conf.AudioFormats
 import com.xinchen.echomind.domain.model.TranscriptFailure
 import com.xinchen.echomind.domain.model.TranscriptJobRow
 import com.xinchen.echomind.domain.model.TranscriptJobStatus
+import com.xinchen.echomind.domain.model.TranscriptPhase
 
 /**
  * 转录页的文字（FR-507 / FR-508）。写成纯 Kotlin 是为了让「失败该给用户什么动作」这条能在 JVM 里断言
@@ -23,28 +24,59 @@ object TranscriptDisplay {
     }
 
     /**
-     * 进度那一行。⚠ 分母在 VAD 跑完之前恒为 0，此时 [TranscriptJobRow.progress] 是 null，
-     * 只能如实说「已识别 N 段」——画一条 0% 的线就是假进度（FR-507）。
+     * 进度那一行（FR-507）。分母是**容器时长**：解码一开始就知道，所以百分比从第一秒起就是真的；
+     * 容器没给时长（[TranscriptJobRow.progress] 为 null）时只报段数，不编百分比。
+     * WMA 的转码阶段单独说清楚「在转 mp3」，否则用户会以为识别卡住了。
      *
-     * 排队中的任务不给进度：它一段都没解。
+     * 排队中的任务不给进度：它一段都没解。失败/取消的行只在真识别过东西时提一句，免得满屏「已识别 0 段」。
      */
-    fun progressLabel(row: TranscriptJobRow): String? {
+    fun progressLabel(row: TranscriptJobRow): String? = when (row.status) {
+        TranscriptJobStatus.Queued -> null
+        TranscriptJobStatus.Success -> "共 ${row.totalSegments} 段全部识别"
+        TranscriptJobStatus.Running -> runningPhrase(row)
+        TranscriptJobStatus.Failed, TranscriptJobStatus.Cancelled ->
+            if (row.doneSegments > 0) "中止前已识别 ${row.doneSegments} 段" else null
+    }
+
+    /**
+     * RUNNING 行的一句话（转录页与播放页共用）：
+     * 「WMA 转码中 34%（转成 mp3 后开始识别）」/「识别中 58% · 已识别 120 段」/ 分母未知时「已识别 N 段」。
+     */
+    fun runningPhrase(row: TranscriptJobRow): String {
         // progress 是计算属性：先落到局部量，别在判空和取值之间把 getter 跑两遍
-        val fraction = row.progress
-        return when {
-            row.status == TranscriptJobStatus.Queued -> null
-            row.status == TranscriptJobStatus.Success -> "共 ${row.totalSegments} 段全部识别"
-            fraction == null -> "已识别 ${row.doneSegments} 段（总段数要等解码跑完才知道）"
-            else -> "已识别 ${row.doneSegments}/${row.totalSegments} 段（${(fraction * 100).toInt()}%）"
+        val percent = row.progress?.let { (it * 100).toInt().coerceIn(0, 99) }
+        return when (row.phase) {
+            TranscriptPhase.Transcoding ->
+                if (percent != null) "WMA 转码中 $percent%（转成 mp3 后开始识别）" else "WMA 转码中…（转成 mp3 后开始识别）"
+
+            TranscriptPhase.Recognizing ->
+                if (percent != null) "识别中 $percent% · 已识别 ${row.doneSegments} 段" else "已识别 ${row.doneSegments} 段"
+
+            null -> "准备模型与解码…"
         }
     }
 
     /** 只有还在占着引擎的任务能取消（终态行取消了没有意义，仓储那侧也会返回 false） */
     fun cancellable(status: TranscriptJobStatus): Boolean = status.isActive
 
-    /** 失败与取消的历史行可以重开一轮；重试是**新建一行**，旧行留着当错误上下文 */
+    /** 失败与取消的行可以重开一轮；重试会用新的一行**顶掉**这一行（一本书一行） */
     fun retryable(status: TranscriptJobStatus): Boolean =
         status == TranscriptJobStatus.Failed || status == TranscriptJobStatus.Cancelled
+
+    /** 已结束的行可以删；活动行要先取消（仓储那侧同样拒删 RUNNING） */
+    fun deletable(status: TranscriptJobStatus): Boolean = !status.isActive
+
+    /**
+     * 删除前的确认文案。删成功记录会**连它产出的 ASR 字幕一起删**——这件事必须在点下去之前说清楚；
+     * 删失败/取消记录不碰字幕（它们本来就没产出）。
+     */
+    fun deleteConfirmText(row: TranscriptJobRow): String = when (row.status) {
+        TranscriptJobStatus.Success ->
+            "这条记录和它识别出的 ${row.totalSegments} 段字幕会一起删除，播放页将不再显示字幕；" +
+                "以后再转录会从头识别。确定删除？"
+
+        else -> "只删这条记录，不影响这本书已有的字幕。确定删除？"
+    }
 
     /**
      * 每条失败都给「你能做什么」（FR-508）。这里刻意**不给**「按字数补时间」「跳过坏块」这类动作：
@@ -72,7 +104,7 @@ object TranscriptDisplay {
             "上一次运行被中断（应用被杀或系统重启），已经识别的部分没有保留。点重试从头再跑"
 
         TranscriptFailure.Cancelled ->
-            "这一轮被你取消了。想重跑就点重试，会新建一行，这一行留着当记录"
+            "这一轮被你取消了。想重跑就点重试，新的一轮会顶掉这条记录"
 
         TranscriptFailure.Unknown ->
             "转录异常中断。可以先重试一次；连续失败请把这个文件的格式与时长告诉我，方便定位"
@@ -109,6 +141,8 @@ object TranscriptDisplay {
         TranscriptOutcomeCopy.JobGone -> "那一行任务查不到了（多半书已被移除），重新选一本书吧"
         TranscriptOutcomeCopy.Cancelled -> "已取消，这一轮不会写入字幕"
         TranscriptOutcomeCopy.AlreadySettled -> "这一行已经结束了（跑完、失败或被取消），没有东西可取消"
+        TranscriptOutcomeCopy.Deleted -> "记录已删除"
+        TranscriptOutcomeCopy.DeleteRefused -> "这一行还在跑或已经不存在，没有删除；进行中的先点取消"
     }
 }
 
@@ -135,4 +169,6 @@ enum class TranscriptOutcomeCopy {
     JobGone,
     Cancelled,
     AlreadySettled,
+    Deleted,
+    DeleteRefused,
 }

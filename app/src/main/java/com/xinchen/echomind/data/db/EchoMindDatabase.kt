@@ -12,6 +12,7 @@ import androidx.room.RoomDatabase
  * v1 = imported_folder / audio_book / playback_state / listening_session（Phase 2~4）。
  * v2 = + subtitle_segment（Phase 5，`Migrations.MIGRATION_1_2`）。
  * v3 = + transcript_job，并给 `subtitle_segment.job_id` 补上外键（整表重建，`Migrations.MIGRATION_2_3`）。
+ * v4 = transcript_job + phase / position_ms / duration_ms（时间口径的转录进度，`Migrations.MIGRATION_3_4`）。
  */
 @Database(
     entities = [
@@ -22,7 +23,7 @@ import androidx.room.RoomDatabase
         SubtitleSegmentEntity::class,
         TranscriptJobEntity::class,
     ],
-    version = 3,
+    version = 4,
     exportSchema = true,
 )
 abstract class EchoMindDatabase : RoomDatabase() {

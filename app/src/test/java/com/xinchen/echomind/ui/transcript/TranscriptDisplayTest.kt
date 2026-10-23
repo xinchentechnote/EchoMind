@@ -4,6 +4,7 @@ import com.xinchen.echomind.core.conf.AudioFormats
 import com.xinchen.echomind.domain.model.TranscriptFailure
 import com.xinchen.echomind.domain.model.TranscriptJobRow
 import com.xinchen.echomind.domain.model.TranscriptJobStatus
+import com.xinchen.echomind.domain.model.TranscriptPhase
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -32,6 +33,9 @@ class TranscriptDisplayTest {
         status: TranscriptJobStatus,
         totalSegments: Int = 0,
         doneSegments: Int = 0,
+        phase: TranscriptPhase? = null,
+        positionMs: Long = 0,
+        durationMs: Long = 0,
     ) = TranscriptJobRow(
         id = "job-1",
         audioId = "audio-1",
@@ -40,6 +44,9 @@ class TranscriptDisplayTest {
         status = status,
         totalSegments = totalSegments,
         doneSegments = doneSegments,
+        phase = phase,
+        positionMs = positionMs,
+        durationMs = durationMs,
         failure = null,
         errorMessage = null,
         createdAtMs = 1_700_000_000_000,
@@ -54,18 +61,50 @@ class TranscriptDisplayTest {
     }
 
     @Test
-    fun `总段数还不知道时只报段数不报百分比`() {
-        val label = TranscriptDisplay.progressLabel(row(TranscriptJobStatus.Running, totalSegments = 0, doneSegments = 3))
-        assertEquals("已识别 3 段（总段数要等解码跑完才知道）", label)
+    fun `容器没给时长时只报段数不报百分比`() {
+        val label = TranscriptDisplay.progressLabel(
+            row(TranscriptJobStatus.Running, doneSegments = 3, phase = TranscriptPhase.Recognizing, positionMs = 5_000, durationMs = 0),
+        )
+        assertEquals("已识别 3 段", label)
         assertFalse("分母未知时不许出现百分号，那是假进度", label!!.contains("%"))
     }
 
     @Test
-    fun `分母出来之后才给得出带百分比的那一行`() {
+    fun `识别阶段按音频位置给百分比并带段数`() {
         assertEquals(
-            "已识别 3/10 段（30%）",
-            TranscriptDisplay.progressLabel(row(TranscriptJobStatus.Running, totalSegments = 10, doneSegments = 3)),
+            "识别中 30% · 已识别 3 段",
+            TranscriptDisplay.progressLabel(
+                row(TranscriptJobStatus.Running, doneSegments = 3, phase = TranscriptPhase.Recognizing, positionMs = 30_000, durationMs = 100_000),
+            ),
         )
+    }
+
+    @Test
+    fun `收尾前百分比封顶 99`() {
+        // 位置可能略超容器时长（解码器末尾垫静音）：进度条不许在 SUCCESS 落库前先喊 100%
+        val label = TranscriptDisplay.progressLabel(
+            row(TranscriptJobStatus.Running, doneSegments = 9, phase = TranscriptPhase.Recognizing, positionMs = 100_500, durationMs = 100_000),
+        )
+        assertEquals("识别中 99% · 已识别 9 段", label)
+    }
+
+    @Test
+    fun `WMA 转码阶段说清在转 mp3`() {
+        val known = TranscriptDisplay.progressLabel(
+            row(TranscriptJobStatus.Running, phase = TranscriptPhase.Transcoding, positionMs = 61_000, durationMs = 2_060_956),
+        )
+        assertEquals("WMA 转码中 2%（转成 mp3 后开始识别）", known)
+        val unknown = TranscriptDisplay.progressLabel(
+            row(TranscriptJobStatus.Running, phase = TranscriptPhase.Transcoding, positionMs = 61_000, durationMs = 0),
+        )
+        assertEquals("WMA 转码中…（转成 mp3 后开始识别）", unknown)
+        assertFalse(unknown!!.contains("%"))
+    }
+
+    @Test
+    fun `刚进运行态还没有阶段时说准备中`() {
+        val label = TranscriptDisplay.progressLabel(row(TranscriptJobStatus.Running))
+        assertEquals("准备模型与解码…", label)
     }
 
     @Test
@@ -75,6 +114,20 @@ class TranscriptDisplayTest {
             "共 7 段全部识别",
             TranscriptDisplay.progressLabel(row(TranscriptJobStatus.Success, totalSegments = 7, doneSegments = 7)),
         )
+    }
+
+    @Test
+    fun `失败行只在真识别过东西时才提段数`() {
+        assertNull(TranscriptDisplay.progressLabel(row(TranscriptJobStatus.Failed, doneSegments = 0)))
+        assertEquals("中止前已识别 12 段", TranscriptDisplay.progressLabel(row(TranscriptJobStatus.Cancelled, doneSegments = 12)))
+    }
+
+    @Test
+    fun `进度分数只在运行中且分母已知时存在`() {
+        assertNull(row(TranscriptJobStatus.Running, positionMs = 10, durationMs = 0).progress)
+        assertNull(row(TranscriptJobStatus.Success, positionMs = 10, durationMs = 100).progress)
+        assertEquals(0.25f, row(TranscriptJobStatus.Running, positionMs = 25, durationMs = 100).progress!!, 0.0001f)
+        assertEquals(1f, row(TranscriptJobStatus.Running, positionMs = 250, durationMs = 100).progress!!, 0.0001f)
     }
 
     @Test
@@ -100,6 +153,24 @@ class TranscriptDisplayTest {
         assertFalse(TranscriptDisplay.retryable(TranscriptJobStatus.Queued))
         assertFalse(TranscriptDisplay.retryable(TranscriptJobStatus.Running))
         assertFalse(TranscriptDisplay.retryable(TranscriptJobStatus.Success))
+    }
+
+    @Test
+    fun `只有已结束的行能删`() {
+        assertTrue(TranscriptDisplay.deletable(TranscriptJobStatus.Success))
+        assertTrue(TranscriptDisplay.deletable(TranscriptJobStatus.Failed))
+        assertTrue(TranscriptDisplay.deletable(TranscriptJobStatus.Cancelled))
+        assertFalse(TranscriptDisplay.deletable(TranscriptJobStatus.Queued))
+        assertFalse(TranscriptDisplay.deletable(TranscriptJobStatus.Running))
+    }
+
+    @Test
+    fun `删成功记录前必须说清字幕会一起没`() {
+        val success = TranscriptDisplay.deleteConfirmText(row(TranscriptJobStatus.Success, totalSegments = 40, doneSegments = 40))
+        assertTrue(success, success.contains("字幕") && success.contains("删除"))
+        assertTrue(success, success.contains("40"))
+        val failed = TranscriptDisplay.deleteConfirmText(row(TranscriptJobStatus.Failed))
+        assertTrue(failed, failed.contains("不影响"))
     }
 
     @Test

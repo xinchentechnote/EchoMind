@@ -87,6 +87,13 @@ object ModelCatalog {
     const val WHISPER_TOKENS_FILE = "base-tokens.txt"
 
     const val SENSEVOICE_ID = "sense-voice-zh-en-ja-ko-yue-int8"
+
+    /**
+     * 「自动选模型」的哨兵 id（D41/D42）：任务行先记它，协调器在装载引擎前用 SenseVoice 听
+     * 开头 30 s 判语言，再把行上的 model_id/version 改写为最终模型
+     * （zh/yue → Paraformer，其余 → SenseVoice，判定规则见 asr/ModelRouting）。
+     */
+    const val AUTO_MODEL_ID = "auto"
     const val SENSEVOICE_MODEL_FILE = "model.int8.onnx"
     const val SENSEVOICE_TOKENS_FILE = "tokens.txt"
 
@@ -244,6 +251,14 @@ object ModelCatalog {
         val weight = spec.files.maxByOrNull { it.expectedBytes }
             ?: throw IllegalArgumentException("模型包 ${spec.id} 没有文件")
         return TranscriptModelRef(id = spec.id, version = weight.expectedSha256.take(12))
+    }
+
+    /** 自动路由的判定结果落到对应的识别模型 spec（ModelRouting 的产物） */
+    fun specForFinal(ref: TranscriptModelRef): ModelSpec = when (ref.id) {
+        PARAFORMER_ID -> paraformer
+        WHISPER_BASE_ID -> whisperBase
+        SENSEVOICE_ID -> senseVoice
+        else -> throw IllegalArgumentException("模型清单里没有 id=${ref.id}")
     }
 
 }

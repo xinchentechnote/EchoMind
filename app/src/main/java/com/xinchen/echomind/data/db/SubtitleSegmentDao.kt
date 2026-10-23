@@ -41,6 +41,10 @@ interface SubtitleSegmentDao {
     @Query("DELETE FROM subtitle_segment WHERE audio_id = :audioId")
     suspend fun deleteByAudio(audioId: String): Int
 
+    /** 删某一轮任务产出的字幕（用户删转录记录时随记录一起走）；手工测试字幕 `job_id` 为 null，不受影响 */
+    @Query("DELETE FROM subtitle_segment WHERE job_id = :jobId")
+    suspend fun deleteByJob(jobId: String): Int
+
     @Insert
     suspend fun insertAll(segments: List<SubtitleSegmentEntity>)
 }

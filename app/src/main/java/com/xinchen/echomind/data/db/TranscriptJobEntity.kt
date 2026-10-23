@@ -9,11 +9,15 @@ import androidx.room.PrimaryKey
 /**
  * 一次转录任务（`docs/database-design.md` §6）。
  *
- * 一张表多行、按时间累积：同一个 audio 重试会产生新行，旧行留着当错误上下文——
- * 用户问「上次为什么失败」时得有东西可查。
+ * **每本书只保留一行**（2026-10-24 起的用户口径）：入队/重试前先删掉这本书已结束的历史行，
+ * 新一轮才插入；活动行（QUEUED/RUNNING）另有「不重复排队」守卫。失败原因因此只保留最近一次——
+ * 用户要的是「这本书现在怎么样、怎么办」，不是一张越滚越长的失败流水。
  *
  * 状态跃迁与 `audio_book.transcription_state` 的更新**必须在同一个事务里**（AGENTS.md §4），
  * 所以跃迁不写在 DAO 的裸方法上，而由 `TranscriptRepositoryImpl` 包 `withTransaction` 完成。
+ *
+ * v4 加的三列是进度（FR-507）：分母从「VAD 的段数」换成**容器时长**，解码一开始就能画出真实百分比；
+ * `phase` 区分 WMA 的「转码中」与「识别中」两个阶段（D44）。
  */
 @Entity(
     tableName = "transcript_job",
@@ -53,6 +57,12 @@ data class TranscriptJobEntity(
     @ColumnInfo(name = "created_at_ms") val createdAtMs: Long,
     @ColumnInfo(name = "started_at_ms") val startedAtMs: Long? = null,
     @ColumnInfo(name = "finished_at_ms") val finishedAtMs: Long? = null,
+    /** RUNNING 时的阶段（[Phase]）；入队与终态为 null */
+    @ColumnInfo(name = "phase") val phase: String? = null,
+    /** 已解到的音频位置（ms），进度分子；解码器实测，不是估算 */
+    @ColumnInfo(name = "position_ms", defaultValue = "0") val positionMs: Long = 0,
+    /** 容器时长（ms），进度分母；容器没给就是 0，UI 据此不显示百分比 */
+    @ColumnInfo(name = "duration_ms", defaultValue = "0") val durationMs: Long = 0,
 ) {
     object Status {
         const val Queued = "QUEUED"
@@ -60,6 +70,12 @@ data class TranscriptJobEntity(
         const val Success = "SUCCESS"
         const val Failed = "FAILED"
         const val Cancelled = "CANCELLED"
+    }
+
+    /** `phase` 列的取值，与 `domain.model.TranscriptPhase` 一一对应（转换在仓储实现里） */
+    object Phase {
+        const val Transcoding = "TRANSCODING"
+        const val Recognizing = "RECOGNIZING"
     }
 
     object ErrorCode {

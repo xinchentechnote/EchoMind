@@ -9,14 +9,17 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -29,7 +32,9 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -82,6 +87,25 @@ fun TranscriptScreen(
         }
     }
 
+    // 删除要确认：成功记录会连字幕一起删，这不是能随手点掉的事
+    var pendingDelete by remember { mutableStateOf<TranscriptJobRow?>(null) }
+    pendingDelete?.let { row ->
+        AlertDialog(
+            onDismissRequest = { pendingDelete = null },
+            title = { Text("删除转录记录") },
+            text = { Text(TranscriptDisplay.deleteConfirmText(row)) },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        viewModel.delete(row.id)
+                        pendingDelete = null
+                    },
+                ) { Text("删除", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("先不") } },
+        )
+    }
+
     Scaffold(
         modifier = modifier,
         snackbarHost = { SnackbarHost(snackbarHostState) },
@@ -99,6 +123,8 @@ fun TranscriptScreen(
                     title = state.titles[audioId] ?: "这本书",
                     existing = state.existingAsr[audioId] ?: ExistingAsr.None,
                     busy = state.isBusy,
+                    selectedModel = state.modelChoice,
+                    onModelSelected = viewModel::onModelSelected,
                     onStart = { force ->
                         viewModel.transcribe(audioId, force)
                         viewModel.clearTarget()
@@ -133,6 +159,7 @@ fun TranscriptScreen(
                             title = state.titles[row.audioId],
                             onCancel = { viewModel.cancel(row.id) },
                             onRetry = { viewModel.retry(row.id) },
+                            onDelete = { pendingDelete = row },
                         )
                     }
                 }
@@ -147,6 +174,8 @@ private fun StartCard(
     title: String,
     existing: ExistingAsr,
     busy: Boolean,
+    selectedModel: ModelChoice,
+    onModelSelected: (ModelChoice) -> Unit,
     onStart: (force: Boolean) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -159,6 +188,20 @@ private fun StartCard(
                 style = MaterialTheme.typography.bodySmall,
                 modifier = Modifier.padding(top = 6.dp),
             )
+            Text(
+                "识别模型",
+                style = MaterialTheme.typography.labelMedium,
+                modifier = Modifier.padding(top = 8.dp),
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 4.dp)) {
+                ModelChoice.entries.forEach { choice ->
+                    FilterChip(
+                        selected = selectedModel == choice,
+                        onClick = { onModelSelected(choice) },
+                        label = { Text(choice.label) },
+                    )
+                }
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 10.dp)) {
                 Button(onClick = { onStart(TranscriptDisplay.startNeedsForce(existing)) }, enabled = !busy) {
                     Text(TranscriptDisplay.startButtonLabel(existing))
@@ -175,6 +218,7 @@ private fun JobCard(
     title: String?,
     onCancel: () -> Unit,
     onRetry: () -> Unit,
+    onDelete: () -> Unit,
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(14.dp)) {
@@ -201,16 +245,19 @@ private fun JobCard(
                 modifier = Modifier.padding(top = 4.dp),
             )
 
-            // 分母未知时 progressLabel 给的是「已识别 N 段」而不是百分比；进度条只在真有分母时才画
+            // 进度条的分母是容器时长（解码一开始就知道）；容器没给时长就画不定长条，不编百分比
             TranscriptDisplay.progressLabel(row)?.let { label ->
                 Text(label, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 6.dp))
-                row.progress?.let { fraction ->
-                    if (row.status == TranscriptJobStatus.Running) {
-                        LinearProgressIndicator(
-                            progress = { fraction },
-                            modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
-                        )
-                    }
+            }
+            if (row.status == TranscriptJobStatus.Running) {
+                val fraction = row.progress
+                if (fraction != null) {
+                    LinearProgressIndicator(
+                        progress = { fraction },
+                        modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+                    )
+                } else {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth().padding(top = 6.dp))
                 }
             }
 
@@ -233,12 +280,20 @@ private fun JobCard(
                 }
             }
 
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 8.dp)) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+            ) {
                 if (TranscriptDisplay.cancellable(row.status)) {
                     FilledTonalButton(onClick = onCancel) { Text("取消") }
                 }
                 if (TranscriptDisplay.retryable(row.status)) {
                     Button(onClick = onRetry) { Text("重试") }
+                }
+                if (TranscriptDisplay.deletable(row.status)) {
+                    Spacer(modifier = Modifier.weight(1f))
+                    TextButton(onClick = onDelete) { Text("删除", color = MaterialTheme.colorScheme.error) }
                 }
             }
         }

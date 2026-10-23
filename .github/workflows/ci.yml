@@ -127,13 +127,18 @@ jobs:
             9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6 \
             app/src/main/assets/models/silero-vad/silero_vad.onnx
 
-      - name: 缓存并取回 libwma.so（WMA 解码，D40）
+      - name: 缓存并取回 libwma.so（WMA 解码 + LAME mp3 编码，D40/D44）
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # 自建的 FFmpeg 最小裁剪 JNI 库（LGPL-2.1-or-later），构建脚本见 docs/architecture.md D40。
-          # 私有仓库的 release 资产要带 token（gh 自带，经 env 注入）；哈希钉住，不匹配即失败。
+          # 自建的 FFmpeg 最小裁剪 + LAME JNI 库（LGPL），构建脚本见 app/libs/wma/README.md。
+          # ⚠ 2026-10-24 起 .so 换新（修超帧溢出 + 接入 LAME，D44）：1,329,656 B，
+          #   SHA-256 e12081cbbadca796e8dfbafe8a4bf7a98a6c1cd3272d66cd77f9b38ad15513b5。
+          #   **新 .so 尚未上传为 release 资产**——本步下载到的旧资产会被 app/build.gradle.kts 的
+          #   字节数闸门拒绝（这是设计好的失败方式，错误信息里就有新哈希与 README 指引）。
+          #   发布时把本机 app/libs/wma-jni/arm64-v8a/libwma.so 传成 release 资产
+          #   （建议名 libwma-arm64-v8a-e12081cb.so），再把下面两行的资产名与哈希换成新值。
           CACHE_DIR="$HOME/.cache/echomind-libs"
           mkdir -p "$CACHE_DIR" app/libs/wma-jni/arm64-v8a
           if [ ! -f "$CACHE_DIR/libwma.so" ]; then

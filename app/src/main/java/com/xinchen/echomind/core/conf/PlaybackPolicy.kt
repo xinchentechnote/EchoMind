@@ -18,6 +18,13 @@ object PlaybackPolicy {
     const val POSITION_FLUSH_INTERVAL_MS: Long = 10_000
 
     /**
+     * 转录进度写库节流（FR-507）。比播放位置的 10 s 密：转录进度条是用户盯着看的，
+     * 10 s 才跳一下会被当成卡住；2 s 仍满足「≥1s」的写库纪律（AGENTS.md §4），
+     * 一本 34 分钟的书整轮也只写几百行。
+     */
+    const val TRANSCRIPT_PROGRESS_INTERVAL_MS: Long = 2_000
+
+    /**
      * 两次位置上报之间允许计入 `consumed_audio_ms` 的最大正向步长。
      * tick 是 500ms，倍速 2.0 时一步最多 ~1000ms 音频；取 2000ms 留一倍余量。
      * 超过它的位置变化一律当作跳转（通知栏拖条、Media3 插值），不算「真听过」（FR-406）。
