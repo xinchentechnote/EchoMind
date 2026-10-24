@@ -922,8 +922,8 @@ ffmpeg 编码形态）。另外复核发现上一轮的 LAME mp3 支路从未真
   截图（宿主机 /tmp）：`shot-player-wma-phase1.png`、`shot-player-normal-book.png`、
   `shot-transcript-running1.png`、`shot-transcript-running3.png`、`shot-delete-dialog.png`、
   `shot-after-delete.png`、`shot-shelf-final.png`。
-- 诚实边界：**用户真机（nova 13）未连接本轮验证**，以上是 API 36 arm64 模拟器证据；新 libwma.so 也尚未
-  上传为 release 资产（CI 的取回步会被 Gradle 闸门按设计拦下，`ci.yml` 里留了替换指引）。真机复测清单：
+- 诚实边界：**用户真机（nova 13）未连接本轮验证**，以上是 API 36 arm64 模拟器证据；新 libwma.so 已随
+  v0.1.4 作为 release 资产 `libwma-arm64-v8a-e12081cb.so` 上传，`ci.yml` 已改为按新哈希取回。真机复测清单：
   0415 那本 WMA 直接点重试应能转完；旧版本积下的重复失败行会在启动时被收口成一行。
 
 ### 并发 3 路 + 一键转录 + 单曲循环 + 播放页重排（用户口径，2026-10-24 第二条）
@@ -955,6 +955,11 @@ ffmpeg 编码形态）。另外复核发现上一轮的 LAME mp3 支路从未真
   （~500 MB）；②车道满 → `retry` 的路径只有协调器/仓储用例，没有制造出「第四本书排队后自动接上」的 UI 现场（150 s 素材几秒
   就转完，来不及凑第四本）；③单曲循环的统计口径（`playback-design.md` §3.3 第 9 条）是代码推演 + 既有 SessionTracker 用例，
   没有专门跑一场跨圈会话对账。
+- **v0.1.4 发布包**（2026-10-24）：`versionCode=5` / `versionName=0.1.4`，debug APK **268,885,558 B**，APK SHA-256
+  `4beb36b35ce72009abb497cd4687107ba6806a9aa0db3517974fa54755a3cb21`，debug 证书 SHA-256
+  `b4f304ace4b3e211e31886f6a6d4b94147dfad7d650f9304b2b57f767871e3d6`（与 v0.1.3 同一把 key，可直接覆盖安装保数据；
+  安装后数据库走 v3→v4 迁移）。release 资产：`EchoMind-v0.1.4-debug.apk`、`libwma-arm64-v8a-e12081cb.so`
+  （1,329,656 B，SHA-256 `e12081cb…ad15513b5`，CI 取回用）。
 
 ### v0.1.3 热修：WMA 不再阻塞文件夹导入（用户真机反馈，2026-10-17）
 

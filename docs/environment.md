@@ -21,7 +21,7 @@
 | NDK | ~~未安装~~ → **r27c（27.2.12479018）**，2026-10-16 经 `sdkmanager "ndk;27.2.12479018"` 安装（自建 libwma.so 交叉编译用，见 §9） | `ls $ANDROID_HOME/ndk` |
 | Homebrew lame | 4.0（`/opt/homebrew/opt/lame`），2026-10-16 `brew install lame`（自建 ffmpeg 带 mp3 编码器、造静音素材用） | `brew list lame` |
 | 自建 FFmpeg | 6.1.1（`~/ffmpeg-build/`，四棵构建树：host 造 WMA 素材、host-mp3 造静音素材、build-arm64 交叉编 libwma、**build-lame-android 交叉编 LAME**（2026-10-24 新增，D44）） | `~/ffmpeg-build/build-host-mp3/ffmpeg -version`；`llvm-readelf -h ~/ffmpeg-build/build-lame-android/libmp3lame/.libs/libmp3lame.a` 必须是 AArch64 |
-| 自建 libwma.so | **1,329,656 B，SHA-256 `e12081cbbadca796e8dfbafe8a4bf7a98a6c1cd3272d66cd77f9b38ad15513b5`**（2026-10-24 重建，D44：修超帧溢出 + 接入 LAME；FFmpeg 裁剪 + LAME 3.100 静态链，`-Wl,-z,defs`、16 KB 页对齐；脚本全文 `app/libs/wma/README.md`）。**尚未传 release 资产**，CI 取回旧版会被 Gradle 闸门拦下 | `ls -l app/libs/wma-jni/arm64-v8a/libwma.so && shasum -a 256 app/libs/wma-jni/arm64-v8a/libwma.so` |
+| 自建 libwma.so | **1,329,656 B，SHA-256 `e12081cbbadca796e8dfbafe8a4bf7a98a6c1cd3272d66cd77f9b38ad15513b5`**（2026-10-24 重建，D44：修超帧溢出 + 接入 LAME；FFmpeg 裁剪 + LAME 3.100 静态链，`-Wl,-z,defs`、16 KB 页对齐；脚本全文 `app/libs/wma/README.md`）。已作为 v0.1.4 release 资产 `libwma-arm64-v8a-e12081cb.so` 上传，CI 按哈希取回 | `ls -l app/libs/wma-jni/arm64-v8a/libwma.so && shasum -a 256 app/libs/wma-jni/arm64-v8a/libwma.so` |
 | Gradle wrapper 发行缓存 | `gradle-8.14.6`、`gradle-9.4.1`、`gradle-9.6.0` | `ls $GRADLE_USER_HOME/wrapper/dists` |
 | 系统 gradle | `/opt/homebrew/bin/gradle` 9.4.1（跑在 homebrew openjdk 25 上） | `gradle --version` |
 | 运行中的设备 | `emulator-5554`：API 36 / arm64-v8a / 1080x2400 | `adb devices -l`、`getprop` |
@@ -200,7 +200,7 @@ adb shell am instrument -w -e package com.xinchen.echomind \
 ```
 
 构建脚本自带三道闸（缺文件直接 GradleException 并打印来源，见 `app/build.gradle.kts`）：
-sherpa-onnx AAR（38,691,998 B）、whisper/sense-voice 模型三件套（§9.4）、libwma.so（1,073,288 B）。
+sherpa-onnx AAR（38,691,998 B）、whisper/sense-voice 模型三件套（§9.4）、libwma.so（1,329,656 B，v0.1.4 资产 `libwma-arm64-v8a-e12081cb.so`）。
 CI（GitHub Actions）会自动取回这几样；本机照抄 `.github/workflows/ci.yml` 里对应步骤即可。
 
 ### 9.3 装到模拟器 / 真机
