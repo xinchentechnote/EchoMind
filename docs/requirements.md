@@ -68,6 +68,7 @@
 | FR-307 | 上一首/下一首按书架顺序，切歌时结束当前会话并开启新会话 | 会话表出现两条记录 | DONE：手动上下曲与自动切播都实测，会话表逐首分行、各自的 `play_count` 不串 |
 | FR-308 | 播放页显示当前音频信息（标题、进度、倍速、收藏） | — | DONE：页面跟随队列换标题/收藏/统计（`PlayerViewModelTest` + 设备实测） |
 | FR-309 | 启动后恢复上次位置（含播放到接近末尾时的「已听完」处理：从头播还是停在末尾，见 FR-407） | 冷启动后位置与退出前差 ≤ 10s | DONE：位置读写与「听完再进来从头播」由 `PlayerViewModelTest` 覆盖、DB 侧由仪器化测试覆盖；**设备冷启动实测（2026-10-15）**：`am force-stop` 时播放器在 61853ms、最后 flush 落库 58459ms，冷启动后从 58459ms 续播，差 **3394ms ≤ 10s**（上界即 `POSITION_FLUSH_INTERVAL_MS`）。数据与做法见 `testing.md` §4 Phase 5 |
+| FR-310 | **（2026-10-24 用户口径）单曲循环**：播放页可开/关，开着时当前这一首播完从头再放、不前进；全局设置，跨书与重启记住 | 开关后播放器 `repeatMode` 变化；杀进程重开仍为开 | **DONE（2026-10-24，模拟器已验证）**：`PlaybackController.setRepeatOne` → Media3 `REPEAT_MODE_ONE`，值存 `AppSettings.repeatOne`；通知栏改循环模式也同步回状态。统计口径不变（循环回头不开新会话，见 `playback-design.md` §3.3 第 9 条）。设备实测：chip 点选 → 杀进程重开仍选中 |
 
 ## 4. 播放记忆与统计（核心）
 
@@ -109,13 +110,15 @@
 抢不到的那本停在 `QUEUED`、一行字幕都不写，用例 `别的任务正在跑时第二本书的任务抢不到运行中的行` /
 `别的书正在跑时第二个协调器收手且不写字幕`，两条都对「去掉闸门」的构建证过伪）；②调度器改成全局单一唯一名 + `APPEND`，
 由 WorkManager 自己排队（**这一半没有用例**，但界面上看得见：两本书先后入队时同屏「转录中 + 排队中」）。新闸门的代价如实写：
-一行卡在 `RUNNING` 会把后续所有转录一起挡住，释放车道靠协调器 `settle` + worker 的 `FAILED(UNKNOWN)` 兜底 + 应用启动的 `recoverInterrupted()` |
+一行卡在 `RUNNING` 会把后续所有转录一起挡住，释放车道靠协调器 `settle` + worker 的 `FAILED(UNKNOWN)` 兜底 + 应用启动的 `recoverInterrupted()`。
+**2026-10-24 更新（D45/D46，见 FR-513/FR-514）**：重试改为新行顶掉旧行（一本书一行）；进度分母改为容器时长；闸门从「只许一行 RUNNING」放宽为 `COUNT(RUNNING) < ASR_MAX_CONCURRENT_JOBS`（3 路，多路共享一份引擎，不再是「两份模型并存」），车道满时 worker `retry`，调度器改回每任务一条唯一名（KEEP）——「一行卡住挡住所有」的代价随之变成「卡住一条车道」，另外两条照跑 |
 | FR-508 | 模型不可用/文件损坏/内存不足 → 明确错误文案与可执行动作（重新准备模型/重试），App 不崩溃且仍可播放 | 设备验证 | **PARTIAL（2026-10-15，UI 文案已落地并在设备上出现过 4 条分支）**：`error_code` 枚举 + `error_message` 存异常原文，`TranscriptJobRow.failure` 透出给 UI，`ui/transcript/TranscriptDisplay.failureGuide` 把 8 个 `TranscriptFailure` 逐个翻成「发生了什么 + 你能做什么」，卡片还把 `error_message` 原文照登成「原始信息：…」（**不加工、不美化**）。**写入方**（协调器）四条分支在 emulator 上被真跑出来（`TranscriptCoordinatorTest`）：`MODEL_MISSING`（模型目录空 → 且断言一行字幕都没写）、`DECODE_FAILED`（文件不在原位置 → 且断言它**在装载引擎之前就返回**，不为注定失败的活儿付 5 s 装载）、`PERMISSION_REVOKED`、`OUTPUT_UNRELIABLE`（静音素材 → 不给 SUCCESS、不给空字幕）。**UI 侧这一轮在设备上见到的**：`INTERRUPTED`（进程被杀后重启）、`OUTPUT_UNRELIABLE`（静音素材，文案里「丢弃比例超过 **20%**」那个数由 `AudioFormats.ASR_MAX_REJECTED_CHUNK_PERCENT` 渲染，不是写死字符串，并明说「宁可失败也不按字数均分时间」）、`CANCELLED`（中途取消）；失败之后 App 没崩、书架与播放页照常可用。JVM 用例 `每种失败都给得出一个动作` 逐分支断言文案里有可执行动作。**为什么不是 DONE**：①`OUT_OF_MEMORY` 分支只有代码、没用例也没设备证据（要真把堆撑爆才走得到）；②~~`MODEL_MISSING` 文案里的「请先在模型页准备好」**指向还不存在的页面**~~ → **模型页已存在（FR-901，2026-10-15 设置页 v1）**，文案不再指空（「删模型 → 出文案 → 按指引恢复」的完整闭环还没连起来走）；③「转录失败的同时点播放」这个动作没专门做过（只验了失败后播放页可用）|
 | FR-509 | 转录与播放互不阻塞（不同线程/不同资源；模型加载不在主线程） | 设备验证：播放中启动转录不卡顿 | **PARTIAL（2026-10-15）**：「模型加载不在主线程」已写成代码里的硬约束——`SherpaOnnxEngine.open()` 与 `VadSegmenter` 构造里各有一条 `check(Looper.myLooper() != Looper.getMainLooper())`（装载实测阻塞 3.0~4.9 s，放主线程就是 ANR），两条仪器化用例用 `runOnMainSync` 断言它当场抛 `IllegalStateException`；`TranscriptWorker` 用 `withContext(Dispatchers.IO)` 跑整轮，`EchoMindApp` 只有一个引擎句柄、用完即 `release()`（`try/finally`），不抢播放器资源（不同进程组件、不同解码器实例）。**「播放中启动转录不卡顿」仍未实测**：转录现在能从界面发起了（任务 #23 已落地），但验证转录时播放器没在放，也没采 `dumpsys gfxinfo`——能说的只有观察级证据（转录那 ~40 s 里底部标签还能切、卡片还能点取消、没有 ANR 弹窗）。且识别 RTF 只有模拟器数字，**两轮同一素材差 1.6 倍**（端到端 0.083/0.131，整首歌含装载三次独立跑 wall 42,965 / 33,453 / 63,714 ms，对 148 s 音频 ≈ RTF 0.29 / 0.23 / 0.43）。**内存峰值已在 AVD 上量到**（这台 AVD 总内存 2.42 GB，正好是目标机型量级）：转录期间峰值 PSS 442 MB、RSS 559 MB，曲线是「~260 MB 装载台阶 + 一条平线」（见 `docs/testing.md` §6b/§7）。**换真手机之后的 RTF 与是否被 lowmemorykiller 杀掉仍未测**，「播放 + 转录同时跑」的掉帧采样也仍是空白 |
 | FR-510 | **（2026-10-15 用户决策改为内置，原「下载或本地导入」口径作废）**模型随安装包内置；删除/损坏后可从安装包离线恢复；模型信息（名称/版本/文件清单/大小/SHA-256/来源）集中在清单里 | 清单里没有虚构值；来源标注清楚 | **DONE（按新口径，2026-10-15）**：清单在 `asr/ModelCatalog.kt`（数值由 `ModelCatalogTest` 钉住，`tokens.txt` 标 `officialSha256=null`）；三个文件随 APK `assets/models/<specId>/` 发布（构建脚本查存在+字节数，CI 按钉住哈希取回并 `sha256sum -c`）；`ModelManager.ensureProvisioned` 启动时把缺文件从 assets 拷进 filesDir（同样的 `.part` → 比大小 → 整份 SHA-256 → 改名规矩），`provision` 供设置页按钮恢复；来源记录 `apk_asset=<asset路径>` 落进 `download-provenance.properties`。设备实测（飞行模式）：删光模型 → 冷启动自动就位两包「已就绪」；再删 `model.int8.onnx` → 设置页「不可用」→ 点「从安装包恢复（232 MB）」→ 20 s 内回「已就绪」（`docs/testing.md` §4 Phase 6f）。原 `download`/`importFile` 代码与 JVM 测试保留为非产品路径，UI 无入口，文档不宣称可下载 |
 | FR-511 | ~~不把模型塞进 APK~~ → **2026-10-15 用户决策反转：模型直接内置，不依赖网络下载**（取舍见 `architecture.md` D39） | 模型文件在 `assets/` 里；APK 体积代价如实记录 | **DONE（2026-10-15）**：三个文件（243,371,218 + 75,756 + 643,854 B）随 `assets/models/` 发布（`.gitignore` 不入库，构建脚本缺失即失败，CI 按哈希取回）；调试 APK 40.9 MB → **267.5 MB**，安装后 `filesDir/models/` 再占一份 ~244 MB（内置方案的固有代价：assets 无法按路径打开，sherpa-onnx 只认文件路径，首次就位必须拷贝）。换来的是：无网络依赖（主清单无 `INTERNET`）、无首启下载等待、删除后可离线恢复 |
 | FR-512 | 当前产品只保证**普通话听书/书解**的字幕效果；首次播放、转录页手动发起、失败重试都固定使用带逐字时间戳的中文 Paraformer。英文音频与歌曲不作为当前能力，不提供模型选择或自动分类入口 | 代码审查：所有生产入口写同一个 `ModelCatalog.transcriptRef`；UI 明示范围；产品模型清单只有 Paraformer + VAD；升级前 `auto`/SenseVoice 排队行在推理前归一为 Paraformer | **DONE（2026-10-17）→ ⚠ 工作区（未提交，2026-10-24）与本文相悖**：转录页重新出现了「自动识别/中文书解/英文·歌曲」选择与 30 秒字符系别探测（`ModelRouting`/`probeTranscript`， 探测已挪到 `markRunning` 之后并配了设备用例 `自动选模型在抢到车道后探测并把行上的模型改写为真正执行的那个`）。要不要据此重新开放多语种**待用户拍板**；拍板前本文按 2026-10-17 的收口口径理解。英文与歌曲恢复条件见 D42 |
 | FR-513 | **（2026-10-24 用户口径）每个文件只保留一条转录记录，记录可删除；转录显示真实进度（含 WMA 转码阶段）；WMA 先转成 mp3 再识别** | 转录页同一本书只有一行；删除带确认且说明字幕连带删除；进度百分比在转码与识别两个阶段都随时间推进；34 分钟真实 WMA 从界面端到端转完 | **DONE（2026-10-24，D44/D45，模拟器已验证）**：入队/重试在事务里顶掉同书旧终态行（启动 `collapseHistory()` 收口升级前的重复行）；`delete()` 只删已结束的行并连带删该轮 ASR 字幕、书架状态回退（`TranscriptRepositoryTest` 6 条新用例）；`transcript_job` v4 加 `phase/position_ms/duration_ms`，进度 = 已解音频位置/容器时长，通知与两处 UI 同文案（`TranscriptDisplayTest` 8 条新用例）；WMA 转录管线改走 mp3（libwma 修超帧溢出 + LAME 接入，34 分钟用户素材 RTF 0.0056）。设备证据见 `docs/testing.md` §4 2026-10-24 条；**用户真机待装新包复测** |
+| FR-514 | **（2026-10-24 用户口径）一键转录 + 后台最多 3 个任务同时**：书架上需要转录（未转录/字幕已过期）的书旁边有小按钮一键入队；播放页无字幕且无任务时有「开始转录这本书」；同时在跑的转录最多 3 路，多的排队、轮到自动开始 | 书架点三本 → 转录页同屏三张「转录中」各自百分比；第四本留在排队中；模型只装一份 | **DONE（2026-10-24，模拟器已验证）**：`AudioFormats.ASR_MAX_CONCURRENT_JOBS = 3`，`markRunning` 的 SQL 车道计数守卫 + `SharedAsrEngines` 共享一份引擎（D46）；车道满时 worker `retry`（15 s 线性退避），调度器改为每任务一条唯一名。仪器化：`车道满时第N加1本书抢不到运行中的行` / `车道满时第四本书的协调器报LaneFull且不写字幕` / `两本书并发转录共享同一份引擎都能入库`（引擎装载 1 次）；JVM `RefCountedPoolTest` 5 条。设备实测：三本书一键发起同屏「识别中 83% / 79% / 87%」；坏文件转录失败后播放页出现「开始转录这本书」，点按重新入队且仍只有一行记录 |
 
 ## 6. 字幕切句与时间戳
 
@@ -134,7 +137,7 @@
 
 | ID | 需求 | 验收标准 |
 | --- | --- | --- |
-| FR-701 | 显示当前句前 ≤3 句 + 当前句 + 后 ≤3 句（最多 7 句）；首尾不足正常处理 | 单测：index 0 / 中间 / 末句 |
+| FR-701 | 显示当前句前后各若干句的窗口，**默认**前后各 3 句（七句）；首尾不足正常处理。**2026-10-24 起窗口按播放页字幕区的可用高度双向自适应**：手机屏放不下长句时收到当前句 ±1（`PlaybackPolicy.SUBTITLE_WINDOW_MIN_RADIUS`），大屏按能容纳的句数放大——字幕区占满剩余高度、不留空白也不裁句 | 单测：index 0 / 中间 / 末句；VM 单测：半径放大/收小都生效且不低于下限 |
 | FR-702 | 当前句高亮且尽量位于窗口中间（不足时贴边） | 目视 |
 | FR-703 | 定位用**二分查找**（`SubtitleSynchronizer`），不每次遍历全部字幕 | 单测 + 代码审查 |
 | FR-704 | 句间停顿期保持当前句稳定，不来回跳 | 单测：落在 gap 内的位置序列 |

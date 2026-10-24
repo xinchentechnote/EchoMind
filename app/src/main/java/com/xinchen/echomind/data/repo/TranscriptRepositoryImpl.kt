@@ -1,6 +1,7 @@
 package com.xinchen.echomind.data.repo
 
 import androidx.room.withTransaction
+import com.xinchen.echomind.core.conf.AudioFormats
 import com.xinchen.echomind.core.time.TimeSource
 import com.xinchen.echomind.data.db.AudioBookEntity
 import com.xinchen.echomind.data.db.EchoMindDatabase
@@ -116,10 +117,12 @@ class TranscriptRepositoryImpl(
     override suspend fun markRunning(jobId: String, totalSegments: Int): Boolean = db.withTransaction {
         val job = jobDao.getById(jobId) ?: return@withTransaction false
         val now = clock.wallMs()
-        if (jobDao.markRunning(jobId, now, totalSegments) == 0) return@withTransaction false
+        if (jobDao.markRunning(jobId, now, totalSegments, AudioFormats.ASR_MAX_CONCURRENT_JOBS) == 0) return@withTransaction false
         bookDao.setTranscriptionState(listOf(job.audioId), AudioBookEntity.TranscriptionState.Running, now)
         true
     }
+
+    override suspend fun runningCount(): Int = jobDao.runningCount()
 
     override suspend fun updateProgress(jobId: String, progress: TranscriptProgress): Boolean =
         jobDao.updateProgress(

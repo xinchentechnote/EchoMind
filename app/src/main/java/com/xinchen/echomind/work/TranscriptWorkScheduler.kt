@@ -2,6 +2,7 @@ package com.xinchen.echomind.work
 
 import android.content.Context
 import android.util.Log
+import androidx.work.BackoffPolicy
 import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
@@ -9,6 +10,7 @@ import androidx.work.workDataOf
 import com.xinchen.echomind.domain.model.TranscriptJobRow
 import com.xinchen.echomind.domain.transcript.TranscriptRepository
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 
 /**
  * 转录工作的入队与取消（FR-507）。
@@ -16,13 +18,16 @@ import java.util.UUID
  * WorkManager 的请求 id 会写回 `transcript_job.work_request_id`，所以取消能精确打到那一个请求；
  * 写不进去（行已经结束）就立刻把刚入队的请求撤掉——留着它只会白跑一遍推理。
  *
- * **唯一名是全局一个，不是每本书一个**（`docs/architecture.md` D36）：WorkManager 对同一唯一名下的工作
- * 严格排队，所以「同一时刻只有一个模型句柄」这条（AGENTS.md §3）由调度层保证，不需要进程内再加一把锁。
- * 两本书各自一个唯一名的版本会真的并发跑起两个 worker，各装一份 243 MB 的 int8 模型。
+ * **每个任务一条独立的唯一名**（`transcript-job-<jobId>`，D46，2026-10-24；此前是全局一条链 `transcript-series`
+ * 串行跑）：并发上限不再由 WorkManager 的排队语义保证，而是由 `markRunning` 的 SQL 车道计数
+ * （`AudioFormats.ASR_MAX_CONCURRENT_JOBS`）——抢不到车道的 worker 返回 `Result.retry()`，按下面的退避再来。
+ * 唯一名用 KEEP：同一行被重复调度（界面连点）时第二次是空操作，不会起两个 worker 抢同一行。
+ * 旧的全局链条不再使用；它曾因 `APPEND` 的「链被取消则后续连带取消」语义踩过雷（`docs/testing.md` §4 Phase 6g），
+ * 按任务独立之后这个问题自然不存在。
  *
  * **没有设 `setExpedited`**：加急请求受系统配额限制（每 App 每天几个），而转录一跑就是几十秒到几分钟，
- * 该走的路线是 `setForeground` 前台服务，不是加急。任务也不自动重试：`Result.failure` 之后由用户
- * 在转录页点重试（FR-507 的取舍：自动重跑会把「这台机器解不开这个文件」变成无限循环）。
+ * 该走的路线是 `setForeground` 前台服务，不是加急。任务也不自动重跑失败：失败由用户在转录页点重试
+ * （FR-507 的取舍：自动重跑会把「这台机器解不开这个文件」变成无限循环）；`retry()` 只用于「车道满、稍后再来」。
  */
 class TranscriptWorkScheduler(
     private val context: Context,
@@ -34,16 +39,11 @@ class TranscriptWorkScheduler(
         val workManager = WorkManager.getInstance(context)
         val request = OneTimeWorkRequestBuilder<TranscriptWorker>()
             .setInputData(workDataOf(TranscriptWorker.KEY_JOB_ID to jobId, TranscriptWorker.KEY_AUDIO_ID to audioId))
+            // 车道满时 worker 返回 retry：线性退避，首次 15 s（WorkManager 下限 10 s），每次多 15 s
+            .setBackoffCriteria(BackoffPolicy.LINEAR, LANE_RETRY_BACKOFF_SECONDS, TimeUnit.SECONDS)
             .addTag(TAG)
             .build()
-        // APPEND_OR_REPLACE：有活着（未结束）的链就排在后面；链条已死（最后一次被取消）就自愈成新链。
-        // 不能用 APPEND：WorkManager 的文档语义是「链条被取消后，APPEND 上去的新任务**连带取消**」——
-        // 实测踩过（docs/testing.md §4 Phase 6g）：用户取消过一次转录之后，后面所有入队全部卡在
-        // QUEUED 永远不跑（worker 根本不会被调度），而且这条只有真机/模拟器测得出来。
-        // REPLACE 单独用不行：它会把正在跑的那本掀掉（D36 更严重的错）。
-        // 原来 REPLACE 兜的「行已结束但请求还挂在队列里」这种残留也不再需要清：
-        // 它轮到自己跑时，协调器发现那一行不是 QUEUED，直接 Skipped，队列自己干净。
-        workManager.enqueueUniqueWork(UNIQUE_NAME, ExistingWorkPolicy.APPEND_OR_REPLACE, request)
+        workManager.enqueueUniqueWork(uniqueNameOf(jobId), ExistingWorkPolicy.KEEP, request)
         if (!repository.attachWorkRequest(jobId, request.id.toString())) {
             Log.w(TAG, "任务 $jobId 写不回 work_request_id（行已结束），撤掉刚入队的请求 ${request.id}")
             workManager.cancelWorkById(request.id)
@@ -69,7 +69,10 @@ class TranscriptWorkScheduler(
     companion object {
         private const val TAG = "transcript"
 
-        /** 全局唯一名：WorkManager 在同名序列里严格排队，一次只跑一个 worker（见类注释与 D36） */
-        const val UNIQUE_NAME = "transcript-series"
+        /** 车道满时的重试退避（秒）。与 `AudioFormats.ASR_MAX_CONCURRENT_JOBS` 搭配：一本书跑完就会有人在 ≤15 s 内接上 */
+        const val LANE_RETRY_BACKOFF_SECONDS = 15L
+
+        /** 每个任务一条唯一名（D46）；并发数由 SQL 车道守卫限制，不靠 WorkManager 排队 */
+        fun uniqueNameOf(jobId: String): String = "transcript-job-$jobId"
     }
 }

@@ -12,6 +12,9 @@ interface AppSettings {
 
     /** WMA 导入时的转码目标：true = MP3（LAME 编码），false = M4A/AAC（默认，兼容性最好） */
     var wmaTranscodeToMp3: Boolean
+
+    /** 单曲循环（FR-310）：播放页上切，跨书、跨进程记住；默认关 */
+    var repeatOne: Boolean
 }
 
 class SharedPreferencesAppSettings(context: Context) : AppSettings {
@@ -22,7 +25,12 @@ class SharedPreferencesAppSettings(context: Context) : AppSettings {
         get() = prefs.getBoolean(KEY_WMA_MP3, false)
         set(value) = prefs.edit().putBoolean(KEY_WMA_MP3, value).apply()
 
+    override var repeatOne: Boolean
+        get() = prefs.getBoolean(KEY_REPEAT_ONE, false)
+        set(value) = prefs.edit().putBoolean(KEY_REPEAT_ONE, value).apply()
+
     private companion object {
         const val KEY_WMA_MP3 = "wma_transcode_to_mp3"
+        const val KEY_REPEAT_ONE = "repeat_one"
     }
 }

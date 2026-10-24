@@ -174,10 +174,12 @@ v3 补 FK 的做法（`Migrations.MIGRATION_2_3`）：
 
 **实现现状（v4）**：DAO 是 `TranscriptJobDao`，每条跃迁语句都带 `WHERE status IN (...)` 守卫并返回受影响行数，所以重复结算第二次是 0 行、已取消的任务被 worker 写回 RUNNING 在 SQL 层面就改不动；0 行由 `TranscriptRepositoryImpl` 翻译成 `false` 交给调用方，而不是抛异常打断 worker。
 **这套守卫现在是生产代码的承重墙**：`asr/TranscriptCoordinator` 的「抢不到行就收手」完全建在上面——`markRunning` 除了 `WHERE status='QUEUED'`
-还带一条 `AND NOT EXISTS (SELECT 1 FROM transcript_job WHERE status='RUNNING' AND id <> :id)`，一条语句挡住三种情况：第二个 worker 抢跑、
-进程被杀后 WorkManager 复活 worker 而库里那行早已被 `recoverInterrupted()` 标成 `FAILED(INTERRUPTED)`、以及**另一本书正在跑时的并发转录**
-（全机同时只允许一行 RUNNING，见 `architecture.md` D36）。三条设备用例分别对应：`正在跑的行不会被第二个worker重复跑` /
-`重启后复活的worker不再覆盖中断结论` / `别的任务正在跑时第二本书的任务抢不到运行中的行`。
+还带一条 `AND (SELECT COUNT(*) FROM transcript_job WHERE status='RUNNING' AND id <> :id) < :maxConcurrent`（2026-10-24 起 D46，
+`maxConcurrent = AudioFormats.ASR_MAX_CONCURRENT_JOBS = 3`，多路任务共享一份引擎；此前是 D36 的 `NOT EXISTS (… RUNNING)`，即只许一行），
+一条语句挡住三种情况：第二个 worker 抢跑、进程被杀后 WorkManager 复活 worker 而库里那行早已被 `recoverInterrupted()` 标成 `FAILED(INTERRUPTED)`、
+以及**车道满时的并发转录**（协调器据此返回 `LaneFull`，worker 退避重试；行留在 QUEUED）。`runningCount()` 给 worker 起前台通知前预检用。
+三条设备用例分别对应：`正在跑的行不会被第二个worker重复跑` / `重启后复活的worker不再覆盖中断结论` / `车道满时第N加1本书抢不到运行中的行`
+（协调器侧：`车道满时第四本书的协调器报LaneFull且不写字幕`、`两本书并发转录共享同一份引擎都能入库`）。
 `updateModel`（自动选模型把 `auto` 改写为真正执行的模型）对 QUEUED **与 RUNNING** 的行有效——探测发生在 `markRunning` 之后（引擎句柄要先抢到车道），已结束的行仍不许改。
 唯一的例外是 `commitSubtitles()`：那条路径只有成功分支，跃迁失败意味着这批字幕不该落库，于是 `check` 抛出、事务回滚——宁可一句都不写，也不能留下「字幕是新的、任务还在 RUNNING」的账。
 状态跃迁与 `audio_book.transcription_state` 的写在同一个 `withTransaction` 里（§9），行为由 `TranscriptRepositoryTest`（**25 条**仪器化用例）覆盖。

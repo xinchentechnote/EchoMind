@@ -926,6 +926,36 @@ ffmpeg 编码形态）。另外复核发现上一轮的 LAME mp3 支路从未真
   上传为 release 资产（CI 的取回步会被 Gradle 闸门按设计拦下，`ci.yml` 里留了替换指引）。真机复测清单：
   0415 那本 WMA 直接点重试应能转完；旧版本积下的重复失败行会在启动时被收口成一行。
 
+### 并发 3 路 + 一键转录 + 单曲循环 + 播放页重排（用户口径，2026-10-24 第二条）
+
+**改动**（D46/D47，细节见 `architecture.md` §10）：①转录并发上限 `AudioFormats.ASR_MAX_CONCURRENT_JOBS = 3`，
+`markRunning` 改为 SQL 车道计数守卫，`asr/SharedAsrEngines` 让多路任务共享同一份模型句柄（引用计数，最后一路才卸载），
+协调器车道满返回 `LaneFull`、worker `Result.retry()`（15 s 线性退避），调度器从全局串行链改为每任务一条唯一名（KEEP）；
+②书架行上「未转录/已过期」的书旁边一个小「转录」按钮直接入队，播放页无字幕无任务时给「开始转录这本书」；
+③单曲循环：`PlaybackController.setRepeatOne` → `REPEAT_MODE_ONE`，`AppSettings.repeatOne` 持久化；
+④播放页字幕在上占满、面板在下收紧、当前句 `titleLarge` 加粗，字幕窗口按量出的高度双向自适应
+（`SUBTITLE_WINDOW_MIN_RADIUS = 1` 到更多）。
+
+**验证结果**：
+
+- JVM：**290 / 0 / 0**（新增 `RefCountedPoolTest` 5 条：同 key 只装一次 / 释放幂等 / 不同 key 独立 / 打开失败不入池 /
+  8 线程并发首次申请只装一份；`PlayerViewModelTest` 新增单曲循环切换、窗口半径双向调整、一键转录出口 3 条）。
+- 仪器化（`am instrument -e class`，`Migration_3_4_Test` + `TranscriptRepositoryTest` + `TranscriptCoordinatorTest`）：**41 / 0**，
+  42.6 s。关键证据：`两本书并发转录共享同一份引擎都能入库`——mp3 + WMA 两路并发 **wall 7,430 ms，两路都 Committed
+  （24 句 / 27 句），引擎装载 1 次，租约全部归还**；`车道满时第四本书的协调器报LaneFull且不写字幕`（三条车道占满后第四本
+  留在 QUEUED、无开始时间）；仓储 `车道满时第N加1本书抢不到运行中的行`（N 路进、N+1 拒、一路结算后放行，`runningCount` 对账）。
+- 真实 UI（emulator-5554）：①书架三本「未转录」行尾各有「转录」小按钮（已有字幕的书没有）；连点三下 → 转录页**同屏三张
+  「转录中」**：识别中 83% / 79% / 87%（截图 `/tmp/shot-transcript-3concurrent.png`）；②播放页新布局：字幕卡占满上部、
+  当前句大字加粗高亮、上下文各一句（手机屏按估算收到 ±1，不裁句）、面板四行在底部、「单曲循环」chip 在倍速行首
+  （`shot-player-new-layout2.png`）；③点「单曲循环」→ chip 选中 → `am force-stop` 重开进播放页仍选中（持久化）；
+  ④坏文件（随机字节的 .mp3）导入后首播自动转录快速失败，播放页出现「转录未完成：这个文件解不出音频…」+
+  「开始转录这本书」按钮 + 本书自己的「无法播放」；点按钮 → 转录页该书只有一行、时间「刚刚」（一本书一行仍成立）。
+  全程 logcat 无 FATAL。
+- 诚实边界：①三路并发在模拟器（8 核、2.4 GB）上验证，低内存真机未测；`auto` 路由会让 SenseVoice 与 Paraformer 同时在内存
+  （~500 MB）；②车道满 → `retry` 的路径只有协调器/仓储用例，没有制造出「第四本书排队后自动接上」的 UI 现场（150 s 素材几秒
+  就转完，来不及凑第四本）；③单曲循环的统计口径（`playback-design.md` §3.3 第 9 条）是代码推演 + 既有 SessionTracker 用例，
+  没有专门跑一场跨圈会话对账。
+
 ### v0.1.3 热修：WMA 不再阻塞文件夹导入（用户真机反馈，2026-10-17）
 
 **复现与根因**：v0.1.2 首次把 WMA 纳入扫描白名单，同时在 `AudioRepositoryImpl.importFolder()` 返回前同步执行

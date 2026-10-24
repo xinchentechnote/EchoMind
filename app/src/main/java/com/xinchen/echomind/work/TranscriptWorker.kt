@@ -13,6 +13,7 @@ import androidx.work.WorkerParameters
 import com.xinchen.echomind.EchoMindApp
 import com.xinchen.echomind.R
 import com.xinchen.echomind.asr.TranscriptOutcome
+import com.xinchen.echomind.core.conf.AudioFormats
 import com.xinchen.echomind.domain.model.TranscriptFailure
 import com.xinchen.echomind.domain.model.TranscriptPhase
 import com.xinchen.echomind.domain.model.TranscriptProgress
@@ -46,6 +47,13 @@ class TranscriptWorker(
         val bookTitle = graph.audioRepository.transcriptionTarget(audioId)?.title
             ?: applicationContext.getString(R.string.app_name)
         val notificationId = jobId.hashCode()
+
+        // 车道满（同时在跑的已达上限，D46）就直接改天再来，别先起个前台通知再撤——那会在通知栏闪一下。
+        // 这只是预检，真正的闸在 markRunning 的 SQL 里；并发窄缝里漏过去的由协调器的 LaneFull 兜回 retry
+        if (repository.runningCount() >= AudioFormats.ASR_MAX_CONCURRENT_JOBS) {
+            Log.i(TAG, "车道满（${AudioFormats.ASR_MAX_CONCURRENT_JOBS} 路都在跑），任务 $jobId 稍后重试")
+            return Result.retry()
+        }
 
         createChannel()
         try {
@@ -97,6 +105,12 @@ class TranscriptWorker(
             // 用户点了取消：库里那行已经是 CANCELLED（是 `cancel()` 改的，不是这里），worker 收工。
             // 这套 API 没有 Result.cancelled()，而取消路径上系统不采信返回值，给 success 不说谎
             TranscriptOutcome.Cancelled -> Result.success()
+
+            // 车道满：行仍是 QUEUED，必须 retry 让 WorkManager 按退避再调度一次，否则这一行永远排队
+            is TranscriptOutcome.LaneFull -> {
+                Log.i(TAG, "车道满（${outcome.running} 路在跑），任务 $jobId 稍后重试")
+                Result.retry()
+            }
 
             // 这一行已经被别人（启动恢复 / 取消）结算掉了，重跑没有意义
             is TranscriptOutcome.Skipped -> {

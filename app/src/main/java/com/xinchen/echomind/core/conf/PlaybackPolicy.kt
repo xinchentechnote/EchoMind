@@ -39,8 +39,14 @@ object PlaybackPolicy {
 
     const val SKIP_STEP_MS: Long = 15_000
 
-    /** 七句窗口：当前句前后各 3 句（FR-701） */
+    /** 字幕窗口的默认半径（当前句前后各几句）：七句窗口（FR-701）；播放页会按可用高度在 [SUBTITLE_WINDOW_MIN_RADIUS] 与更大值之间自适应 */
     const val SUBTITLE_WINDOW_RADIUS: Int = 3
+
+    /**
+     * 字幕窗口半径的下限（FR-701 注记，2026-10-24）：手机屏放不下七句长句时允许收到「当前句 ± 1」，
+     * 大屏则按高度放大——窗口大小由页面量出来的空间决定，不再是固定七句。
+     */
+    const val SUBTITLE_WINDOW_MIN_RADIUS: Int = 1
 
     val SPEED_STEPS: List<Float> = listOf(0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
     const val DEFAULT_SPEED: Float = 1.0f

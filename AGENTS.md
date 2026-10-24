@@ -32,7 +32,7 @@ source ~/android-dev/env.sh        # 第一步，永远不能省
 - 包分层：`core` / `domain` / `data` / `playback` / `asr` / `work` / `ui`。
 - **`domain` 包禁止 import 任何 `android.*` / Media3 / Room 类型**。这是「统计与字幕算法能在 JVM 单测里跑」的前提，破坏它等于删掉测试能力。
 - `ui` 层禁止：构造 `ExoPlayer`、直接查 DAO、跑推理。UI 只吃 `PlaybackController` 接口与 ViewModel 的 `StateFlow`。
-- 全 App 只有一个 `ExoPlayer` 实例（`PlayerHolder`）、同一时刻只有一个 ASR 引擎句柄。
+- 全 App 只有一个 `ExoPlayer` 实例（`PlayerHolder`）；ASR 引擎**按模型只装一份句柄**（`asr/SharedAsrEngines` 引用计数共享，最后一路释放才卸载，D46），并发转录任务数只在 `AudioFormats.ASR_MAX_CONCURRENT_JOBS` 一处定义（当前 3）——不许绕开共享池自己 `SherpaOnnxEngine.open`。
 - 阈值/常量只允许一处定义：`core/conf/PlaybackPolicy.kt`、`core/conf/AudioFormats.kt`、`asr/ModelCatalog.kt`。UI 上的规则说明文案必须由这些常量渲染，不许另写死字符串。
 - 手工 DI（`AppGraph`）。不引 Hilt/Koin/KAPT；不引入未经实测的大型框架（FFmpeg、ExoPlayer 之外的解码库、图片加载库等）——先证明系统能力不足，再在文档里记录理由后引入。
 

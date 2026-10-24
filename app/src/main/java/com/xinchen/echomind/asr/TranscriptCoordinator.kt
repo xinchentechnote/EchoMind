@@ -44,9 +44,10 @@ import java.util.UUID
  * 1. **不合格的字直接丢，不补时间**（§8 第一行）。`TokenTimingMapper.Mismatch` 抛出来的那块没有可用时间，
  *    均分填洞是 AGENTS.md §5 禁止的行为；丢弃比例过高时整本标 `OUTPUT_UNRELIABLE`，而不是交一份满是洞的「成功」。
  * 2. **状态跃迁全靠仓储的守卫**。`markRunning` 返回 false 有两种：这一行已经被取消/已结算
- *    （进程被杀后 WorkManager 会重跑 worker，而库里那行已是 FAILED），或者**别的任务正占着唯一的车道**
- *    （D36：一份 int8 模型 243 MB，同时开两份不是慢而是 OOM）。两种都立刻收手、一行都不写，
- *    而且收手发生在**任何**模型装载之前——语言探测（SenseVoice 226 MB）也排在它后面，同一个理由。
+ *    （进程被杀后 WorkManager 会重跑 worker，而库里那行已是 FAILED）→ `Skipped`；或者**车道满了**
+ *    （同时在跑的任务已达 `AudioFormats.ASR_MAX_CONCURRENT_JOBS`，D46）→ `LaneFull`，worker 稍后重试。
+ *    两种都立刻收手、一行都不写，而且收手发生在**任何**模型装载之前——语言探测（SenseVoice 226 MB）
+ *    也排在它后面。引擎本身是 `SharedAsrEngines` 里按模型共享的一份句柄（并发任务共用，最后一路释放时才卸载）。
  * 3. **进度的分母是容器时长，不是段数**。解码一开始就知道时长，所以百分比从第一秒起就是真的；
  *    容器没给时长（极少数）就不显示百分比（FR-507；假进度比没有进度更糟）。
  * 4. **WMA 的转码也算进度**（阶段 `Transcoding`）：一本 34 分钟的书转码要一两分钟，这段时间不能让用户对着 0%。
@@ -70,6 +71,11 @@ class TranscriptCoordinator(
      * lambda 接缝：`audio_book` 的 DAO 不该出现在 asr 包里，和 `AsyncWmaImportPreparer.onPrepared` 同一个形状。
      */
     private val onWmaPrepared: suspend (audioId: String, uri: String, durationMs: Long) -> Unit = { _, _, _ -> },
+    /**
+     * 识别引擎共享池（D46）：多路并发任务共用同一份模型句柄，最后一路释放时才真卸载。
+     * 生产装配传 `AppGraph` 里那一个（协调器本身也是单例，并发 run 共享它）；测试默认各自一个。
+     */
+    private val engines: SharedAsrEngines = SharedAsrEngines(modelsRoot),
 ) {
 
     /**
@@ -115,9 +121,13 @@ class TranscriptCoordinator(
             if (requested.id == ModelCatalog.AUTO_MODEL_ID) null else ModelCatalog.specForFinal(requested)
 
         if (!repository.markRunning(jobId, 0)) {
-            return TranscriptOutcome.Skipped(
-                "任务 $jobId 没能进入运行态（已被取消、已结算，或**别的任务正占着模型句柄**），本轮收手",
-            )
+            // 两种抢不到：行已被取消/结算（跳过），或车道满了（行仍是 QUEUED，稍后再来——D46 的 N 路上限）
+            val still = repository.jobById(jobId)
+            return if (still?.status == TranscriptJobStatus.Queued) {
+                TranscriptOutcome.LaneFull(repository.runningCount())
+            } else {
+                TranscriptOutcome.Skipped("任务 $jobId 没能进入运行态（已被取消或已结算），本轮收手")
+            }
         }
 
         val throttle = ProgressThrottle(clock)
@@ -150,15 +160,15 @@ class TranscriptCoordinator(
             resolved
         }
 
-        val engine = try {
-            SherpaOnnxEngine.open(modelsRoot, spec)
+        val lease = try {
+            engines.acquire(spec)
         } catch (e: AsrModelNotReadyException) {
             return fail(jobId, TranscriptFailure.ModelMissing, e.message ?: "识别模型不可用")
         }
         val run = try {
-            Attempt(engine = engine, vadModel = vadModel, target = target, durationMs = source.durationMs, throttle = throttle)
+            Attempt(lease = lease, vadModel = vadModel, target = target, durationMs = source.durationMs, throttle = throttle)
         } catch (e: Exception) {
-            engine.release()
+            lease.release()
             return fail(jobId, TranscriptFailure.ModelMissing, "VAD 打不开（${vadModel.path}）：${e.javaClass.simpleName} ${e.message}")
         }
         val outcome: TranscriptOutcome = try {
@@ -333,12 +343,13 @@ class TranscriptCoordinator(
      * Paraformer）——探测挂了不该挡住一次本来合法的转录。解码来源与正式识别同一份（WMA 已是 mp3）。
      */
     private fun probeTranscript(source: Source, isCancelled: () -> Boolean): String? {
-        val engine = try {
-            SherpaOnnxEngine.open(modelsRoot, ModelCatalog.senseVoice)
+        val lease = try {
+            engines.acquire(ModelCatalog.senseVoice)
         } catch (e: Exception) {
             Log.w(TAG, "语言探测引擎装载失败，按默认模型继续：${e.message}")
             return null
         }
+        val engine = lease.value
         val result: String? = try {
             val transcript = StringBuilder()
             val collected = mutableListOf<FloatArray>()
@@ -371,7 +382,7 @@ class TranscriptCoordinator(
             Log.w(TAG, "语言探测失败，按默认模型继续：${e.message}")
             null
         } finally {
-            engine.release()
+            lease.release()
         }
         return result
     }
@@ -413,16 +424,18 @@ class TranscriptCoordinator(
 
     /**
      * 一次跑的中间状态。做成一个对象只为两件事：`release()` 成对（AGENTS.md §5），
-     * 以及把「VAD 与引擎跟着这次跑走」写死——识别引擎全 App 同一时刻只许一个句柄，装载要花几秒，不能逐段开。
+     * 以及把「VAD 与引擎租约跟着这次跑走」写死——引擎是池里共享的那一份（D46），这里持有的是租约，
+     * 释放租约不等于卸载模型（别的任务可能还在用）；VAD 很小，每路自己一份。
      */
     private class Attempt(
-        val engine: SherpaOnnxEngine,
+        val lease: RefCountedPool<ModelSpec, SherpaOnnxEngine>.Lease,
         vadModel: File,
         val target: TranscriptionTarget,
         /** 容器时长（进度分母），未知 -1 */
         val durationMs: Long,
         val throttle: ProgressThrottle,
     ) {
+        val engine: SherpaOnnxEngine get() = lease.value
         val vad: VadSegmenter = VadSegmenter(vadModel)
         val segments = mutableListOf<RecognizedSegment>()
         var totalChunks = 0
@@ -436,7 +449,7 @@ class TranscriptCoordinator(
 
         fun releaseAll() {
             runCatching { vad.release() }
-            runCatching { engine.release() }
+            runCatching { lease.release() }
         }
 
         fun summaryLine(): String {
@@ -462,6 +475,12 @@ sealed interface TranscriptOutcome {
 
     /** 这一行不归我跑（行没了、状态不是 QUEUED、被取消或被重启结算过）：什么都没写 */
     data class Skipped(val reason: String) : TranscriptOutcome
+
+    /**
+     * 车道满了（同时在跑的任务已达 `AudioFormats.ASR_MAX_CONCURRENT_JOBS`，D46）：行仍是 QUEUED，什么都没写，
+     * worker 该稍后重试而不是放弃——放弃会让这一行永远排队。
+     */
+    data class LaneFull(val running: Int) : TranscriptOutcome
 
     data object Cancelled : TranscriptOutcome
 

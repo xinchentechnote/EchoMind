@@ -7,6 +7,7 @@ import android.util.Log
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.xinchen.echomind.core.conf.AudioFormats
 import com.xinchen.echomind.core.conf.PlaybackPolicy
 import com.xinchen.echomind.core.time.TimeSource
 import com.xinchen.echomind.data.db.AudioBookEntity
@@ -29,6 +30,8 @@ import com.xinchen.echomind.domain.model.TranscriptPhase
 import com.xinchen.echomind.domain.model.TranscriptProgress
 import java.io.File
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.After
@@ -266,24 +269,59 @@ class TranscriptCoordinatorTest {
      * 「之前」这件事由 `started_at_ms` 为空证明——`markRunning` 就排在装载前面，抢不到车道就没有开始时间。
      */
     @Test
-    fun 别的书正在跑时第二个协调器收手且不写字幕() = runBlocking {
-        val running = enqueueBook(fileUriOf(DeviceAsrFixtures.REAL_MP3), durationMs = DeviceAsrFixtures.REAL_MP3_DURATION_MS)
-        assertTrue(repository.markRunning(running, totalSegments = 0))
+    fun 车道满时第四本书的协调器报LaneFull且不写字幕() = runBlocking {
+        // 先把 N 条车道占满（N = ASR_MAX_CONCURRENT_JOBS）：这些行只需要是 RUNNING，不必真解码；
+        // `audio_book.uri` 上有唯一索引，所以每本书换一个占位 uri
+        val lanes = (1..AudioFormats.ASR_MAX_CONCURRENT_JOBS).map { n ->
+            enqueueBook("file:///lane-$n.mp3", audioId = "lane-$n").also { id ->
+                assertTrue("第 $n 条车道该能进", repository.markRunning(id, totalSegments = 0))
+            }
+        }
 
-        // 第二本书必须换一个 uri（`audio_book.uri` 上有唯一索引，同一份文件不能挂两本书）。
-        // 这里用静音那份负例：它只是「另一本书」的占位，本轮根本走不到解码——收手在装载模型之前。
-        val second = enqueueBook(fileUriOf(DeviceAsrFixtures.SILENT_WAV), audioId = "b")
-        val outcome = coordinator().run(second)
-        val skipped = outcome as? TranscriptOutcome.Skipped
-            ?: error("第二本书竟然跑起来了（那就是两个引擎并存）：$outcome")
-        assertTrue("收手的理由要说清是抢不到运行态：${skipped.reason}", skipped.reason.contains("没能进入运行态"))
+        // 第 N+1 本：静音负例只是「另一本书」的占位，本轮根本走不到解码——收手在装载模型之前
+        val extra = enqueueBook(fileUriOf(DeviceAsrFixtures.SILENT_WAV), audioId = "b")
+        val outcome = coordinator().run(extra)
+        val laneFull = outcome as? TranscriptOutcome.LaneFull
+            ?: error("第 ${AudioFormats.ASR_MAX_CONCURRENT_JOBS + 1} 本书竟然跑起来了（车道闸失效）：$outcome")
+        assertEquals(AudioFormats.ASR_MAX_CONCURRENT_JOBS, laneFull.running)
 
-        val row = jobRow(second)
-        assertEquals(TranscriptJobEntity.Status.Queued, row.status)
+        val row = jobRow(extra)
+        assertEquals("车道满时行必须留在 QUEUED（worker 据此 retry）", TranscriptJobEntity.Status.Queued, row.status)
         assertNull("没抢到车道不该有开始时间：$row", row.startedAtMs)
         assertEquals(0, db.subtitleSegmentDao().getByAudio("b").size)
-        // 第一本那一行不受影响：别人收手不该顺手把正在跑的那轮结算掉
-        assertEquals(TranscriptJobEntity.Status.Running, jobRow(running).status)
+        // 正在跑的那几行不受影响：别人收手不该顺手把正在跑的那轮结算掉
+        lanes.forEach { assertEquals(TranscriptJobEntity.Status.Running, jobRow(it).status) }
+    }
+
+    /**
+     * D46：多路并发**共享同一份引擎**。两本书（一本 mp3、一本 WMA）同时跑完都入库，而模型只装了一次——
+     * 这就是「3 个任务同时」不等于「3 份 243 MB」的证据。用同一个协调器实例，和生产里的单例一样。
+     */
+    @Test
+    fun 两本书并发转录共享同一份引擎都能入库() = runBlocking {
+        val mp3Job = enqueueBook(fileUriOf(DeviceAsrFixtures.REAL_MP3), audioId = "a", fileName = "a.mp3")
+        val wmaJob = enqueueBook(fileUriOf(DeviceAsrFixtures.REAL_WMA), audioId = "b", fileName = "b.wma")
+        val engines = SharedAsrEngines(modelsRoot)
+        val store = WmaPlaybackStore(File(context.cacheDir, "coordinator-concurrent-${System.nanoTime()}"))
+        val coordinator = TranscriptCoordinator(
+            context, audioRepository, grants, repository, modelsRoot, SteppingClock(),
+            wmaStore = store, engines = engines,
+        )
+
+        val startedAt = SystemClock.elapsedRealtime()
+        val outcomes = listOf(mp3Job, wmaJob).map { jobId ->
+            async(Dispatchers.IO) { coordinator.run(jobId) }
+        }.awaitAll()
+        Log.i(TAG, "并发两路：$outcomes，wall=${SystemClock.elapsedRealtime() - startedAt} ms，引擎装载 ${engines.opened} 次")
+
+        outcomes.forEach { assertTrue("并发里有一路没跑成：$it", it is TranscriptOutcome.Committed) }
+        assertEquals("两路共用一份模型，只该装载一次", 1, engines.opened)
+        assertEquals("跑完必须把租约都还回去", 0, engines.activeLeases(ModelCatalog.paraformer))
+        assertEquals(TranscriptJobEntity.Status.Success, jobRow(mp3Job).status)
+        assertEquals(TranscriptJobEntity.Status.Success, jobRow(wmaJob).status)
+        assertTrue(db.subtitleSegmentDao().getByAudio("a").isNotEmpty())
+        assertTrue(db.subtitleSegmentDao().getByAudio("b").isNotEmpty())
+        assertTrue(store.isReady("b", "mp3"))
     }
 
     /**

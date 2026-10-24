@@ -5,6 +5,7 @@ import android.content.Intent
 import androidx.room.Room
 import com.xinchen.echomind.asr.ModelCatalog
 import com.xinchen.echomind.asr.ModelManager
+import com.xinchen.echomind.asr.SharedAsrEngines
 import com.xinchen.echomind.asr.TranscriptCoordinator
 import com.xinchen.echomind.asr.WmaTranscoder
 import com.xinchen.echomind.core.time.AndroidTimeSource
@@ -115,6 +116,8 @@ class EchoMindApp : Application() {
         val transcriptRepository = TranscriptRepositoryImpl(db, timeSource)
         val modelsRoot = File(filesDir, ModelCatalog.MODELS_DIR_NAME)
         val liveTranscriptStore = LiveTranscriptStore()
+        // D46：识别引擎按模型共享一份句柄，多路并发转录共用；放在图里是为了协调器与任何将来的调用方拿到同一个池
+        val sharedEngines = SharedAsrEngines(modelsRoot)
         graph = AppGraph(
             database = db,
             timeSource = timeSource,
@@ -141,6 +144,7 @@ class EchoMindApp : Application() {
                 onWmaPrepared = { audioId, uri, durationMs ->
                     db.audioBookDao().setPreparedDuration(audioId, uri, durationMs, timeSource.wallMs())
                 },
+                engines = sharedEngines,
             ),
             transcriptWork = TranscriptWorkScheduler(this, transcriptRepository),
             liveTranscriptStore = liveTranscriptStore,
@@ -154,6 +158,9 @@ class EchoMindApp : Application() {
                 // MediaSessionService 只在有 controller 绑定时才被系统创建；本 App 的 UI 不绑 controller，
                 // 所以每场会话开始时自己拉一次，否则没有会话注册也没有通知栏（实测）。
                 startSessionService = { startService(Intent(this, EchoMindMediaService::class.java)) },
+                // 单曲循环是全局设置：开机取回上次的值，切换时写回（FR-310）
+                initialRepeatOne = appSettings.repeatOne,
+                onRepeatOneChanged = { appSettings.repeatOne = it },
             ),
             appScope = appScope,
             playbackScope = playbackScope,

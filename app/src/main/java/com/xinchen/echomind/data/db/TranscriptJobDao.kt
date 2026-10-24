@@ -61,16 +61,21 @@ interface TranscriptJobDao {
     /**
      * QUEUED → RUNNING。分段总数此时才由 VAD 的结果填进去。
      *
-     * `NOT EXISTS (... status = 'RUNNING')` 是**全机同时只跑一个转录**的那道闸：模型句柄一份 243 MB，
-     * 两本书同时开就是 OOM（AGENTS.md §3，`docs/architecture.md` D36）。守卫写在 SQL 里而不是「先查再改」，
-     * 因为查与改之间正是并发窗口；0 行由仓储翻成 `false`，协调器据此在装载模型之前就收手。
+     * `(SELECT COUNT(*) … RUNNING AND id <> :id) < :maxConcurrent` 是**全机同时最多跑 N 个转录**的那道闸
+     * （N = `AudioFormats.ASR_MAX_CONCURRENT_JOBS`，多路共享同一份引擎，D46）。守卫写在 SQL 里而不是「先查再改」，
+     * 因为查与改之间正是并发窗口——N 个 worker 同时起跑时，只有前 N 个能把这条 UPDATE 改成 1 行；
+     * 0 行由仓储翻成 `false`，协调器据此在装载模型之前就收手（车道满 = 稍后重试，行已结算 = 跳过）。
      */
     @Query(
         "UPDATE transcript_job SET status = 'RUNNING', started_at_ms = :startedAtMs, total_segments = :totalSegments " +
             "WHERE id = :id AND status = 'QUEUED' " +
-            "AND NOT EXISTS (SELECT 1 FROM transcript_job WHERE status = 'RUNNING' AND id <> :id)",
+            "AND (SELECT COUNT(*) FROM transcript_job WHERE status = 'RUNNING' AND id <> :id) < :maxConcurrent",
     )
-    suspend fun markRunning(id: String, startedAtMs: Long, totalSegments: Int): Int
+    suspend fun markRunning(id: String, startedAtMs: Long, totalSegments: Int, maxConcurrent: Int): Int
+
+    /** 正在跑的行数（worker 起前台通知前先看一眼车道，免得通知闪一下又因为车道满退出） */
+    @Query("SELECT COUNT(*) FROM transcript_job WHERE status = 'RUNNING'")
+    suspend fun runningCount(): Int
 
     /** RUNNING → SUCCESS。done 一并写终值，免得最后一块的进度没来得及节流写库 */
     @Query(

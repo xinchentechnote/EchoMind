@@ -1,6 +1,7 @@
 package com.xinchen.echomind.ui.player
 
 import android.net.Uri
+import com.xinchen.echomind.core.conf.PlaybackPolicy
 import com.xinchen.echomind.data.db.ImportedFolderEntity
 import com.xinchen.echomind.data.db.RecentSessionRow
 import com.xinchen.echomind.data.db.ShelfRow
@@ -136,6 +137,9 @@ class PlayerViewModelTest {
         override fun setSpeed(speed: Float) = Unit
         override fun next() = Unit
         override fun previous() = Unit
+        override fun setRepeatOne(enabled: Boolean) {
+            state.value = state.value.copy(repeatOne = enabled)
+        }
         override fun stop() {
             state.value = state.value.copy(isPlaying = false)
         }
@@ -180,6 +184,7 @@ class PlayerViewModelTest {
         override suspend fun jobById(jobId: String): TranscriptJobRow? = unsupported()
         override suspend fun retry(jobId: String, model: TranscriptModelRef): EnqueueOutcome = unsupported()
         override suspend fun markRunning(jobId: String, totalSegments: Int): Boolean = unsupported()
+        override suspend fun runningCount(): Int = 0
         override suspend fun updateProgress(jobId: String, progress: TranscriptProgress): Boolean = unsupported()
         override suspend fun commitSubtitles(jobId: String, segments: List<SubtitleSegment>, totalSegments: Int): Int = unsupported()
         override suspend fun markFailed(jobId: String, failure: TranscriptFailure, message: String?): Boolean = unsupported()
@@ -456,6 +461,55 @@ class PlayerViewModelTest {
         assertTrue(queued.contains("排队"))
         assertTrue(!queued.contains("段"))
         assertNull(liveStatusLine(null, 5))
+    }
+
+    // -- 单曲循环 / 窗口半径 / 一键转录（2026-10-24）------------------------------------------
+
+    @Test
+    fun `单曲循环切换走控制器并反映在播放态里`() = runTest {
+        val h = Harness()
+        advanceUntilIdle()
+        assertFalse(h.vm.playback.value.repeatOne)
+        h.vm.toggleRepeatOne()
+        assertTrue(h.vm.playback.value.repeatOne)
+        h.vm.toggleRepeatOne()
+        assertFalse(h.vm.playback.value.repeatOne)
+    }
+
+    @Test
+    fun `字幕窗口按页面给的半径双向调整且不低于下限`() = runTest {
+        val segments = (0 until 30).map { seg(it, it * 1_000L, "句$it") }
+        val h = Harness(subtitles = FakeSubtitleRepo(mapOf("a" to segments)))
+        advanceUntilIdle()
+        h.controller.seekTo(15_000)
+        advanceUntilIdle()
+        assertEquals("句15", h.vm.subtitles.value.current?.text)
+        assertEquals(PlaybackPolicy.SUBTITLE_WINDOW_RADIUS, h.vm.subtitles.value.after.size)
+
+        h.vm.setWindowRadius(8)
+        advanceUntilIdle()
+        assertEquals(8, h.vm.subtitles.value.before.size)
+        assertEquals(8, h.vm.subtitles.value.after.size)
+        assertEquals("句15", h.vm.subtitles.value.current?.text)
+
+        // 手机屏放不下：收到「当前句 ± 1」，但不能再少（否则就没有上下文了）
+        h.vm.setWindowRadius(0)
+        advanceUntilIdle()
+        assertEquals(PlaybackPolicy.SUBTITLE_WINDOW_MIN_RADIUS, h.vm.subtitles.value.after.size)
+        assertEquals(PlaybackPolicy.SUBTITLE_WINDOW_MIN_RADIUS, h.vm.subtitles.value.before.size)
+    }
+
+    @Test
+    fun `一键转录走与自动发起同一个出口`() = runTest {
+        // READY 的书不会自动发起（上面已有用例），正好用来验证按钮那条路确实走到了发起出口
+        val h = Harness(audio = FakeAudioRepo(listOf(row("a", "三体", 30_000, 0, state = "READY"), bookB)))
+        advanceUntilIdle()
+        assertTrue(h.started.isEmpty())
+
+        h.vm.transcribeNow()
+        advanceUntilIdle()
+
+        assertEquals(listOf("a"), h.started)
     }
 }
 

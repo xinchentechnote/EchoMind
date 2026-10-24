@@ -53,6 +53,15 @@ object AudioFormats {
     /** 推理线程数。模拟器上 2 线程实测识别 RTF 0.13~0.14（`docs/testing.md` §4，同一素材两轮抖动值），再多只是跟播放抢 CPU。 */
     const val ASR_NUM_THREADS: Int = 2
 
+    /**
+     * 同时转录的任务数上限（用户口径，2026-10-24）。
+     *
+     * 多路任务**共享同一份识别引擎**（`asr/SharedAsrEngines` 引用计数，每个模型只装一份 243 MB 权重），
+     * 所以 3 路的内存代价是三份解码/VAD 缓冲（每路 ≤ 几 MB），不是三份模型；CPU 上三路在同一个 ORT 线程池里
+     * 轮转——总吞吐不会变高，只是三本书同时往前走。超过上限的任务留在 QUEUED，worker 隔一段时间再来抢车道。
+     */
+    const val ASR_MAX_CONCURRENT_JOBS: Int = 3
+
     // ── 切句参数（唯一出处；`docs/asr-design.md` §6 的四条规则引用的就是下面这几个值）──
 
     /** 单句上限（FR-602 的「默认 60 字」）。超了才走兜底切分，见 `SentenceSplitter`。 */

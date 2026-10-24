@@ -5,9 +5,12 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -136,6 +139,7 @@ fun ShelfScreen(
                             onRename = { renaming = row },
                             onRemove = { viewModel.removeBook(row.id) },
                             onTranscribe = { onTranscribe(row.id) },
+                            onTranscribeNow = { viewModel.transcribeNow(row.id) },
                         )
                     }
                 }
@@ -193,6 +197,7 @@ private fun ShelfRowItem(
     onRename: () -> Unit,
     onRemove: () -> Unit,
     onTranscribe: () -> Unit,
+    onTranscribeNow: () -> Unit,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     val missing = row.fileStatus == AudioBookEntity.FileStatus.Missing
@@ -218,9 +223,8 @@ private fun ShelfRowItem(
                 }
                 DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                     DropdownMenuItem(text = { Text("重命名") }, onClick = { menuOpen = false; onRename() })
-                    // 转录不在这里入队，只把书带到转录页去确认：那一页才是唯一能发起转录的地方，
-                    // 「同一时刻只跑一本」的说明也就只需要写一份
-                    DropdownMenuItem(text = { Text("转录这本书") }, onClick = { menuOpen = false; onTranscribe() })
+                    // 菜单里这一项仍走转录页确认卡（可选模型、看说明）；行上的小按钮是不问直接转的快捷路径
+                    DropdownMenuItem(text = { Text("转录这本书…") }, onClick = { menuOpen = false; onTranscribe() })
                     DropdownMenuItem(text = { Text("从书架移除") }, onClick = { menuOpen = false; onRemove() })
                 }
             }
@@ -240,6 +244,17 @@ private fun ShelfRowItem(
             if (missing) {
                 Text("· 文件已不在", style = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.error))
             }
+            // 需要转录（没转过 / 字幕已过期）的书：一键入队，不用绕菜单与确认页（用户口径，2026-10-24）
+            if (!missing && needsTranscription(row.transcriptionState)) {
+                Spacer(modifier = Modifier.weight(1f))
+                TextButton(
+                    onClick = onTranscribeNow,
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                    modifier = Modifier.height(28.dp),
+                ) {
+                    Text("转录", style = MaterialTheme.typography.labelMedium)
+                }
+            }
         }
         // 只有真播过的书才画进度轨道，否则满屏都是 0% 的空线
         if (row.lastPlayedAtMs > 0) {
@@ -252,6 +267,10 @@ private fun ShelfRowItem(
         }
     }
 }
+
+/** 「需要转录」= 没有可信的 ASR 字幕：从没转过，或文件变过旧字幕已过期。失败/取消的书在转录页有重试入口 */
+private fun needsTranscription(state: String): Boolean =
+    state == AudioBookEntity.TranscriptionState.None || state == AudioBookEntity.TranscriptionState.Expired
 
 /**
  * 这一格说的是**转录任务**的状态，不是「这本书有没有字幕」：手工导入的测试字幕只写 `subtitle_segment`，

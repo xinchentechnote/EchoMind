@@ -7,6 +7,7 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.xinchen.echomind.EchoMindApp
 import com.xinchen.echomind.asr.ModelCatalog
+import com.xinchen.echomind.core.conf.AudioFormats
 import com.xinchen.echomind.core.conf.PlaybackPolicy
 import com.xinchen.echomind.data.db.AudioBookEntity
 import com.xinchen.echomind.data.db.ShelfRow
@@ -74,7 +75,8 @@ data class PlayerTranscriptState(
  */
 internal fun liveStatusLine(job: TranscriptJobRow?, sentenceCount: Int): String? = when {
     job == null -> null
-    job.status == TranscriptJobStatus.Queued -> "转录排队中（另一本书正在转录），轮到后自动开始"
+    job.status == TranscriptJobStatus.Queued ->
+        "转录排队中（同时最多转 ${AudioFormats.ASR_MAX_CONCURRENT_JOBS} 本，已满），轮到后自动开始"
     job.status == TranscriptJobStatus.Running ->
         "正在转录：${TranscriptDisplay.runningPhrase(job)} · 已出 $sentenceCount 句（转完自动入库）"
 
@@ -141,6 +143,13 @@ class PlayerViewModel(
 
     private val playingId = MutableStateFlow(audioId)
 
+    /**
+     * 字幕窗口半径（当前句前后各几句）。初值是 [PlaybackPolicy.SUBTITLE_WINDOW_RADIUS]（FR-701 的七句），
+     * 播放页按字幕区实际能容纳的行数双向调整——大屏上「剩下的全部是字幕」，手机屏上放不下就收小，不留空白也不裁句
+     * （FR-701 注记，2026-10-24）。
+     */
+    private val windowRadius = MutableStateFlow(PlaybackPolicy.SUBTITLE_WINDOW_RADIUS)
+
     init {
         viewModelScope.launch {
             val rows = audioRepository.shelf(ShelfTab.All, "").first()
@@ -193,9 +202,12 @@ class PlayerViewModel(
                 .collect { _subtitleSummary.value = it }
         }
         // 换曲只重挂字幕流，位置仍然取控制器的实时值：两处各存一份 position 就会对不上账（AGENTS.md §4）
+        // 窗口半径变了（页面量出能放更多行）也重挂同步器，位置同样不动
         viewModelScope.launch {
             playingId.flatMapLatest { id ->
-                subtitleRepository.observeSegments(id).map { segments -> SubtitleSynchronizer(segments) }
+                combine(subtitleRepository.observeSegments(id), windowRadius) { segments, radius ->
+                    SubtitleSynchronizer(segments, radius)
+                }
             }.flatMapLatest { synchronizer ->
                 controller.state.map { it.positionMs }
                     .distinctUntilChanged()
@@ -205,14 +217,14 @@ class PlayerViewModel(
         // 实时预览窗口：预览句子一变就重挂同步器，位置取值与库字幕同一套（七句窗口、点句跳转都复用）
         viewModelScope.launch {
             playingId.flatMapLatest { id ->
-                liveStore.live.map { it[id]?.sentences }.distinctUntilChanged()
-            }.flatMapLatest { sentences ->
+                combine(liveStore.live.map { it[id]?.sentences }.distinctUntilChanged(), windowRadius) { s, r -> s to r }
+            }.flatMapLatest { (sentences, radius) ->
                 if (sentences.isNullOrEmpty()) {
                     kotlinx.coroutines.flow.flowOf(null)
                 } else {
                     controller.state.map { it.positionMs }
                         .distinctUntilChanged()
-                        .map { positionMs -> SubtitleSynchronizer(sentences).windowAt(positionMs) }
+                        .map { positionMs -> SubtitleSynchronizer(sentences, radius).windowAt(positionMs) }
                 }
             }.collect { _liveWindow.value = it }
         }
@@ -251,6 +263,27 @@ class PlayerViewModel(
     fun seekTo(positionMs: Long) = controller.seekTo(positionMs)
     fun next() = controller.next()
     fun previous() = controller.previous()
+
+    /** 单曲循环开/关（FR-310）：全局设置，控制器负责持久化 */
+    fun toggleRepeatOne() = controller.setRepeatOne(!controller.state.value.repeatOne)
+
+    /**
+     * 页面量出字幕区能放几句就把窗口调到几句：大屏放大、手机屏放不下七句长句时收小，
+     * 下限 [PlaybackPolicy.SUBTITLE_WINDOW_MIN_RADIUS]（当前句 ± 1）。只在真的变了才写，避免每次重组都重挂同步器。
+     */
+    fun setWindowRadius(radius: Int) {
+        val clamped = radius.coerceAtLeast(PlaybackPolicy.SUBTITLE_WINDOW_MIN_RADIUS)
+        if (windowRadius.value != clamped) windowRadius.value = clamped
+    }
+
+    /**
+     * 一键转录（用户口径，2026-10-24）：没有字幕、也没有任务在跑的书，字幕区给一个按钮直接发起，
+     * 不用绕到书架菜单再去转录页确认。入队的守卫在仓储层（已有活动任务/已转好 → 不重复）。
+     */
+    fun transcribeNow() {
+        val id = playingId.value
+        viewModelScope.launch { startTranscription(id) }
+    }
 
     /** 停止播放并结算会话；页面留在原地，用户可以再点播放 */
     fun stop() = controller.stop()

@@ -249,7 +249,8 @@ Phase 6d 之后这些行为有了**设备证据**（人工从界面点出来：�
 
 1. `markRunning(jobId, 0)` 先行。它的跃迁语句是 `WHERE status = 'QUEUED' AND NOT EXISTS (… status = 'RUNNING' AND id <> :id)`，
    **抢不到行就立刻 `Skipped` 收手**——一条守卫同时挡住三种情况：第二个 worker 抢跑、进程被杀后复活的 worker 覆盖中断结论
-   （`recoverInterrupted()` 已把那行标成 `FAILED(INTERRUPTED)`）、以及**另一本书占了模型句柄时的并发转录**（D36）。
+   （`recoverInterrupted()` 已把那行标成 `FAILED(INTERRUPTED)`）、以及**车道满时的并发转录**（2026-10-24 起 D46：
+   `COUNT(RUNNING) < ASR_MAX_CONCURRENT_JOBS`，当前 3 路，多路共享一份引擎；此前是 D36 的「只许一行 RUNNING」）。
    第三档必须写在 SQL 里：「先 SELECT 看有没有 RUNNING 再 UPDATE」在查与改之间就是并发窗口，两个 worker 都能读到「没有」，
    于是各自开一份 243 MB 的引擎。用例 `别的任务正在跑时第二本书的任务抢不到运行中的行` / `别的书正在跑时第二个协调器收手且不写字幕`。
    **WMA 的 mp3 转码与「自动选模型」的语言探测都排在它之后**（2026-10-24）：转码不用引擎但要用 RUNNING 行写进度
@@ -385,6 +386,10 @@ Phase 6d 之后这些行为有了**设备证据**（人工从界面点出来：�
 
 ## 10. 当前状态（诚实标注）
 
+- **并发 3 路共享引擎（2026-10-24 同日，D46）**：`markRunning` 的闸从「只许一行 RUNNING」改成「RUNNING 数 < `ASR_MAX_CONCURRENT_JOBS`」，
+  `asr/SharedAsrEngines` 按模型共享一份 `SherpaOnnxEngine`（引用计数），协调器车道满返回 `LaneFull`、worker 退避重试。
+  设备证据：mp3 + WMA 两路并发 7.4 s 全入库、引擎装载 1 次；三本书从界面一键发起同屏「转录中」（`docs/testing.md` §4 2026-10-24 第二条）。
+  §5.1 第 1 条里「同一时刻只跑一个」的措辞按此理解：**一个模型一份句柄**，不是一个任务。
 - **WMA 转录管线与任务列表重做（2026-10-24，D44/D45）**：`.wma` 先转 mp3 再识别（`app/libs/wma/README.md` 有新 libwma.so
   的构建脚本与哈希；修了 32 KB 超帧溢出、接入 LAME）；`transcript_job` v4 加 `phase/position_ms/duration_ms`，
   进度分母换成容器时长（转码/识别两阶段、百分比从第一秒起是真的）；一本书一行任务 + 手动删除（连字幕）。

@@ -7,6 +7,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import com.xinchen.echomind.core.conf.AudioFormats
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -89,7 +90,7 @@ class Migration_3_4_Test {
                         createdAtMs = 10_000L,
                     ),
                 )
-                assertEquals(1, dao.markRunning("j2", startedAtMs = 10_001L, totalSegments = 0))
+                assertEquals(1, dao.markRunning("j2", startedAtMs = 10_001L, totalSegments = 0, maxConcurrent = AudioFormats.ASR_MAX_CONCURRENT_JOBS))
                 assertEquals(
                     1,
                     dao.updateProgress("j2", doneSegments = 4, phase = TranscriptJobEntity.Phase.Transcoding, positionMs = 30_000L, durationMs = 120_000L),

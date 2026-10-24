@@ -3,6 +3,7 @@ package com.xinchen.echomind.data.repo
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.xinchen.echomind.core.conf.AudioFormats
 import com.xinchen.echomind.core.time.TimeSource
 import com.xinchen.echomind.data.db.AudioBookEntity
 import com.xinchen.echomind.data.db.EchoMindDatabase
@@ -283,30 +284,37 @@ class TranscriptRepositoryTest {
     }
 
     /**
-     * D36：一份 int8 模型 243 MB，两本书同时开就是 OOM 而不是慢。
-     * 这道闸写在**一条 SQL 语句里**而不是「先查有没有 RUNNING 再改」——查与改之间正是并发窗口，
-     * 两次并发的「查」都能看见空车道，然后两个都改成功。
+     * D46：同时最多跑 `ASR_MAX_CONCURRENT_JOBS` 路（多路共享一份引擎）。
+     * 这道闸写在**一条 SQL 语句里**而不是「先查有几个 RUNNING 再改」——查与改之间正是并发窗口，
+     * N+1 个并发的「查」都能看见还有空位，然后全部改成功。
      */
     @Test
-    fun 别的任务正在跑时第二本书的任务抢不到运行中的行() = runBlocking {
-        upsertBook(audioId = "b")
-        val first = (repo.enqueue("a", model) as EnqueueOutcome.Created).jobId
-        val second = (repo.enqueue("b", model) as EnqueueOutcome.Created).jobId
+    fun 车道满时第N加1本书抢不到运行中的行() = runBlocking {
+        val max = AudioFormats.ASR_MAX_CONCURRENT_JOBS
+        val laneIds = (1..max).map { n ->
+            upsertBook(audioId = "lane-$n")
+            (repo.enqueue("lane-$n", model) as EnqueueOutcome.Created).jobId
+        }
+        upsertBook(audioId = "extra")
+        val extra = (repo.enqueue("extra", model) as EnqueueOutcome.Created).jobId
 
-        assertTrue(repo.markRunning(first, totalSegments = 4))
-        assertFalse("第二本书竟然也拿到了运行中的行", repo.markRunning(second, totalSegments = 4))
+        laneIds.forEachIndexed { i, id -> assertTrue("第 ${i + 1} 条车道该能进", repo.markRunning(id, totalSegments = 4)) }
+        assertEquals(max, repo.runningCount())
+        assertFalse("第 ${max + 1} 本书竟然也拿到了运行中的行", repo.markRunning(extra, totalSegments = 4))
 
-        val blocked = job(second)
+        val blocked = job(extra)
         assertEquals(TranscriptJobEntity.Status.Queued, blocked.status)
         assertNull("抢不到车道就不该有开始时间：$blocked", blocked.startedAtMs)
         // 入队本来就会把那本书标成 QUEUED（第一个用例守的就是这件事），关键是它没被翻成 RUNNING
-        assertEquals(AudioBookEntity.TranscriptionState.Queued, db.audioBookDao().getById("b")!!.transcriptionState)
+        assertEquals(AudioBookEntity.TranscriptionState.Queued, db.audioBookDao().getById("extra")!!.transcriptionState)
         // 同一行自己撞第二次还是老理由（不是 QUEUED），不是被这条新闸挡的
-        assertFalse(repo.markRunning(first, totalSegments = 4))
+        assertFalse(repo.markRunning(laneIds[0], totalSegments = 4))
 
-        // 第一轮结算完让出车道，第二轮才抢得到
-        repo.commitSubtitles(first, segments("第一轮的"), totalSegments = 4)
-        assertTrue(repo.markRunning(second, totalSegments = 4))
+        // 有一路结算完让出车道，排队的那本才抢得到
+        repo.commitSubtitles(laneIds[0], segments("第一轮的"), totalSegments = 4)
+        assertEquals(max - 1, repo.runningCount())
+        assertTrue(repo.markRunning(extra, totalSegments = 4))
+        assertEquals(max, repo.runningCount())
     }
 
     /** 一本书一行：重试是新行**顶掉**旧行，用户看到的永远是这本书最近一次的结果 */

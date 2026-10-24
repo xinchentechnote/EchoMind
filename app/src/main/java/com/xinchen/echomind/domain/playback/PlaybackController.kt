@@ -40,6 +40,8 @@ data class PlaybackUiState(
     val queue: List<QueueItem> = emptyList(),
     val index: Int = -1,
     val error: String? = null,
+    /** 单曲循环（FR-310）：开着时播完当前这一首从头再放，不前进到下一首 */
+    val repeatOne: Boolean = false,
 ) {
     val hasPrevious: Boolean get() = index > 0
     val hasNext: Boolean get() = queue.isNotEmpty() && index in 0 until queue.lastIndex
@@ -65,6 +67,12 @@ interface PlaybackController {
     fun setSpeed(speed: Float)
     fun next()
     fun previous()
+
+    /**
+     * 单曲循环开/关（FR-310）。全局设置，跨书生效；统计口径不变——循环回头不是换曲，
+     * 同一场会话继续累计（`docs/playback-design.md` §3 的循环注记）。
+     */
+    fun setRepeatOne(enabled: Boolean)
 
     /** 停止播放并结算会话（UserStopped）：通知栏的停止键走这条路 */
     fun stop()

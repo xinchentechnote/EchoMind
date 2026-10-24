@@ -73,6 +73,7 @@ EchoMindMediaService（MediaSessionService）── 用同一个 player 建 Medi
 6. **进度恢复**：`last_position_ms` 超过 `duration - END_TOLERANCE` 时，UI 视为「已听完」，重新点击播放从头开始（并把 `is_finished` 置位）；这避免每次进入都停在末尾。
 7. **位置推进的步长上限**：`consumed_audio_ms` 只累计 `0 < Δposition ≤ MAX_COUNTED_POSITION_STEP_MS` 的正向推进。超过 2s 的跳变当作外部跳转（通知栏进度条拖动、Media3 在 seek 后的插值跳变、缓冲后回放点重定位），只更新基准不计时——否则一次跳跃就能把完播骗过去（FR-407 的实现细节）。我们自己发起的 ±15s / 拖动 / 点字幕走 `onSeek`，语义相同但入口分开，便于单测区分「用户跳」和「系统跳」。
 8. **自动切歌的会话归属**：队列里一首播完、Media3 触发 `onMediaItemTransition` 时，控制器先按 `SwitchedAudio` 结算**上一首**，再为**这一首**开新会话（`SessionTracker.start()` 内部也会兜底结算未关闭的上一场，返回给调用方落库，FR-409）。实测跨 6 首连续播放，每首各自的 `play_count/completed_count` 与逐场会话一致。
+9. **单曲循环不改口径（FR-310，2026-10-24）**：`REPEAT_MODE_ONE` 下播到末尾 Media3 发的 `onMediaItemTransition(reason=REPEAT)` 还是同一本书，`target.audioId == tracker.activeAudioId` 直接早退——**不结算、不开新会话**，同一场会话跨圈继续累计 `listened_ms`；位置从末尾跳回 0 被第 7 条的步长上限当成跳转、不计 `consumed_audio_ms`，第二圈的正向推进继续计入。于是 `consumed_audio_ms` 可能超过时长、完播判定可能在第二圈才满足——这是「真听过」，与口径一致；一场会话无论循环几圈，`play_count/completed_count` 各只记 1。
 
 ### 3.4 崩溃与异常（FR-405）
 

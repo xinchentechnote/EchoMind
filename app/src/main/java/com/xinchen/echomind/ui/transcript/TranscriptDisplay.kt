@@ -119,7 +119,7 @@ object TranscriptDisplay {
     /** 开始卡的说明。「整本替换」这件事必须在点下去之前说清楚：`commitSubtitles` 是单事务删旧插新（AGENTS.md §4） */
     fun startGuide(existing: ExistingAsr): String = when (existing) {
         ExistingAsr.None ->
-            "用本机模型识别（不联网）。同一时刻只跑一本，排在后面的会等前面那本跑完"
+            "用本机模型识别（不联网）。同一时刻最多 ${AudioFormats.ASR_MAX_CONCURRENT_JOBS} 本一起转，排在后面的轮到即开始"
 
         ExistingAsr.Ready ->
             "它已经有 ASR 字幕。重转会整本替换旧字幕——删旧和插新在同一个事务里，不会出现半本新半本旧"
@@ -130,7 +130,7 @@ object TranscriptDisplay {
 
     /** 入队结局翻成一句话（FR-506 的「不重复识别」是正常业务分支，不是异常） */
     fun enqueueOutcomeLabel(outcome: TranscriptOutcomeCopy): String = when (outcome) {
-        TranscriptOutcomeCopy.Scheduled -> "已开始排队；同一时刻只跑一本，排在后面的会接着开始"
+        TranscriptOutcomeCopy.Scheduled -> "已开始排队；同一时刻最多 ${AudioFormats.ASR_MAX_CONCURRENT_JOBS} 本一起转，轮到即开始"
         TranscriptOutcomeCopy.AlreadyActive -> "这本书已经在队列里了，不重复排队"
         TranscriptOutcomeCopy.AlreadyTranscribed ->
             // 走到这里说明页面用的还是旧状态（多半是刚刚跑完那一轮），此刻按钮上并没有「覆盖重转」，

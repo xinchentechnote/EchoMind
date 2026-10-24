@@ -72,10 +72,14 @@ interface TranscriptRepository {
     /**
      * QUEUED → RUNNING，[totalSegments] 由 VAD 跑完后的段数填入。
      *
-     * 返回 `false` 有两种：这一行不是 QUEUED（被取消/已结算），**或者别的任务正在跑**——
-     * 一台机器同一时刻只许有一个模型句柄，抢不到就收手（`docs/architecture.md` D36）。
+     * 返回 `false` 有两种：这一行不是 QUEUED（被取消/已结算），**或者车道满了**——
+     * 同时在跑的任务已达 `AudioFormats.ASR_MAX_CONCURRENT_JOBS`（多路共享一份引擎，D46），
+     * 抢不到就等下一轮再来（调用方用 [runningCount] 与行状态区分这两种）。
      */
     suspend fun markRunning(jobId: String, totalSegments: Int): Boolean
+
+    /** 正在跑（RUNNING）的任务数：worker 起前台通知前先看车道，协调器据此区分「车道满」与「行已结算」 */
+    suspend fun runningCount(): Int
 
     /** 进度节流写库（≥1s，AGENTS.md §4）。只在 RUNNING 时有效 */
     suspend fun updateProgress(jobId: String, progress: TranscriptProgress): Boolean

@@ -90,6 +90,7 @@ class SettingsViewModelTest {
         override var wmaTranscodeToMp3: Boolean
             get() = mp3
             set(value) { mp3 = value }
+        override var repeatOne: Boolean = false
     }
 
     /** assets 布局与生产一致：models/<specId>/<fileName> */

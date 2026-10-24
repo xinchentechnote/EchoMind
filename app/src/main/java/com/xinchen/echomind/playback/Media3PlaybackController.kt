@@ -46,10 +46,13 @@ class Media3PlaybackController(
     private val clock: TimeSource,
     private val scope: CoroutineScope,
     private val startSessionService: () -> Unit,
+    /** 单曲循环的初值（来自设置）与持久化出口（FR-310）；lambda 接缝让 JVM 测试不碰 SharedPreferences */
+    initialRepeatOne: Boolean = false,
+    private val onRepeatOneChanged: (Boolean) -> Unit = {},
 ) : PlaybackController, Player.Listener {
 
     private val tracker = SessionTracker(clock)
-    private val _state = MutableStateFlow(PlaybackUiState())
+    private val _state = MutableStateFlow(PlaybackUiState(repeatOne = initialRepeatOne))
     override val state: StateFlow<PlaybackUiState> = _state.asStateFlow()
 
     private val writes = Channel<suspend () -> Unit>(Channel.UNLIMITED)
@@ -68,6 +71,7 @@ class Media3PlaybackController(
 
     init {
         player.addListener(this)
+        player.repeatMode = if (initialRepeatOne) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_OFF
         scope.launch {
             for (op in writes) {
                 runCatching { op() }
@@ -158,6 +162,18 @@ class Media3PlaybackController(
         player.setPlaybackSpeed(speed)
         queue = queue.map { if (it.audioId == state.value.audioId) it.copy(speed = speed) else it }
         currentItem()?.let { item -> enqueue { repository.saveSpeed(item.audioId, speed) } }
+        pushState()
+    }
+
+    override fun setRepeatOne(enabled: Boolean) {
+        player.repeatMode = if (enabled) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_OFF
+        onRepeatOneChanged(enabled)
+        pushState()
+    }
+
+    /** 通知栏/媒体键也可能改循环模式：以播放器为准同步回状态与设置 */
+    override fun onRepeatModeChanged(repeatMode: Int) {
+        onRepeatOneChanged(repeatMode == Player.REPEAT_MODE_ONE)
         pushState()
     }
 
@@ -370,6 +386,7 @@ class Media3PlaybackController(
                 index = if (queue.isEmpty()) -1 else player.currentMediaItemIndex,
                 // 错误只属于出错的那一本：当前在播的不是它，就不显示
                 error = if (item != null && item.audioId == erroredAudioId) current.error else null,
+                repeatOne = player.repeatMode == Player.REPEAT_MODE_ONE,
             )
         }
     }

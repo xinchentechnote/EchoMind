@@ -8,11 +8,15 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import android.net.Uri
 import android.util.Log
 import com.xinchen.echomind.EchoMindApp
+import com.xinchen.echomind.asr.ModelCatalog
 import com.xinchen.echomind.data.db.ImportedFolderEntity
 import com.xinchen.echomind.data.db.ShelfRow
 import com.xinchen.echomind.data.repo.AudioRepository
 import com.xinchen.echomind.data.repo.ShelfTab
 import com.xinchen.echomind.domain.importing.PermissionRevokedException
+import com.xinchen.echomind.domain.model.EnqueueOutcome
+import com.xinchen.echomind.ui.transcript.TranscriptDisplay
+import com.xinchen.echomind.ui.transcript.TranscriptOutcomeCopy
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -32,7 +36,14 @@ data class ShelfUiState(
     val message: String? = null,
 )
 
-class ShelfViewModel(private val repository: AudioRepository) : ViewModel() {
+class ShelfViewModel(
+    private val repository: AudioRepository,
+    /**
+     * 一键转录的出口（用户口径，2026-10-24）：书架行上「未转录」旁边的小按钮直接入队，不再绕到转录页确认。
+     * 返回给用户看的一句话。lambda 接缝：入队 + 排 WorkManager 那半边要 Android，JVM 里用替身。
+     */
+    private val startTranscription: suspend (audioId: String) -> String? = { null },
+) : ViewModel() {
 
     private val _state = MutableStateFlow(ShelfUiState())
     val state: StateFlow<ShelfUiState> = _state.asStateFlow()
@@ -114,6 +125,9 @@ class ShelfViewModel(private val repository: AudioRepository) : ViewModel() {
         "已从书架移除（收听历史保留）"
     }
 
+    /** 行上那个小「转录」按钮：直接入队并排上 WorkManager，结局一句话回给用户 */
+    fun transcribeNow(audioId: String) = runBusy { startTranscription(audioId) }
+
     private fun runBusy(block: suspend () -> String?) {
         _state.update { it.copy(isBusy = true) }
         viewModelScope.launch {
@@ -138,7 +152,24 @@ class ShelfViewModel(private val repository: AudioRepository) : ViewModel() {
         val Factory: ViewModelProvider.Factory = viewModelFactory {
             initializer {
                 val app = this[androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.APPLICATION_KEY] as EchoMindApp
-                ShelfViewModel(app.graph.audioRepository)
+                ShelfViewModel(
+                    app.graph.audioRepository,
+                    startTranscription = { audioId ->
+                        // 与首次播放自动转录同一个模型引用（FR-512）；守卫（已有任务/已转好）都在仓储层
+                        val outcome = app.graph.transcriptRepository.enqueue(audioId, ModelCatalog.transcriptRef)
+                        val copy = when (outcome) {
+                            is EnqueueOutcome.Created ->
+                                if (app.graph.transcriptWork.schedule(outcome.jobId, audioId)) TranscriptOutcomeCopy.Scheduled
+                                else TranscriptOutcomeCopy.WorkRefused
+
+                            is EnqueueOutcome.AlreadyActive -> TranscriptOutcomeCopy.AlreadyActive
+                            EnqueueOutcome.AlreadyTranscribed -> TranscriptOutcomeCopy.AlreadyTranscribed
+                            EnqueueOutcome.AudioNotFound -> TranscriptOutcomeCopy.BookGone
+                            EnqueueOutcome.JobNotFound -> TranscriptOutcomeCopy.JobGone
+                        }
+                        TranscriptDisplay.enqueueOutcomeLabel(copy)
+                    },
+                )
             }
         }
     }
