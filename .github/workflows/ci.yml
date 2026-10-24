@@ -162,12 +162,10 @@ jobs:
           retention-days: 7
 
       - name: 上传调试 APK
-        if: success()
+        if: startsWith(github.ref, 'refs/tags/v')
+        continue-on-error: true # 268MB 的 APK 会顶爆 free 层 500MB 的 Actions 存储配额（2026-10-24 实测：配额满时这一步必红，殃及整条 CI 的绿色信号）；长期分发走 Release 附件（不计此配额），CI 的 APK 只在打 tag 时尽力传一份
         uses: actions/upload-artifact@v7
         with:
           name: EchoMind-${{ github.ref_name }}-debug
           path: app/build/outputs/apk/debug/app-debug.apk
-          # 单个 APK ~216MB：free 层账户 Actions 存储配额全账户共 500MB，
-          # 14 天 × ~1.4 次/天 会常驻 4GB+（曾顶爆配额殃及其他仓库上传）。
-          # 只保最近构建；要长期分发请打 tag 挂 Release（不计入此配额）。
           retention-days: 1
