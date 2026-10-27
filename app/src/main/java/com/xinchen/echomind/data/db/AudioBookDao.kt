@@ -26,6 +26,10 @@ interface AudioBookDao {
     @Query("SELECT COUNT(*) FROM audio_book")
     suspend fun count(): Int
 
+    /** 全库 uri（本机音频页的「已在书架」角标用）；量级几千行，一次性读入 */
+    @Query("SELECT uri FROM audio_book")
+    suspend fun allUris(): List<String>
+
     @Query("SELECT COUNT(*) FROM audio_book WHERE folder_id = :folderId")
     suspend fun countOfFolder(folderId: String): Int
 

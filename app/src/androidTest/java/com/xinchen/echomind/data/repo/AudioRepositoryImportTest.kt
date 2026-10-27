@@ -217,6 +217,25 @@ class AudioRepositoryImportTest {
         assertEquals(3, db.audioBookDao().count())
     }
 
+    /** 目录管理（2026-10-28）：按夹重扫只动指定的那个文件夹 */
+    @Test
+    fun rescanFolder只重扫指定的文件夹() = runBlocking {
+        val browser = FakeBrowser(sampleTree())
+        val repo = repository(browser, FakeGrants(), FakeReader())
+        repo.importFolder(Uri.parse(treeRoot))
+        browser.tree = browser.tree + mapOf(otherRoot to listOf(file("b.mp3", "$otherRoot/b.mp3")))
+        repo.importFolder(Uri.parse(otherRoot))
+
+        val outcome = repo.rescanFolder(stableIdFromUri(otherRoot))
+
+        assertEquals(stableIdFromUri(otherRoot), outcome.folderId)
+        assertEquals(0, outcome.added)
+        assertEquals(1, outcome.unchanged)
+        assertEquals(3, db.audioBookDao().count())
+        val error = runCatching { repo.rescanFolder("不存在的id") }.exceptionOrNull()
+        assertTrue(error is NoSuchElementException)
+    }
+
     @Test
     fun 文件消失只标状态不删记录() = runBlocking {
         val browser = FakeBrowser(sampleTree())

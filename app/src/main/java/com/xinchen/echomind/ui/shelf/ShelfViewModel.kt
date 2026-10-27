@@ -17,6 +17,7 @@ import com.xinchen.echomind.domain.importing.PermissionRevokedException
 import com.xinchen.echomind.domain.model.EnqueueOutcome
 import com.xinchen.echomind.ui.transcript.TranscriptDisplay
 import com.xinchen.echomind.ui.transcript.TranscriptOutcomeCopy
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -34,6 +35,10 @@ data class ShelfUiState(
     val lastPlayed: ShelfRow? = null,
     val folders: List<ImportedFolderEntity> = emptyList(),
     val message: String? = null,
+    /** 目录管理（2026-10-28）：null = 全部；非空 = 只看这个文件夹的书 */
+    val selectedFolderId: String? = null,
+    /** 每个文件夹在书架上的书数（目录 chip 角标与移除确认用） */
+    val folderCounts: Map<String, Int> = emptyMap(),
 )
 
 class ShelfViewModel(
@@ -48,13 +53,30 @@ class ShelfViewModel(
     private val _state = MutableStateFlow(ShelfUiState())
     val state: StateFlow<ShelfUiState> = _state.asStateFlow()
 
+    /** 未经过文件夹筛选的全量行；筛选在 combine 里做，tab/query 照旧走 SQL */
+    private val allRows = MutableStateFlow<List<ShelfRow>>(emptyList())
+
     init {
         // tab/query 只存在 _state 里：再开一份私有 MutableStateFlow 就会出现
         // 「列表跟着 tab 变了、高亮却读旧值」的分裂状态
         viewModelScope.launch {
             _state.map { it.tab to it.query }.distinctUntilChanged()
                 .flatMapLatest { (t, q) -> repository.shelf(t, q) }
-                .collect { rows -> _state.update { it.copy(rows = rows) } }
+                .collect { rows -> allRows.value = rows }
+        }
+        viewModelScope.launch {
+            // 文件夹筛选与 tab/query 正交：目录维度在任何 tab 下都成立
+            combine(allRows, _state.map { it.selectedFolderId }.distinctUntilChanged()) { rows, folderId ->
+                if (folderId == null) rows else rows.filter { it.folderId == folderId }
+            }.collect { filtered ->
+                _state.update {
+                    it.copy(
+                        rows = filtered,
+                        // 计数永远来自全量行：选中某个文件夹后其他 chip 的角标不能归零
+                        folderCounts = allRows.value.groupingBy { row -> row.folderId }.eachCount(),
+                    )
+                }
+            }
         }
         viewModelScope.launch {
             repository.lastPlayed().distinctUntilChanged()
@@ -67,6 +89,35 @@ class ShelfViewModel(
 
     fun onTabSelected(selected: ShelfTab) {
         _state.update { it.copy(tab = selected) }
+    }
+
+    /** 目录筛选：null = 全部；移除的文件夹被选中时 UI 会先调这个归位 */
+    fun onFolderSelected(folderId: String?) {
+        _state.update { it.copy(selectedFolderId = folderId) }
+    }
+
+    /** 只重扫选中的文件夹（SAF 与本机伪文件夹都走仓储同一段分支） */
+    fun rescanFolder(folderId: String) = runBusy {
+        val outcome = repository.rescanFolder(folderId)
+        if (outcome.permissionRevoked) {
+            "文件夹授权已失效，请重新授权"
+        } else {
+            buildString {
+                append("文件夹已重扫：新增 ${outcome.added}，更新 ${outcome.changed}，消失 ${outcome.vanished}")
+                if (outcome.revived > 0) append("，${outcome.revived} 首文件已回来")
+                if (outcome.alreadyOnShelf > 0) append("，已在书架 ${outcome.alreadyOnShelf}")
+                if (outcome.preparingWma > 0) append("，${outcome.preparingWma} 首 WMA 正在后台准备")
+            }
+        }
+    }
+
+    /** 移除整个文件夹的书架记录（级联删播放记忆；listening_session 历史保留，NFR-04） */
+    fun removeFolder(folderId: String) = runBusy {
+        val folder = _state.value.folders.firstOrNull { it.id == folderId }
+        val count = allRows.value.count { it.folderId == folderId }
+        repository.removeFolder(folderId)
+        if (_state.value.selectedFolderId == folderId) onFolderSelected(null)
+        "已移除「${folder?.displayName ?: "该文件夹"}」及其 $count 本书（收听历史保留）"
     }
 
     fun onQueryChanged(text: String) {

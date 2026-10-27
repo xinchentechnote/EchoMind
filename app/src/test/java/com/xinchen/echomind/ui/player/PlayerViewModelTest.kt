@@ -6,6 +6,8 @@ import com.xinchen.echomind.data.db.ImportedFolderEntity
 import com.xinchen.echomind.data.db.RecentSessionRow
 import com.xinchen.echomind.data.db.ShelfRow
 import com.xinchen.echomind.data.repo.AudioRepository
+import com.xinchen.echomind.data.repo.MediaAudioAccess
+import com.xinchen.echomind.domain.importing.DeviceAudioEntry
 import com.xinchen.echomind.data.repo.ImportOutcome
 import com.xinchen.echomind.data.repo.PlaybackRepository
 import com.xinchen.echomind.data.repo.PlaybackStateSnapshot
@@ -80,7 +82,13 @@ class PlayerViewModelTest {
         }
 
         override suspend fun importFolder(treeUri: Uri): ImportOutcome = unsupported()
+        override suspend fun importDeviceFolder(volume: String, relativePath: String): ImportOutcome = unsupported()
+        override suspend fun importDeviceFile(file: DeviceAudioEntry): ImportOutcome = unsupported()
+        override suspend fun scanDeviceAudio(): List<DeviceAudioEntry> = unsupported()
+        override suspend fun deviceImportedUris(): Set<String> = unsupported()
+        override val mediaAudioAccess: MediaAudioAccess? = null
         override suspend fun rescanAll(): List<ImportOutcome> = unsupported()
+        override suspend fun rescanFolder(folderId: String): ImportOutcome = unsupported()
         override suspend fun rename(audioId: String, title: String) = unsupported()
         override suspend fun removeBook(audioId: String) = unsupported()
         override suspend fun removeFolder(folderId: String) = unsupported()
@@ -538,6 +546,7 @@ private fun row(
     lastPositionMs = lastPositionMs,
     lastPlayedAtMs = 0,
     playbackSpeed = 1f,
+    folderId = "f-test",
 )
 
 private fun seg(index: Int, startMs: Long, text: String) =

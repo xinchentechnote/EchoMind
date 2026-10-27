@@ -34,8 +34,8 @@ erDiagram
 | 列 | 类型 | 约束 | 说明 |
 | --- | --- | --- | --- |
 | `id` | TEXT | PK | UUID |
-| `tree_uri` | TEXT | UNIQUE | SAF 树 URI（持久化授权的载体） |
-| `display_name` | TEXT | | 用户可读名字（`DocumentFile.name`） |
+| `tree_uri` | TEXT | UNIQUE | SAF 树 URI（持久化授权的载体）。**2026-10-27 起语义扩展（D48）**：本机音频的「伪文件夹」也存这里，形如 `mediastore://<volume>/<relativePath>`（如 `mediastore://external_primary/Music`），由 `DeviceAudioFolders.SCHEME` 前缀判别——不对应任何 SAF 树，也不需要持久化授权（读文件靠 `READ_MEDIA_AUDIO` 运行时权限）。伪文件夹的 `granted_at_ms` 记首次导入时刻 |
+| `display_name` | TEXT | | 用户可读名字（SAF：`DocumentFile.name`；伪文件夹：`内部存储/<relativePath>`） |
 | `granted_at_ms` | INTEGER | | 授权时间（墙钟，仅展示） |
 | `last_scan_at_ms` | INTEGER | | 上次扫描完成时间 |
 | `permission_state` | TEXT | | `GRANTED` / `REVOKED`（检测与降级见 `architecture.md` §8 与 FR-110） |
@@ -46,7 +46,7 @@ erDiagram
 | 列 | 类型 | 约束 | 说明 |
 | --- | --- | --- | --- |
 | `id` | TEXT | PK | UUID，跨重扫稳定 |
-| `uri` | TEXT | **UNIQUE 索引** | SAF 文档 URI；去重键（FR-106） |
+| `uri` | TEXT | **UNIQUE 索引** | 音频内容 URI（SAF 文档 URI，或本机音频的 `content://media/...`）；去重键（FR-106） |
 | `folder_id` | TEXT | FK→imported_folder CASCADE, 索引 | |
 | `relative_path` | TEXT | | 相对树根路径，用于展示与排序 |
 | `file_name` | TEXT | | 含扩展名 |

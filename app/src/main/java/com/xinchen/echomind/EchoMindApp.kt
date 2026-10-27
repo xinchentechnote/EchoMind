@@ -15,6 +15,7 @@ import com.xinchen.echomind.data.db.Migrations
 import com.xinchen.echomind.data.repo.AudioRepository
 import com.xinchen.echomind.data.repo.AudioRepositoryImpl
 import com.xinchen.echomind.data.repo.AppSettings
+import com.xinchen.echomind.data.repo.AndroidMediaAudioAccess
 import com.xinchen.echomind.data.repo.SharedPreferencesAppSettings
 import com.xinchen.echomind.data.repo.AsyncWmaImportPreparer
 import com.xinchen.echomind.data.repo.WmaImportPreparer
@@ -25,6 +26,7 @@ import com.xinchen.echomind.data.repo.SubtitleRepository
 import com.xinchen.echomind.data.repo.SubtitleRepositoryImpl
 import com.xinchen.echomind.data.repo.SafTreeGrantStore
 import com.xinchen.echomind.data.repo.TranscriptRepositoryImpl
+import com.xinchen.echomind.data.scan.MediaStoreAudioSource
 import com.xinchen.echomind.data.scan.SafTreeBrowser
 import com.xinchen.echomind.data.scan.SystemAudioMetadataReader
 import com.xinchen.echomind.domain.playback.PlaybackController
@@ -112,6 +114,9 @@ class EchoMindApp : Application() {
             nowMs = timeSource::wallMs,
             wmaStore = wmaStore,
             wmaPrepare = wmaPreparer,
+            // 本机音频（MediaStore）：扫描源与权限接缝成对装配（2026-10-27）
+            deviceSource = MediaStoreAudioSource(this),
+            mediaAudio = AndroidMediaAudioAccess(this),
         )
         val transcriptRepository = TranscriptRepositoryImpl(db, timeSource)
         val modelsRoot = File(filesDir, ModelCatalog.MODELS_DIR_NAME)
@@ -145,6 +150,7 @@ class EchoMindApp : Application() {
                     db.audioBookDao().setPreparedDuration(audioId, uri, durationMs, timeSource.wallMs())
                 },
                 engines = sharedEngines,
+                mediaAudio = AndroidMediaAudioAccess(this),
             ),
             transcriptWork = TranscriptWorkScheduler(this, transcriptRepository),
             liveTranscriptStore = liveTranscriptStore,

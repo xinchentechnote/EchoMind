@@ -7,6 +7,7 @@ import com.xinchen.echomind.core.conf.AudioFormats
 import com.xinchen.echomind.core.conf.PlaybackPolicy
 import com.xinchen.echomind.core.time.TimeSource
 import com.xinchen.echomind.data.repo.AudioRepository
+import com.xinchen.echomind.data.repo.MediaAudioAccess
 import com.xinchen.echomind.data.repo.TreeGrantStore
 import com.xinchen.echomind.data.repo.WmaPlaybackStore
 import com.xinchen.echomind.domain.asr.AsrChunkPlanner
@@ -76,6 +77,11 @@ class TranscriptCoordinator(
      * 生产装配传 `AppGraph` 里那一个（协调器本身也是单例，并发 run 共享它）；测试默认各自一个。
      */
     private val engines: SharedAsrEngines = SharedAsrEngines(modelsRoot),
+    /**
+     * 本机音频（MediaStore）书的运行时权限接缝。null（部分测试）= 跳过检查，
+     * 权限被撤时会落到解码失败，原因可读性差但行为不变。
+     */
+    private val mediaAudio: MediaAudioAccess? = null,
 ) {
 
     /**
@@ -107,6 +113,17 @@ class TranscriptCoordinator(
             val treeUri = target.treeUri
             if (treeUri == null || !grants.hasReadGrant(treeUri)) {
                 return fail(jobId, TranscriptFailure.PermissionRevoked, "文件夹授权已失效，请重新授权后重试：${treeUri ?: target.uri}")
+            }
+        }
+        if (target.needsMediaPermission) {
+            // 本机音频（MediaStore）书：读文件靠「音乐和音频」运行时权限。不查的话失败会落在解码环节，
+            // 用户看到的是「解码失败」而不是「去授予限」
+            if (mediaAudio?.isGranted() == false) {
+                return fail(
+                    jobId,
+                    TranscriptFailure.PermissionRevoked,
+                    "缺少「音乐和音频」读取权限，请在系统设置中授予后重试：${target.title}",
+                )
             }
         }
         val vadModel = vadModelFile() ?: return fail(

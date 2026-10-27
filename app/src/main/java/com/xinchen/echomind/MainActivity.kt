@@ -27,6 +27,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.xinchen.echomind.ui.nav.Destinations
+import com.xinchen.echomind.ui.device.DeviceAudioScreen
 import com.xinchen.echomind.ui.player.PlayerScreen
 import com.xinchen.echomind.ui.settings.SettingsScreen
 import com.xinchen.echomind.ui.shelf.ShelfScreen
@@ -94,6 +95,13 @@ private fun RootScreen() {
                 ShelfScreen(
                     onOpenPlayer = { audioId -> navController.navigate(Destinations.player(audioId)) },
                     onTranscribe = { audioId -> navController.navigate(Destinations.transcript(audioId)) },
+                    onOpenDeviceAudio = { navController.navigate(Destinations.DEVICE_AUDIO) },
+                )
+            }
+            composable(Destinations.DEVICE_AUDIO) {
+                DeviceAudioScreen(
+                    onBack = { navController.popBackStack() },
+                    onOpenPlayer = { audioId -> navController.navigate(Destinations.player(audioId)) },
                 )
             }
             composable(

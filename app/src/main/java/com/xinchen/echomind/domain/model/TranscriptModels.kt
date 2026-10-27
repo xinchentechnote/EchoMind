@@ -153,4 +153,9 @@ data class TranscriptionTarget(
     val isFilePresent: Boolean,
     val needsTreeGrant: Boolean,
     val treeUri: String?,
+    /**
+     * 本机音频（MediaStore）书：读 uri 靠的是「音乐和音频」运行时权限而不是 SAF 树授权，
+     * 协调器要在解码前检查它，权限被撤销时给出可操作的失败原因而不是笼统的「解码失败」。
+     */
+    val needsMediaPermission: Boolean = false,
 )

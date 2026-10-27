@@ -44,6 +44,10 @@
 | FR-109 | 不复制音频到 App 私有目录（默认直接读 SAF URI）；WMA 因系统播放器无解码能力，允许生成一份可播放的 m4a 转码产物 | 非 WMA 不产生副本；WMA 只保留成功原子就位的 `<audioId>.m4a`，删除书籍时一并清理 | **DONE**（普通格式仍直接读 SAF URI；WMA 产物集中在 `filesDir/transcoded/`，后台只写任务独占 `.part`，成功后原子替换，失败/取消/删书清理；设备上观察到 `.part → 32 MB m4a` 且无临时文件残留） |
 | FR-110 | 授权撤销（`SecurityException`）→ 播放/扫描给出「重新授权」入口，历史保留 | 撤销授权后进入 App 显示可操作的提示而不是崩溃 | **PARTIAL**（扫描侧：`PermissionRevokedException` → 提示「文件夹授权已失效，请重新授权」，重扫只跳过失效文件夹；系统侧真实撤销未实测，播放侧入口待 Phase 4） |
 | FR-111 | 扫描在后台线程/协程调度器执行，UI 有进度与可取消 | 大目录扫描不卡主线程（`Dispatchers.IO`） | **PARTIAL**（扫描在 `Dispatchers.IO`；WMA 的分钟级转码已移出导入 busy，确认目录后先回书架并提示“正在后台准备”，不会再拖住整批导入。扫描本身仍**没有取消**，也没有逐项进度 → Phase 7） |
+| FR-112 | **本机音频扫描**（2026-10-27，参考 VidNest）：按 MediaStore 扫描整机音频，扩展名白名单与 FR-103 一致（`core/conf/AudioFormats` 一处定义）；需要 `READ_MEDIA_AUDIO`（API 33+）/`READ_EXTERNAL_STORAGE`（26-32）运行时权限，只在进入本机音频页时请求 | 扫描在 `Dispatchers.IO`；白名单外的文件（ogg/opus/视频音轨等）不出现在列表里 | **DONE**（`MediaStoreAudioSource` 全量/子树两路查询；白名单过滤在内存里做；JVM 用例钉住扩展名判定与 LIKE 转义。见 `testing.md` §4「本机音频」） |
+| FR-113 | **按文件夹浏览**：卷 → 目录逐层下钻（子文件夹带递归计数），同一相对路径在不同卷上是独立文件夹；已加入书架的文件显示角标 | 每层只显示直接子文件夹与本层文件；返回键先上退一层再退出页面 | **DONE**（`DeviceAudioIndex` 纯 Kotlin 分组 + 11 项 JVM 单测；浏览数据不落库，每次进入重扫。UI 实测见 `testing.md` §4） |
+| FR-114 | **从本机音频导入**：整夹（含子层级）或单文件加入书架；伪文件夹 `mediastore://<volume>/<path>` 复用 `imported_folder`（级联删除/书架归属/转录投影不变）；单文件导入的差量只看该文件；媒体权限被撤时与 SAF 失效文件夹同一 `REVOKED` 语义，重扫跳过不删记录 | 重扫「重扫」按钮同时覆盖 SAF 文件夹与本机伪文件夹；删除书籍后收听历史保留 | **DONE**（`AudioRepositoryImpl.importScanned` 把 SAF 与 MediaStore 两条路的差量管线合成一份；仪器化 7 项覆盖建夹/去重/单文件不误伤/消失标 MISSING/rescanAll/撤权/子树不串目录） |
+| FR-115 | **书架按目录管理**（2026-10-28）：书架 tab 下有目录筛选行（「全部」+ 每个已导入文件夹一枚 chip，SAF 与本机伪文件夹同列，带书数角标、授权失效标注）；选中目录后可「重扫此文件夹 / 移除该文件夹记录」（级联删书记录与播放记忆，统计会话保留）；筛选与搜索/tab 正交 | 选中目录只显示该书；移除后目录消失、选中态归位；重扫只动该目录 | **DONE**（`ShelfRow` 增 `folder_id` 投影；`rescanFolder` 复用 `rescanOne` 分支（SAF 授权/媒体权限/伪文件夹三路同一份）；JVM 5 条 VM 用例 + 2 条仪器化（按夹重扫、不存在 id 抛错）；设备走查：筛选、重扫 snackbar、移除对话框与级联删除 DB 对账，见 `testing.md` §4 2026-10-28） |
 
 ## 2. 本地书架
 

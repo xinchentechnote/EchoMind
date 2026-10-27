@@ -11,6 +11,9 @@ import com.xinchen.echomind.data.db.ShelfRow
 import com.xinchen.echomind.data.scan.AudioMetadataReader
 import com.xinchen.echomind.domain.importing.AudioImportPlanner
 import com.xinchen.echomind.domain.importing.AudioTreeWalker
+import com.xinchen.echomind.domain.importing.DeviceAudioEntry
+import com.xinchen.echomind.domain.importing.DeviceAudioFolderRef
+import com.xinchen.echomind.domain.importing.DeviceAudioSource
 import com.xinchen.echomind.domain.importing.PermissionRevokedException
 import com.xinchen.echomind.domain.importing.TreeBrowser
 import com.xinchen.echomind.domain.model.ExistingAudio
@@ -60,13 +63,36 @@ interface AudioRepository {
      * 转录要读的那一本书（`asr/TranscriptCoordinator` 的唯一入口）。
      *
      * worker 也不许直接查 DAO（`domain/transcript/TranscriptRepository` 的约定），
-     * 所以「 uri 在哪、文件还在不在、要不要 SAF 授权、授权挂在哪棵树上」由这里投影成纯 Kotlin 的 [TranscriptionTarget]。
-     * 树 uri 必须在这里一起给出：文档 uri 与树 uri 长得不一样，拿文档 uri 查授权必然查不到。
+     * 所以「 uri 在哪、文件还在不在、要什么权限」由这里投影成纯 Kotlin 的 [TranscriptionTarget]：
+     * SAF 书需要树授权（[TranscriptionTarget.needsTreeGrant]），本机音频书需要媒体读取权限
+     * （[TranscriptionTarget.needsMediaPermission]）。
      */
     suspend fun transcriptionTarget(audioId: String): TranscriptionTarget?
 
     suspend fun importFolder(treeUri: Uri): ImportOutcome
+
+    /**
+     * 本机音频（MediaStore 伪文件夹，见 [DeviceAudioFolders]）导入：该目录子树（含子层级）。
+     * 媒体读取权限缺失时抛 [PermissionRevokedException]。
+     */
+    suspend fun importDeviceFolder(volume: String, relativePath: String): ImportOutcome
+
+    /** 本机音频单文件导入：只差量这一个文件，同伪文件夹下的其他书不受影响 */
+    suspend fun importDeviceFile(file: DeviceAudioEntry): ImportOutcome
+
+    /** 全量扫描本机支持格式的音频（本机音频浏览页每次进入重建索引，不落库） */
+    suspend fun scanDeviceAudio(): List<DeviceAudioEntry>
+
+    /** 当前在书架上的全部 uri（本机音频页的「已在书架」角标） */
+    suspend fun deviceImportedUris(): Set<String>
+
+    /** 本机音频的运行时权限状态：UI 的权限门与请求都以此为准 */
+    val mediaAudioAccess: MediaAudioAccess?
+
     suspend fun rescanAll(): List<ImportOutcome>
+
+    /** 只重扫一个文件夹（书架目录管理的「重扫此文件夹」）；文件夹已删则抛 [NoSuchElementException] */
+    suspend fun rescanFolder(folderId: String): ImportOutcome
     suspend fun rename(audioId: String, title: String)
     suspend fun setFavorite(audioId: String, favorite: Boolean)
     suspend fun removeBook(audioId: String)
@@ -89,6 +115,10 @@ class AudioRepositoryImpl(
     private val wmaStore: WmaPlaybackStore? = null,
     /** WMA 后台准备器；null（部分测试）时只入库，不生成可播放的 m4a。 */
     private val wmaPrepare: WmaImportPreparer? = null,
+    /** 本机音频（MediaStore）扫描源；null（部分测试）= 本机音频导入不可用 */
+    private val deviceSource: DeviceAudioSource? = null,
+    /** 本机音频读取权限；与 [deviceSource] 成对装配 */
+    private val mediaAudio: MediaAudioAccess? = null,
 ) : AudioRepository {
 
     override fun shelf(tab: ShelfTab, query: String): Flow<List<ShelfRow>> = when (tab) {
@@ -103,16 +133,18 @@ class AudioRepositoryImpl(
 
     override suspend fun transcriptionTarget(audioId: String): TranscriptionTarget? =
         audioBookDao.getById(audioId)?.let { book ->
-            val needsTreeGrant = book.uri.startsWith("content://")
+            // folder_id 是外键（ON DELETE CASCADE），书还在则文件夹行必在
+            val folderTreeUri = folderDao.byId(book.folderId)?.treeUri
+            val isDevice = folderTreeUri != null && DeviceAudioFolders.isDeviceFolder(folderTreeUri)
             TranscriptionTarget(
                 audioId = book.id,
                 uri = book.uri,
                 title = book.title,
                 fileName = book.fileName,
                 isFilePresent = book.fileStatus == AudioBookEntity.FileStatus.Present,
-                needsTreeGrant = needsTreeGrant,
-                // 只在 SAF 那侧查：folder_id 是外键（ON DELETE CASCADE），书还在则文件夹行必在
-                treeUri = if (needsTreeGrant) folderDao.byId(book.folderId)?.treeUri else null,
+                needsTreeGrant = !isDevice && book.uri.startsWith("content://"),
+                needsMediaPermission = isDevice,
+                treeUri = folderTreeUri,
             )
         }
 
@@ -146,10 +178,124 @@ class AudioRepositoryImpl(
             val duration = if (WmaPlaybackStore.isWma(file.fileName)) null else metadataReader.durationMs(file.uri)
             file to duration
         }
+        importScanned(folder, scanned, truncated = walk.truncated)
+    }
 
-        val existing = audioBookDao.existingForFolder(folderId).map {
-            ExistingAudio(it.id, it.uri, it.sizeBytes, it.lastModifiedMs, it.titleIsManual, it.fileMissing)
+    override suspend fun importDeviceFolder(volume: String, relativePath: String): ImportOutcome =
+        withContext(Dispatchers.IO) {
+            ensureMediaAudioGranted()
+            val source = deviceSource ?: error("本机音频导入未装配 DeviceAudioSource")
+            val uriText = DeviceAudioFolders.treeUri(volume, relativePath)
+            val folder = upsertDeviceFolder(uriText, volume, relativePath)
+            importScanned(
+                folder,
+                source.filesUnder(volume, relativePath).map { it.toScanned() to it.readDuration() },
+                truncated = false,
+            )
         }
+
+    override suspend fun importDeviceFile(file: DeviceAudioEntry): ImportOutcome = withContext(Dispatchers.IO) {
+        ensureMediaAudioGranted()
+        val uriText = DeviceAudioFolders.treeUri(file.volume, file.relativePath)
+        val folder = upsertDeviceFolder(uriText, file.volume, file.relativePath)
+        // restrictToUri：差量只看这一个文件。不过滤的话，existingForFolder 会把同伪文件夹下
+        // 这次没扫的其他书全标成 MISSING——单文件导入只知道自己这一个文件在不在。
+        importScanned(
+            folder,
+            listOf(file.toScanned() to file.readDuration()),
+            truncated = false,
+            restrictToUri = file.uri,
+        )
+    }
+
+    override suspend fun scanDeviceAudio(): List<DeviceAudioEntry> = withContext(Dispatchers.IO) {
+        val source = deviceSource ?: error("本机音频扫描未装配 DeviceAudioSource")
+        source.scanAll()
+    }
+
+    override suspend fun deviceImportedUris(): Set<String> = audioBookDao.allUris().toSet()
+
+    override val mediaAudioAccess: MediaAudioAccess? get() = mediaAudio
+
+    /** 全量重扫 = 对每个文件夹跑同一段分支逻辑（FR-110：失效只跳过，不拖垮整批） */
+    override suspend fun rescanAll(): List<ImportOutcome> = folderDao.getAll().map { rescanOne(it) }
+
+    override suspend fun rescanFolder(folderId: String): ImportOutcome {
+        val folder = folderDao.byId(folderId) ?: throw NoSuchElementException("文件夹已不存在：$folderId")
+        return rescanOne(folder)
+    }
+
+    private suspend fun rescanOne(folder: ImportedFolderEntity): ImportOutcome = when {
+        DeviceAudioFolders.isDeviceFolder(folder.treeUri) -> {
+            val volumePath = DeviceAudioFolders.parse(folder.treeUri)
+                ?: error("伪文件夹 tree_uri 无法解析：${folder.treeUri}")
+            // 装配漏了权限接缝时宁可炸出来，也不能把「没检查」当成「没授权」误标 REVOKED
+            val access = mediaAudio ?: error("重扫遇到本机音频伪文件夹（${folder.treeUri}）但装配缺少 MediaAudioAccess")
+            if (!access.isGranted()) {
+                folderDao.setPermissionState(folder.id, ImportedFolderEntity.PermissionState.Revoked)
+                revokedOutcome(folder.id)
+            } else {
+                importDeviceFolder(volumePath.first, volumePath.second)
+            }
+        }
+
+        !grants.hasReadGrant(folder.treeUri) -> {
+            folderDao.setPermissionState(folder.id, ImportedFolderEntity.PermissionState.Revoked)
+            revokedOutcome(folder.id)
+        }
+
+        else -> importFolder(Uri.parse(folder.treeUri))
+    }
+
+    private fun revokedOutcome(folderId: String) = ImportOutcome(
+        folderId = folderId,
+        added = 0,
+        changed = 0,
+        vanished = 0,
+        revived = 0,
+        unchanged = 0,
+        alreadyOnShelf = 0,
+        truncated = false,
+        permissionRevoked = true,
+    )
+
+    override suspend fun rename(audioId: String, title: String) =
+        audioBookDao.rename(audioId, title.trim(), nowMs())
+
+    override suspend fun setFavorite(audioId: String, favorite: Boolean) =
+        audioBookDao.setFavorite(audioId, favorite, nowMs())
+
+    /** 删书：级联删播放记忆，但 listening_session 无外键，历史保留（NFR-04）；WMA 书连转码产物一起清 */
+    override suspend fun removeBook(audioId: String) {
+        // 有准备器时，取消与文件清理由它在同一把 generation 锁内完成。这里再删一次会留下窗口：
+        // 快速重导入的新任务刚创建 `.part`，却被旧 removeBook 的第二次 delete 误删。
+        if (wmaPrepare != null) wmaPrepare.cancel(audioId) else wmaStore?.delete(audioId)
+        audioBookDao.delete(audioId)
+    }
+
+    override suspend fun removeFolder(folderId: String) {
+        folderDao.delete(folderId)
+    }
+
+    override suspend fun markPermissionRevoked(folderId: String) =
+        folderDao.setPermissionState(folderId, ImportedFolderEntity.PermissionState.Revoked)
+
+    // ── 内部：SAF 与 MediaStore 两条导入路共享的差量管线 ─────────────────────────────
+
+    /**
+     * 拿到扫描结果之后的所有事：差量判定、插新、改变更、标消失/回来、WMA 后台准备、markScanned。
+     * SAF 树与本机伪文件夹只在前半段（怎么扫出 [ScannedAudioFile] 列表）不同，后半段必须同一份。
+     */
+    private suspend fun importScanned(
+        folder: ImportedFolderEntity,
+        scanned: List<Pair<ScannedAudioFile, Long?>>,
+        truncated: Boolean,
+        restrictToUri: String? = null,
+    ): ImportOutcome {
+        val now = nowMs()
+        val existing = audioBookDao.existingForFolder(folder.id).map {
+            ExistingAudio(it.id, it.uri, it.sizeBytes, it.lastModifiedMs, it.titleIsManual, it.fileMissing)
+        }.let { list -> if (restrictToUri == null) list else list.filter { e -> e.uri == restrictToUri } }
         val plan = AudioImportPlanner.plan(existing, scanned.map { it.first })
 
         val newUris = plan.newFiles.map { it.uri }.toSet()
@@ -157,7 +303,7 @@ class AudioRepositoryImpl(
             AudioBookEntity(
                 id = stableIdFromUri(file.uri),
                 uri = file.uri,
-                folderId = folderId,
+                folderId = folder.id,
                 relativePath = file.relativePath,
                 fileName = file.fileName,
                 title = TitleDeriver.defaultTitle(file.fileName),
@@ -223,60 +369,60 @@ class AudioRepositoryImpl(
             val audioId = stableIdFromUri(file.uri)
             wmaPrepare?.schedule(audioId, file.uri, force = audioId in forcePrepareIds) == true
         }
-        folderDao.markScanned(folderId, now)
+        folderDao.markScanned(folder.id, now)
 
-        ImportOutcome(
-            folderId = folderId,
+        return ImportOutcome(
+            folderId = folder.id,
             added = entitiesToInsert.size,
             changed = plan.changed.size,
             vanished = plan.vanishedIds.size,
             revived = plan.revivedIds.size,
             unchanged = plan.unchangedCount,
             alreadyOnShelf = alreadyOnShelf.size,
-            truncated = walk.truncated,
+            truncated = truncated,
             preparingWma = preparingWma,
         )
     }
 
-    /** 一个文件夹失去授权不能拖垮整批重扫：它标成 REVOKED 并回报，其余照常扫描（FR-110） */
-    override suspend fun rescanAll(): List<ImportOutcome> = folderDao.getAll().map { folder ->
-        if (!grants.hasReadGrant(folder.treeUri)) {
-            folderDao.setPermissionState(folder.id, ImportedFolderEntity.PermissionState.Revoked)
-            ImportOutcome(
-                folderId = folder.id,
-                added = 0,
-                changed = 0,
-                vanished = 0,
-                revived = 0,
-                unchanged = 0,
-                alreadyOnShelf = 0,
-                truncated = false,
-                permissionRevoked = true,
-            )
-        } else {
-            importFolder(Uri.parse(folder.treeUri))
+    /** MediaStore 伪文件夹行：首次出现就建，重扫/单文件导入复用同一行 */
+    private suspend fun upsertDeviceFolder(treeUri: String, volume: String, relativePath: String): ImportedFolderEntity {
+        val folderId = stableIdFromUri(treeUri)
+        val existing = folderDao.byTreeUri(treeUri)
+        val now = nowMs()
+        // 伪文件夹没有「授权时刻」，grantedAtMs 记首次导入时刻，语义是「开始用这个文件夹的时间」
+        val folder = existing ?: ImportedFolderEntity(
+            id = folderId,
+            treeUri = treeUri,
+            displayName = deviceFolderDisplayName(volume, relativePath),
+            grantedAtMs = now,
+        )
+        folderDao.upsert(folder.copy(permissionState = ImportedFolderEntity.PermissionState.Granted))
+        return folder
+    }
+
+    private fun deviceFolderDisplayName(volume: String, relativePath: String): String {
+        val volumeName = DeviceAudioFolderRef.volumeDisplayName(volume)
+        val path = relativePath.trim('/')
+        return if (path.isEmpty()) volumeName else "$volumeName/$path"
+    }
+
+    private fun ensureMediaAudioGranted() {
+        val access = mediaAudio ?: error("本机音频导入需要装配 MediaAudioAccess")
+        if (!access.isGranted()) {
+            throw PermissionRevokedException("没有「音乐和音频」读取权限，无法读取本机音频（${access.permissionName()}）")
         }
     }
 
-    override suspend fun rename(audioId: String, title: String) =
-        audioBookDao.rename(audioId, title.trim(), nowMs())
+    /** MediaStore 行 → 导入差量判定的输入；书的 relative_path 与 SAF 导入同口径（目录/文件名） */
+    private fun DeviceAudioEntry.toScanned() = ScannedAudioFile(
+        uri = uri,
+        relativePath = bookRelativePath,
+        fileName = fileName,
+        sizeBytes = sizeBytes,
+        lastModifiedMs = lastModifiedMs,
+    )
 
-    override suspend fun setFavorite(audioId: String, favorite: Boolean) =
-        audioBookDao.setFavorite(audioId, favorite, nowMs())
-
-    /** 删书：级联删播放记忆，但 listening_session 无外键，历史保留（NFR-04）；WMA 书连转码产物一起清 */
-    override suspend fun removeBook(audioId: String) {
-        // 有准备器时，取消与文件清理由它在同一把 generation 锁内完成。这里再删一次会留下窗口：
-        // 快速重导入的新任务刚创建 `.part`，却被旧 removeBook 的第二次 delete 误删。
-        if (wmaPrepare != null) wmaPrepare.cancel(audioId) else wmaStore?.delete(audioId)
-        audioBookDao.delete(audioId)
-    }
-
-    override suspend fun removeFolder(folderId: String) {
-        folderDao.delete(folderId)
-    }
-
-    override suspend fun markPermissionRevoked(folderId: String) =
-        folderDao.setPermissionState(folderId, ImportedFolderEntity.PermissionState.Revoked)
-
+    /** WMA 与「MediaStore 没给时长」都返回 null（= 时长未知），真实时长由后台转码回填 */
+    private fun DeviceAudioEntry.readDuration(): Long? =
+        if (WmaPlaybackStore.isWma(fileName)) null else durationMs.takeIf { it > 0 }
 }

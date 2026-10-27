@@ -13,6 +13,9 @@ object Destinations {
     const val STATS = "stats"
     const val SETTINGS = "settings"
 
+    /** 本机音频浏览页（MediaStore 扫描，按文件夹下钻）。下钻状态在 ViewModel 里，不进路由 */
+    const val DEVICE_AUDIO = "device"
+
     fun player(audioId: String) = "player/$audioId"
 
     fun transcript(audioId: String) = "transcript?audioId=$audioId"

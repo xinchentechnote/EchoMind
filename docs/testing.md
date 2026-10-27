@@ -62,6 +62,8 @@ source ~/android-dev/env.sh     # 否则 GRADLE_USER_HOME 退回 ~/.gradle，且
 - **WorkManager 的前台服务要在自己清单里合并出类型**（Phase 6d 实测，点「开始转录」直接崩）：光有 `FOREGROUND_SERVICE_DATA_SYNC` 权限不够，Android 14+ 还查**起服务那个组件**的 `foregroundServiceType`。`setForeground(dataSync)` 会去起 `androidx.work.impl.foreground.SystemForegroundService`，而 work-runtime 2.12.0 清单里它的类型是空的，报错原文 `foregroundServiceType 0x00000001 is not a subset of foregroundServiceType attribute 0x00000000 in service element of manifest file`。修法是 `<service android:name="androidx.work.impl.foreground.SystemForegroundService" android:foregroundServiceType="dataSync" tools:node="merge" />`；**验收要看合并后的清单**（`app/build/intermediates/merged_manifests/`）或装好的包，读源码看不出来。
 - **底部导航别对带参数的路由用 `saveState`/`restoreState`**（Phase 6d 实测）：`popUpTo(start){saveState=true}` + `restoreState=true` 会把被 pop 的返回栈存起来再恢复；转录页是 `transcript?audioId=…`，恢复时把「转录这本书？」卡片连同 ViewModel 状态一起复活，表现是**点底部标签毫无反应**。去掉这两个 flag、只留 `popUpTo(start)` + `launchSingleTop` 就好了（`MainActivity.kt` 里有注释）。
 - **测音频内容必须自己数零字节**（Phase 6 实测）：书架那批「《三体》」素材帧体 99% 是 `0x00`，也就是静音。它能通过所有「长度类」断言（时长、进度、切歌、样本数），所以只要断言里出现 `peak`/`rms`，就必须同时准备**一份真音频**和**一份静音对照**。素材放 `getExternalFilesDir("asr-fixtures")`：读写自己的 external 目录不需要运行时权限，`adb push` 就能放。
+- **模型暖机可以不用搬 243 MB 了**（2026-10-28 实测，D39 模型内置之后）：`adb install -r` + 启动一次 App，`ModelManager.ensureProvisioned` 约 40 s 把 Paraformer/VAD 从 assets 拷进 `filesDir/models/`（验收：`run-as … find files/models -name '*.onnx'` 出两个文件）。只有 SenseVoice 不在 assets 里，仍要从 `app/libs/models/sense-voice-zh-en-ja-ko-yue/` 按 §2b 的 run-as 拷进 `files/models/sense-voice-zh-en-ja-ko-yue-int8/`。暖机必须与 `connectedDebugAndroidTest` **在同一条命令里**连着做——gradle 跑完就会卸载 App，中间任何一步落了单，下一轮就是 21 条「缺少模型/素材」的红。
+- **adb push 进 `/sdcard` 的音频会被 MediaStore 标 `is_pending=1`**（2026-10-28 本机音频实测）：App 查询不可见（owner=shell 才可见），`content query` 能看到但 `MediaStoreAudioSource` 查不到，表现是「明明推了 9 个文件只扫出 5 个」。清法：`adb shell content call --uri content://media/ --method scan_volume --arg external_primary`，跑完 pending 全部归零。真实用户经文件管理器/MTP 拷贝不受影响。
 
 ## 3. 测试分层策略
 
@@ -960,6 +962,89 @@ ffmpeg 编码形态）。另外复核发现上一轮的 LAME mp3 支路从未真
   `b4f304ace4b3e211e31886f6a6d4b94147dfad7d650f9304b2b57f767871e3d6`（与 v0.1.3 同一把 key，可直接覆盖安装保数据；
   安装后数据库走 v3→v4 迁移）。release 资产：`EchoMind-v0.1.4-debug.apk`、`libwma-arm64-v8a-e12081cb.so`
   （1,329,656 B，SHA-256 `e12081cb…ad15513b5`，CI 取回用）。
+
+### 书架按目录管理（目录筛选 + 按夹重扫/移除，2026-10-28）
+
+**功能口径**（FR-115）：书架 tab 下目录筛选行（「全部」+ 每个已导入文件夹一枚 chip；SAF 与本机伪文件夹同列；
+chip 文案 = 显示名末段 · 书数，授权失效追加「（失效）」）；筛选与搜索/tab 正交；选中目录后行尾 ⋮ 给
+「重扫此文件夹 / 移除该文件夹记录」（确认框写明级联删书、统计会话保留）；「继续上次收听」卡只在无目录筛选时出现。
+
+**测试数字**（`drill36` AVD，API 36）：
+
+- JVM：**312 / 0**。`ShelfViewModelTest` 重写为 5 条（原 2 条保留）：选中文件夹只看该书且**计数角标来自全量行**
+  （选中 f1 后 f2 的计数不归零）、按夹重扫回显单夹结果、移除后选中态归位并提示保留历史。
+- 仪器化：**+2 条**（`am instrument` 免卸载补跑 OK）：SAF `rescanFolder只重扫指定的文件夹`（另一夹不动；
+  不存在的 id 抛 `NoSuchElementException`）与伪文件夹 `rescanFolder对伪文件夹走同一段分支`。
+
+**真实 UI 走查**（截图 `/tmp/21~28-*.png`，dump 均含 `</hierarchy>`）：
+
+1. 书架 tab 下出现「全部 / Podcasts · 1 / 我的_有声书 · 2」chip 行；平铺列表 3 本。
+2. 点「我的_有声书 · 2」→ 列表只剩该夹 2 本，chip 选中态正确。
+3. ⋮ → 「重扫此文件夹」→ snackbar「文件夹已重扫：新增 0，更新 0，消失 0」（刚导入无变化，符合预期）。
+4. ⋮ → 「移除该文件夹记录…」→ 确认框显示全名「内部存储/Music/我的_有声书」+ 2 本书 + 历史保留说明 →
+   点「移除」→ chip 只剩 Podcasts、选中态归位「全部」、列表只剩 ep1；`run-as sqlite3` 复核
+   `imported_folder` 只剩 Podcasts 伪文件夹、`audio_book` count=1（级联删除正确）。
+
+**诚实边界**：①「授权失效」chip 的「（失效）」后缀只有代码路径与 VM 单测，没有在设备上真撤销权限造出失效态；
+②移除文件夹级联删播放记忆由外键 CASCADE 保证（既有仪器化覆盖），本轮只对账了书数。
+
+### 本机音频扫描（MediaStore + 按文件夹浏览导入，2026-10-27 ~ 10-28）
+
+**功能口径**（FR-112/113/114，决策 D48，参考 VidNest 的层级浏览）：书架顶栏「本机」→ 权限门 → MediaStore
+全量扫描 → 卷 → 目录逐层下钻 → 整夹/单文件加入书架。伪文件夹 `mediastore://<volume>/<path>` 复用
+`imported_folder`，差量管线与 SAF 导入共用一份（`importScanned`）。
+
+**测试数字**（`drill36` AVD，API 36；本轮为冷启动 AVD，先按 §2b 的暖机程序摆好模型与素材）：
+
+- JVM：**309 / 0**。新增 `DeviceAudioIndexTest` 13 条（根层分组、跨卷隔离、子树前缀不误匹配 `Music1`、深层 ref 全路径、
+  相对路径规范化、DATA 推导、LIKE 转义、扩展名白名单与 SAF 遍历同一规则）、`DeviceAudioViewModelTest` 6 条
+  （选卷/下钻/上退状态机、整夹导入后角标与提示、单文件导入、已导入静默、权限授予即开扫/拒绝进 Blocked）。
+  两个 ViewModel 测试假仓储补齐了新接口成员。
+- 仪器化：**131 / 131**（JVM 之外，同一 HEAD 构建上：完整 `connectedDebugAndroidTest` 一轮 **130 / 1**——唯一的红
+  `中文书解前两分钟回归` 是暖机脚本把 App 刚供应好的 `silero_vad.onnx` 覆盖成 0 字节所致
+  （`cat 不存在的 /data/local/tmp 文件 > 目标` 的重定向副作用，与代码无关），修好模型后用 §2b 的
+  `am instrument` 免卸载跑法补跑 **OK (1 test)**；此前三次 gradle 运行的红全部是冷 AVD 缺素材/模型的环境问题
+  ——失败原文都是「缺少音频素材/缺少模型」的 fail-fast 断言）。新增
+  `DeviceAudioImportTest` 7 条：真 MediaStore 插入占位音频行 → 整夹导入建伪文件夹（`tree_uri` 全路径、
+  `display_name=内部存储/Music/<dir>`）→ 重复导入不重复建记录 → **单文件导入不误伤同夹其他书**
+  （`restrictToUri` 差量，防 VANISHED 误标）→ 删除文件后重扫标 MISSING 而另一本仍 PRESENT →
+  `rescanAll` 把伪文件夹交给 MediaStore 重扫 → 撤权后导入抛 `PermissionRevokedException`、重扫标 REVOKED
+  且不删记录 → 子树查询不串 `Music1` 这类前缀相似目录。权限用 UiAutomation 真授予/撤销。
+
+**真实 UI 走查**（emulator-5554，`uiautomator dump` 均含 `</hierarchy>`，截图 `/tmp/0x-*.png`）：
+
+1. 书架顶栏出现「本机」入口；未授权时进入显示权限门（说明文案含「SAF 导入的文件夹不受影响」）。
+2. 点「授予读取权限」→ 系统 `READ_MEDIA_AUDIO` 弹窗（API 36 显示为「访问音乐和音频」）→ ALLOW →
+   自动开扫。卷层显示「内部存储 / 9 首」。
+3. 内部存储 → `Music`：子文件夹 `Podcasts (1 首)`、`我的_有声书 (2 首)` 各带「导入」按钮，直属文件 6 个
+   带时长/大小；目录名含下划线正常显示（LIKE 转义路径）。
+4. 点 `我的_有声书` 的「导入」→ 库里出现伪文件夹
+   `mediastore://external_primary/Music/我的_有声书`（display_name `内部存储/Music/我的_有声书`，
+   `run-as sqlite3` 复核）与两本书（`三体` / `黑暗森林`，`relative_path=Music/我的_有声书/…`，
+   时长取 MediaStore 的 139 ms 真值）；文件夹页两行都显示「已在书架」角标。
+5. 点已导入的文件行 → 直达播放页，MediaStore URI 真实加载（`dumpsys media_session` active item，
+   position 143 ms）；首播触发 FR-512 自动转录，139 ms 的 TTS 素材无语音 → 协调器按 §8 诚实判
+   `FAILED(OutputUnreliable)`，转录页给「重试/删除」，**本机音频书的媒体权限检查在链路里通过**
+   （未出现权限失败分支）。
+6. 返回键层级语义：`我的_有声书` →（BACK）→ `Music` →（BACK）→ 卷层 →（BACK）→ 退出页面。
+7. 书架 tab：两本书在列，「继续上次收听」卡显示 `黑暗森林`。
+
+**实测抓到并修掉的真 bug（只看代码看不出来）**：
+
+- **子文件夹 ref 存了相对段**：`childrenOf` 给子文件夹的 `DeviceAudioFolderRef.path` 存的是
+  `我的_有声书` 而不是 `Music/我的_有声书`——卷根层 `removePrefix("")` 恰好等于全路径、单测又只断言
+  `displayName`，两层遮蔽下第一轮设备实测才暴露：下钻进子文件夹「这里没有扫描到支持的音频」、整夹导入
+  建出**缺父路径的伪文件夹**（`mediastore://external_primary/我的_有声书`，导入 0 首）。修复 = 子文件夹
+  ref 一律存全路径，`DeviceAudioIndexTest` 改为断言 `ref.path` 并新增三层深路径用例。错误数据已用
+  `run-as sqlite3` 清除后复测。
+- **「已导入 5 首」≠ 媒体库 9 行**：App 查询少 4 行不是查询 bug——adb push 进 `/sdcard/Music` 的文件被
+  MediaStore 标 `is_pending=1`（App 不可见，owner=shell 才可见）。`content call --uri content://media/
+  --method scan_volume --arg external_primary` 后 pending 清零、9 行全出。这属于测试素材摆放口径，
+  已记入 §2b 暖机程序；真实用户经文件管理器/MTP 拷贝的文件不受影响。
+
+**诚实边界**：①API 26-28 的 legacy 路径（DATA 推导目录 + LIKE 前缀子树）只有 JVM 单测，没有老系统设备
+可跑；②多卷（SD 卡）场景模拟器只有一个 external_primary 卷，跨卷隔离由 JVM 单测覆盖；③「已在书架」
+角标以内存集合刷新为准，导入后立即刷新，不经数据库观察流。
 
 ### v0.1.3 热修：WMA 不再阻塞文件夹导入（用户真机反馈，2026-10-17）
 
