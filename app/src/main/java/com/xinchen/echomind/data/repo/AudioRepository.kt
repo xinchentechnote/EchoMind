@@ -145,6 +145,7 @@ class AudioRepositoryImpl(
                 needsTreeGrant = !isDevice && book.uri.startsWith("content://"),
                 needsMediaPermission = isDevice,
                 treeUri = folderTreeUri,
+                fileLastModifiedMs = book.fileLastModifiedMs,
             )
         }
 

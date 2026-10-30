@@ -16,7 +16,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavController
@@ -28,6 +30,7 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.xinchen.echomind.ui.nav.Destinations
 import com.xinchen.echomind.ui.device.DeviceAudioScreen
+import com.xinchen.echomind.ui.player.NowPlayingBar
 import com.xinchen.echomind.ui.player.PlayerScreen
 import com.xinchen.echomind.ui.settings.SettingsScreen
 import com.xinchen.echomind.ui.shelf.ShelfScreen
@@ -60,28 +63,45 @@ private fun RootScreen() {
     val navController = rememberNavController()
     val backStack by navController.currentBackStackEntryAsState()
     val currentRoute = backStack?.destination
+    // 「正在播放」条读的是全 App 唯一那份播放状态（与播放页同源），不经 ViewModel：它不属于任何一个页面
+    val app = LocalContext.current.applicationContext as EchoMindApp
+    val playback by app.graph.playbackController.state.collectAsStateWithLifecycle()
+    val onPlayerRoute = currentRoute?.hierarchy?.any { it.route == Destinations.PLAYER } == true
 
     Scaffold(
         bottomBar = {
-            NavigationBar {
-                tabs.forEach { tab ->
-                    NavigationBarItem(
-                        // 转录页还有一条带查询参数的路由（`transcript?audioId=…`），比对只看 `?` 之前那一段，
-                        // 否则从书架跳过去之后底部「转录」标签就不亮了
-                        selected = currentRoute?.hierarchy?.any { it.route?.substringBefore('?') == tab.route } == true,
-                        onClick = {
-                            // 刻意不用 saveState/restoreState：带参数的转录页被 pop 掉之后，
-                            // restoreState 会把它连同「转录这本书？」卡片一起复活，实测点「书架」根本切不走。
-                            // 标签页的滚动位置记忆不值得换这个 bug
-                            navController.navigate(tab.route) {
-                                popUpTo(navController.graph.findStartDestination().id)
-                                launchSingleTop = true
-                            }
+            Column {
+                // FR-312：播放页不是底部标签，切标签会把它 pop 掉；队列里有书且不在播放页时给一条回去的路
+                val nowPlayingId = playback.audioId
+                if (nowPlayingId != null && !onPlayerRoute) {
+                    NowPlayingBar(
+                        state = playback,
+                        onOpenPlayer = {
+                            navController.navigate(Destinations.player(nowPlayingId)) { launchSingleTop = true }
                         },
-                        alwaysShowLabel = false,
-                        icon = { Text(tab.label.first().toString()) },
-                        label = { Text(tab.label) },
+                        onTogglePlayPause = { app.graph.playbackController.togglePlayPause() },
                     )
+                }
+                NavigationBar {
+                    tabs.forEach { tab ->
+                        NavigationBarItem(
+                            // 转录页还有一条带查询参数的路由（`transcript?audioId=…`），比对只看 `?` 之前那一段，
+                            // 否则从书架跳过去之后底部「转录」标签就不亮了
+                            selected = currentRoute?.hierarchy?.any { it.route?.substringBefore('?') == tab.route } == true,
+                            onClick = {
+                                // 刻意不用 saveState/restoreState：带参数的转录页被 pop 掉之后，
+                                // restoreState 会把它连同「转录这本书？」卡片一起复活，实测点「书架」根本切不走。
+                                // 标签页的滚动位置记忆不值得换这个 bug
+                                navController.navigate(tab.route) {
+                                    popUpTo(navController.graph.findStartDestination().id)
+                                    launchSingleTop = true
+                                }
+                            },
+                            alwaysShowLabel = false,
+                            icon = { Text(tab.label.first().toString()) },
+                            label = { Text(tab.label) },
+                        )
+                    }
                 }
             }
         },

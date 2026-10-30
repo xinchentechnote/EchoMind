@@ -184,6 +184,16 @@ class TranscriptDisplayTest {
     }
 
     @Test
+    fun `中断的文案不再说已识别的部分没有保留`() {
+        // FR-512 起断点会保留已识别的段（2026-10-30）：文案必须跟着行为走（AGENTS.md §7），
+        // 既不许再吓用户「从头再来」，也不能把话说满——断点失效（文件变过/换模型）时确实会从头识别
+        val guide = TranscriptDisplay.failureGuide(TranscriptFailure.Interrupted)
+        assertTrue("该说从断点继续：$guide", guide.contains("断点"))
+        assertFalse("不许再说「没有保留」：$guide", guide.contains("没有保留"))
+        assertTrue("断点失效的情形也要说清：$guide", guide.contains("从头识别"))
+    }
+
+    @Test
     fun `不合格占比那句话跟着常量走`() {
         // 阈值只许一处定义（AGENTS.md §3）：改了 AudioFormats 这里必须跟着变，不许 UI 自己抄一份 20
         val guide = TranscriptDisplay.failureGuide(TranscriptFailure.OutputUnreliable)

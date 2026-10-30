@@ -538,6 +538,7 @@ private fun row(
     uri = "content://audio/$id",
     title = title,
     fileName = fileName,
+    relativePath = "$id.mp3",
     durationMs = durationMs,
     sizeBytes = 1_000_000,
     fileStatus = "OK",

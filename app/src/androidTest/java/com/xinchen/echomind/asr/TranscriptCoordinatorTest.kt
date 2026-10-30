@@ -20,6 +20,7 @@ import com.xinchen.echomind.data.repo.TreeGrantStore
 import com.xinchen.echomind.data.repo.TranscriptRepositoryImpl
 import com.xinchen.echomind.data.repo.WmaPlaybackStore
 import com.xinchen.echomind.data.scan.AudioMetadataReader
+import com.xinchen.echomind.domain.asr.SentenceSplitter
 import com.xinchen.echomind.domain.importing.TreeBrowser
 import com.xinchen.echomind.domain.importing.TreeEntry
 import com.xinchen.echomind.domain.model.EnqueueOutcome
@@ -36,6 +37,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -555,6 +557,131 @@ class TranscriptCoordinatorTest {
         assertEquals(ModelCatalog.paraformer.id, row.modelId)
         assertEquals(ModelCatalog.refOf(ModelCatalog.paraformer).version, row.modelVersion)
         assertTrue(subtitles().isNotEmpty())
+    }
+
+    /**
+     * FR-512 转录断点的端到端（2026-10-30）：同一份素材跑三遍——
+     * ①一遍到底（基线）；②识别到第 6 段置取消位（模拟进程被杀前的中断），断点必须落盘；
+     * ③重试后从断点续跑。断言三件事：
+     * - **续跑是真的**：续跑那轮的第一次进度上报就带着断点攒下的段数（≥6），不是从 0 爬；
+     * - **结果与一遍跑完逐句一致**（起点、终点、文本全同）——断点处不丢一句、不重一句，
+     *   这是「断点续跑不会把字幕搞坏」的直接证据；
+     * - 成功收口后断点文件必删。
+     */
+    @Test
+    fun 中断后重试从断点续跑结果与一遍跑完逐句一致() = runBlocking {
+        val uri = fileUriOf(DeviceAsrFixtures.REAL_MP3)
+        val checkpoints = TranscriptCheckpointStore(
+            File(context.cacheDir, "coordinator-checkpoint-${System.nanoTime()}"),
+        )
+        fun newCoordinator() = TranscriptCoordinator(
+            context, audioRepository, grants, repository, modelsRoot,
+            SteppingClock(), checkpoints = checkpoints,
+        )
+
+        // ① 基线：一遍到底
+        val baselineJob = enqueueBook(uri)
+        val baseline = newCoordinator().run(baselineJob) as? TranscriptOutcome.Committed
+            ?: error("基线一遍没跑成")
+        val baselineSentences = subtitles().map { Triple(it.startMs, it.endMs, it.text) }
+        assertTrue("基线一句都没有", baselineSentences.isNotEmpty())
+        assertFalse("成功收口后断点不该在", checkpoints.fileOf(AUDIO_ID).exists())
+
+        // ② 识别攒到 6 段就置取消位：断点文件必须在，行仍是 RUNNING（终态由取消的那一方写）
+        val cancelAtSegments = 6
+        var cancelled = false
+        val cancelledJob = (repository.enqueue(AUDIO_ID, ModelCatalog.transcriptRef, force = true) as EnqueueOutcome.Created).jobId
+        val cancelOutcome = newCoordinator().run(
+            cancelledJob,
+            isCancelled = { cancelled },
+            onProgress = { p -> if (p.doneSegments >= cancelAtSegments) cancelled = true },
+        )
+        assertTrue("没走取消支路：$cancelOutcome", cancelOutcome is TranscriptOutcome.Cancelled)
+        val saved = checkpoints.load(AUDIO_ID)
+            ?: error("取消后断点没落盘（${checkpoints.fileOf(AUDIO_ID).path}）")
+        assertTrue("断点里该有 ≥$cancelAtSegments 段：${saved.doneSegments}", saved.doneSegments >= cancelAtSegments)
+        assertEquals("断点要记下真正执行的模型", ModelCatalog.refOf(ModelCatalog.paraformer).version, saved.modelVersion)
+
+        // ③ 重试：恢复流程（recoverInterrupted 标 FAILED → 用户点重试建新行）后从断点继续
+        assertEquals(1, repository.recoverInterrupted())
+        val retryJob = (repository.retry(cancelledJob, ModelCatalog.transcriptRef) as EnqueueOutcome.Created).jobId
+        val reports = mutableListOf<TranscriptProgress>()
+        val resumed = newCoordinator().run(retryJob, onProgress = { p -> reports += p })
+        val committed = resumed as? TranscriptOutcome.Committed ?: error("续跑没跑成：$resumed")
+        Log.i(TAG, "续跑：段 ${committed.segments}，句 ${committed.sentences}，首报 ${reports.first()}")
+        assertTrue(
+            "续跑第一次进度就该带着断点的段数（≥$cancelAtSegments），实际首报 ${reports.firstOrNull()}——这轮是从头跑的",
+            reports.first().doneSegments >= cancelAtSegments,
+        )
+        // 断点续跑的诚实契约（`docs/asr-design.md` §5.2）：断点里的句子**逐字**出现在成品里；
+        // 断点边界之后由全新状态的 VAD 重新切分，与一遍跑完允许有 ±几十毫秒/个别分句的差异——
+        // 所以不逐句比对，改比「断点内容一字不少」+「音频尾部覆盖完整」。
+        val finalRows = subtitles()
+        val finalText = finalRows.joinToString("") { it.text }
+        for (draft in SentenceSplitter.split(saved.segments)) {
+            assertTrue("断点里的句子丢了：${draft.text}", finalText.contains(draft.text))
+        }
+        val baselineLast = baselineSentences.last().second
+        assertTrue(
+            "续跑没覆盖到音频尾部：末句 ${finalRows.last().endMs} ms < 基线 $baselineLast ms",
+            finalRows.last().endMs >= baselineLast - 2_000,
+        )
+        assertFalse("成功收口后断点必须删掉", checkpoints.fileOf(AUDIO_ID).exists())
+        assertEquals(TranscriptJobEntity.Status.Success, jobRow(retryJob).status)
+    }
+
+    /**
+     * FR-512 的诚实性半边：断点的模型身份与本轮不符（用户换模型重试）必须作废、
+     * 从头识别——不同权重的字混进同一条时间线比没有断点更糟。作废的观察方法：
+     * 首次进度上报的段数从个位数爬起（没播种），且结果仍与基线逐句一致。
+     */
+    @Test
+    fun 换模型的断点被作废从头识别() = runBlocking {
+        val uri = fileUriOf(DeviceAsrFixtures.REAL_MP3)
+        val checkpoints = TranscriptCheckpointStore(
+            File(context.cacheDir, "coordinator-checkpoint-mismatch-${System.nanoTime()}"),
+        )
+        val coordinator = TranscriptCoordinator(
+            context, audioRepository, grants, repository, modelsRoot,
+            SteppingClock(), checkpoints = checkpoints,
+        )
+
+        // 基线
+        val baselineJob = enqueueBook(uri)
+        coordinator.run(baselineJob) as? TranscriptOutcome.Committed ?: error("基线没跑成")
+        val baselineSentences = subtitles().map { Triple(it.startMs, it.endMs, it.text) }
+        assertTrue("基线一句都没有", baselineSentences.isNotEmpty())
+
+        // 中途取消，留下 Paraformer 的断点；随后按真实用户路径把行结算掉（取消）再重试
+        var cancelled = false
+        val cancelledJob = (repository.enqueue(AUDIO_ID, ModelCatalog.transcriptRef, force = true) as EnqueueOutcome.Created).jobId
+        val cancelOutcome = coordinator.run(
+            cancelledJob,
+            isCancelled = { cancelled },
+            onProgress = { p -> if (p.doneSegments >= 6) cancelled = true },
+        )
+        assertTrue("没走取消支路：$cancelOutcome", cancelOutcome is TranscriptOutcome.Cancelled)
+        val saved = checkpoints.load(AUDIO_ID) ?: error("取消后断点没落盘")
+        assertTrue("取消要走仓储（行还是 RUNNING 时重试会被「不重复排队」拦下）", repository.cancel(cancelledJob))
+
+        // 模拟「换模型重试」：把断点里的模型身份改成一个清单里不存在的权重
+        checkpoints.save(saved.copy(modelId = "no-such-model"))
+        val retryJob = (repository.retry(cancelledJob, ModelCatalog.transcriptRef) as EnqueueOutcome.Created).jobId
+        val reports = mutableListOf<TranscriptProgress>()
+        val outcome = coordinator.run(retryJob, onProgress = { p -> reports += p })
+
+        val committed = outcome as? TranscriptOutcome.Committed ?: error("作废后的重跑没跑成：$outcome")
+        assertTrue(
+            "断点该被作废（首次进度上报的段数应从个位数爬起）：${reports.firstOrNull()}",
+            reports.first().doneSegments < 6,
+        )
+        assertEquals(
+            "作废后从头识别的结果必须与基线逐句一致",
+            baselineSentences,
+            subtitles().map { Triple(it.startMs, it.endMs, it.text) },
+        )
+        assertFalse("作废的断点文件必须删掉", checkpoints.fileOf(AUDIO_ID).exists())
+        assertEquals(TranscriptJobEntity.Status.Success, jobRow(retryJob).status)
     }
 
     private fun emptyModelsRoot(): File =

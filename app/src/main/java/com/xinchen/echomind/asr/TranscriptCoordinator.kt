@@ -11,6 +11,7 @@ import com.xinchen.echomind.data.repo.MediaAudioAccess
 import com.xinchen.echomind.data.repo.TreeGrantStore
 import com.xinchen.echomind.data.repo.WmaPlaybackStore
 import com.xinchen.echomind.domain.asr.AsrChunkPlanner
+import com.xinchen.echomind.domain.asr.ResumeGate
 import com.xinchen.echomind.domain.asr.SentenceSplitter
 import com.xinchen.echomind.domain.asr.TokenTimingMapper
 import com.xinchen.echomind.domain.asr.TranscriptQuality
@@ -25,6 +26,7 @@ import com.xinchen.echomind.domain.model.TranscriptPhase
 import com.xinchen.echomind.domain.model.TranscriptProgress
 import com.xinchen.echomind.domain.model.TranscriptionTarget
 import com.xinchen.echomind.domain.transcript.LiveTranscriptStore
+import com.xinchen.echomind.domain.transcript.TranscriptCheckpoint
 import com.xinchen.echomind.domain.transcript.TranscriptRepository
 import java.io.File
 import java.util.UUID
@@ -82,6 +84,13 @@ class TranscriptCoordinator(
      * 权限被撤时会落到解码失败，原因可读性差但行为不变。
      */
     private val mediaAudio: MediaAudioAccess? = null,
+    /**
+     * 转录断点的落盘（FR-512，2026-10-30）。null（部分测试）= 不落断点，行为与没有断点的旧版完全一致；
+     * 生产装配传 `filesDir/transcript_checkpoints` 上那一个。非 null 时：识别中按
+     * [AudioFormats.ASR_CHECKPOINT_SEGMENTS] 节奏落盘，取消补写一次，成功收口必删，
+     * 重试（或复活 worker 撞车后的用户重试）从最后一个完整语音段继续。
+     */
+    private val checkpoints: TranscriptCheckpointStore? = null,
 ) {
 
     /**
@@ -148,6 +157,8 @@ class TranscriptCoordinator(
         }
 
         val throttle = ProgressThrottle(clock)
+        // 断点（FR-512）：文件身份（uri / 文件修改时间）在这里核，模型身份等 spec 定下来再核
+        val checkpoint = loadCheckpoint(target)
         // 第 1 步：定下解码来源。WMA 先转 mp3（阶段 Transcoding 的进度就在这里发出去）
         val source = try {
             prepareSource(target, isCancelled) { decodedMs, containerMs ->
@@ -163,18 +174,31 @@ class TranscriptCoordinator(
         if (isCancelled()) return TranscriptOutcome.Cancelled
 
         // 第 2 步：「自动选模型」（D41）——SenseVoice 听开头 30 s 按转写文本字符系别判语言，
-        // 把行上的 model_id/version 改写为最终模型（zh/yue → Paraformer，其余 → SenseVoice）
-        val spec = explicitSpec ?: run {
-            val probedText = probeTranscript(source, isCancelled)
-            if (isCancelled()) return TranscriptOutcome.Cancelled
-            val resolved = ModelRouting.resolve(probedText)
-            runCatching {
-                repository.updateModel(
-                    jobId,
-                    TranscriptModelRef(id = resolved.id, version = ModelCatalog.refOf(resolved).version),
-                )
+        // 把行上的 model_id/version 改写为最终模型（zh/yue → Paraformer，其余 → SenseVoice）。
+        // 有可用断点时直接沿用断点里记录的最终模型：同一份音频的探测结果是确定的，
+        // 重探只是把 226 MB 的 SenseVoice 白装一遍再听一次开头。
+        val spec = explicitSpec
+            ?: checkpoint?.let { specFromCheckpoint(jobId, it) }
+            ?: run {
+                val probedText = probeTranscript(source, isCancelled)
+                if (isCancelled()) return TranscriptOutcome.Cancelled
+                val resolved = ModelRouting.resolve(probedText)
+                runCatching {
+                    repository.updateModel(
+                        jobId,
+                        TranscriptModelRef(id = resolved.id, version = ModelCatalog.refOf(resolved).version),
+                    )
+                }
+                resolved
             }
-            resolved
+
+        // 模型身份不符的断点作废（换模型重试是用户的合法操作，但不同权重的字不能混进同一条时间线）
+        val usable = checkpoint?.takeIf {
+            it.modelId == spec.id && it.modelVersion == ModelCatalog.refOf(spec).version
+        }
+        if (checkpoint != null && usable == null) {
+            Log.i(TAG, "断点属于模型 ${checkpoint.modelId}/${checkpoint.modelVersion}，本轮用 ${spec.id}，作废从头识别")
+            checkpoints?.delete(target.audioId)
         }
 
         val lease = try {
@@ -183,14 +207,44 @@ class TranscriptCoordinator(
             return fail(jobId, TranscriptFailure.ModelMissing, e.message ?: "识别模型不可用")
         }
         val run = try {
-            Attempt(lease = lease, vadModel = vadModel, target = target, durationMs = source.durationMs, throttle = throttle)
+            Attempt(
+                lease = lease,
+                vadModel = vadModel,
+                target = target,
+                durationMs = source.durationMs,
+                throttle = throttle,
+                modelRef = ModelCatalog.refOf(spec),
+                resumeFromSample = usable?.resumeSample ?: 0L,
+                seedSegments = usable?.segments.orEmpty(),
+                seedTotalChunks = usable?.totalChunks ?: 0,
+                seedRejectedChunks = usable?.rejectedChunks ?: 0,
+                seedDoneSegments = usable?.doneSegments ?: 0,
+            )
         } catch (e: Exception) {
             lease.release()
             return fail(jobId, TranscriptFailure.ModelMissing, "VAD 打不开（${vadModel.path}）：${e.javaClass.simpleName} ${e.message}")
         }
+        if (usable != null) {
+            // 续跑开始：位置先抬到断点处（进度条从上次的百分比继续，不从 0 起），
+            // 实时预览把断点里的段先切出来补进场，之后的新句子接在后面
+            run.positionMs = AsrChunkPlanner.msOf(usable.resumeSample, AudioFormats.ASR_SAMPLE_RATE)
+            publishLiveResumed(run)
+            Log.i(
+                TAG,
+                "从断点续跑：${target.title} 已有 ${usable.doneSegments} 段，" +
+                    "从 ${run.positionMs} ms（样本 ${usable.resumeSample}）继续",
+            )
+        }
         val outcome: TranscriptOutcome = try {
             run.recognizeAll(source, isCancelled, onProgress)
-            if (run.wasCancelled) TranscriptOutcome.Cancelled else settle(jobId, run)
+            when {
+                run.wasCancelled -> {
+                    // 取消也把账面留下：点取消的那一方（或失败的这一轮之后点重试的用户）从最后一个完整段继续
+                    checkpoints?.let { run.saveCheckpoint(it) }
+                    TranscriptOutcome.Cancelled
+                }
+                else -> settle(jobId, run)
+            }
         } catch (e: PcmDecodeException) {
             fail(jobId, TranscriptFailure.DecodeFailed, e.message ?: "解码失败")
         } catch (e: OutOfMemoryError) {
@@ -201,6 +255,44 @@ class TranscriptCoordinator(
             liveStore?.clear(target.audioId)
         }
         return outcome
+    }
+
+    /**
+     * 读断点并核对**文件身份**（FR-512）：uri 不同（文件被移动/重导）或修改时间变了（内容被替换，
+     * FR-107「旧字幕不可信」的同一判据）都作废即删；识别模型身份在 spec 定下来后另核。
+     * 读不出来（半截、版本不符、损坏）`TranscriptCheckpointStore.load` 已按无断点处理。
+     */
+    private suspend fun loadCheckpoint(target: TranscriptionTarget): TranscriptCheckpoint? {
+        val store = checkpoints ?: return null
+        val loaded = store.load(target.audioId) ?: return null
+        val sameFile = loaded.audioId == target.audioId &&
+            loaded.uri == target.uri &&
+            (target.fileLastModifiedMs <= 0 || loaded.fileLastModifiedMs == target.fileLastModifiedMs)
+        val hasContent = loaded.resumeSample > 0 && loaded.segments.isNotEmpty()
+        if (!sameFile || !hasContent) {
+            Log.i(TAG, "断点作废（${if (!sameFile) "文件身份不符" else "断点里还没有完整段"}）：${target.title}")
+            store.delete(target.audioId)
+            return null
+        }
+        return loaded
+    }
+
+    /**
+     * 断点里记录的最终模型。清单里查不到（清单改过、断点来自旧安装）返回 null——
+     * 落回正常探测路径；那个不可用的断点文件会在后面的模型身份核对里被作废。
+     */
+    private suspend fun specFromCheckpoint(jobId: String, checkpoint: TranscriptCheckpoint): ModelSpec? {
+        val spec = runCatching {
+            ModelCatalog.specForFinal(TranscriptModelRef(checkpoint.modelId, checkpoint.modelVersion))
+        }.getOrNull()
+        if (spec == null) {
+            Log.w(TAG, "断点里的模型（${checkpoint.modelId}）不在清单里，走正常探测")
+            return null
+        }
+        runCatching {
+            repository.updateModel(jobId, TranscriptModelRef(spec.id, ModelCatalog.refOf(spec).version))
+        }
+        return spec
     }
 
     /** 解码来源：给 `PcmDecoder` 的 uri 与容器时长（未知 -1） */
@@ -253,9 +345,14 @@ class TranscriptCoordinator(
                 wasCancelled = true
                 false
             } else {
-                // 位置记到本块末尾：进度条跟着解码走，哪怕这一块没切出任何语音段
-                positionMs = (startSample + samples.size) * 1000L / AudioFormats.ASR_SAMPLE_RATE
-                vad.push(samples).forEach { utterance -> consume(utterance, onProgress) }
+                // 位置记到本块末尾：进度条跟着解码走，哪怕这一块没切出任何语音段。
+                // maxOf 是给续跑用的：断点之前的那段解码只是路过，位置不许从断点处倒回小值再爬回来
+                positionMs = maxOf(positionMs, (startSample + samples.size) * 1000L / AudioFormats.ASR_SAMPLE_RATE)
+                // 断点（FR-512）之前的部分已识别过、字在断点里，不能再次喂给 VAD（会切出重叠段）
+                val trimmed = ResumeGate.slice(samples, startSample, resumeFromSample)
+                if (trimmed != null) {
+                    vad.push(trimmed.samples).forEach { utterance -> consume(utterance, onProgress) }
+                }
                 reportProgress(onProgress)
                 true
             }
@@ -266,6 +363,8 @@ class TranscriptCoordinator(
 
     /** 一个 VAD 段：切成 ≤20 s 的块逐块识别，字攒成 [RecognizedSegment]（一个段一组候选字，§6 第 1 条）。 */
     private fun Attempt.consume(utterance: VadUtterance, onProgress: (TranscriptProgress) -> Unit) {
+        // 先记段终点再识别：进程在这一段识别中途被杀，断点留在上一个完整段——这一段整段重来，不丢不重
+        lastUtteranceEndSample = utterance.endSample
         val tokens = mutableListOf<TokenTiming>()
         for (chunk in AsrChunkPlanner.plan(listOf(utterance.span))) {
             totalChunks++
@@ -292,7 +391,52 @@ class TranscriptCoordinator(
         if (tokens.isNotEmpty()) {
             publishLive(segments.last(), doneSegments)
         }
+        // 断点节奏落盘（FR-512）：攒够 [AudioFormats.ASR_CHECKPOINT_SEGMENTS] 个新段才写一次
+        checkpoints?.takeIf { doneSegments - savedSegments >= AudioFormats.ASR_CHECKPOINT_SEGMENTS }
+            ?.let { saveCheckpoint(it) }
         reportProgress(onProgress)
+    }
+
+    /**
+     * 续跑开始时把断点里的段切出来补进实时预览（FR-512）：预览不能只有断点之后的新句子，
+     * 否则播放页边转边显示的内容会从半截开始。
+     */
+    private fun publishLiveResumed(run: Attempt) {
+        val store = liveStore ?: return
+        if (run.segments.isEmpty()) return
+        val sentences = SentenceSplitter.split(run.segments).map { draft ->
+            SubtitleSegment(index = 0, startMs = draft.startMs, endMs = draft.endMs, text = draft.text)
+        }
+        store.append(run.target.audioId, sentences, run.doneSegments)
+    }
+
+    /** 断点写盘（FR-512）。没有完整段（识别刚起步）不写——那种断点续跑位置是 0，等于没有 */
+    private fun Attempt.saveCheckpoint(store: TranscriptCheckpointStore) {
+        if (segments.isEmpty() || lastUtteranceEndSample <= 0) return
+        // 续跑位置对齐到旧 VAD 的 512 窗栅格：新 VAD 的窗与此对齐后，边界之后唯一剩下的差异是
+        // 它的内部状态从零开始（流式 VAD 的状态带不进文件，`docs/asr-design.md` §5.2）。
+        // 对齐只可能把位置往前挪 ≤32ms——那是一段已被确认结束的语音的静音尾巴，重喂无害；
+        // 往后挪（截掉音频）不是选项。
+        val grid = AudioFormats.VAD_WINDOW_SAMPLES.toLong()
+        val resumeSample = lastUtteranceEndSample / grid * grid
+        if (resumeSample <= 0) return
+        store.save(
+            TranscriptCheckpoint(
+                audioId = target.audioId,
+                uri = target.uri,
+                fileLastModifiedMs = target.fileLastModifiedMs,
+                modelId = modelRef.id,
+                modelVersion = modelRef.version,
+                resumeSample = resumeSample,
+                totalChunks = totalChunks,
+                rejectedChunks = rejectedChunks,
+                doneSegments = doneSegments,
+                segments = segments.toList(),
+                savedAtWallMs = clock.wallMs(),
+            ),
+        )
+        savedSegments = doneSegments
+        Log.i(TAG, "断点已落盘：${target.title} 段 $doneSegments，位置 ${AsrChunkPlanner.msOf(resumeSample, AudioFormats.ASR_SAMPLE_RATE)} ms")
     }
 
     /**
@@ -346,6 +490,8 @@ class TranscriptCoordinator(
         }
         // 段数的终值随 SUCCESS 一起落库（done = total = 实跑段数），不再依赖节流中的最后一次进度写
         val written = repository.commitSubtitles(jobId, segments, totalSegments = run.doneSegments)
+        // 书已 READY：断点的使命结束（FR-512）。失败/取消路径刻意保留断点，重试时从那里继续
+        checkpoints?.delete(run.target.audioId)
         return TranscriptOutcome.Committed(
             sentences = written,
             segments = run.doneSegments,
@@ -443,6 +589,8 @@ class TranscriptCoordinator(
      * 一次跑的中间状态。做成一个对象只为两件事：`release()` 成对（AGENTS.md §5），
      * 以及把「VAD 与引擎租约跟着这次跑走」写死——引擎是池里共享的那一份（D46），这里持有的是租约，
      * 释放租约不等于卸载模型（别的任务可能还在用）；VAD 很小，每路自己一份。
+     *
+     * FR-512 的播种参数（[resumeFromSample] 等）全带默认值 0/空：不续跑时行为与旧版逐位一致。
      */
     private class Attempt(
         val lease: RefCountedPool<ModelSpec, SherpaOnnxEngine>.Lease,
@@ -451,13 +599,28 @@ class TranscriptCoordinator(
         /** 容器时长（进度分母），未知 -1 */
         val durationMs: Long,
         val throttle: ProgressThrottle,
+        /** 这轮真正执行的模型身份，断点落盘时写进去（续跑换模型会被作废） */
+        val modelRef: TranscriptModelRef,
+        /** 从哪个绝对样本继续（0 = 从头）。之前的样本不喂 VAD，它们的字已在断点里 */
+        val resumeFromSample: Long = 0,
+        seedSegments: List<RecognizedSegment> = emptyList(),
+        seedTotalChunks: Int = 0,
+        seedRejectedChunks: Int = 0,
+        seedDoneSegments: Int = 0,
     ) {
         val engine: SherpaOnnxEngine get() = lease.value
-        val vad: VadSegmenter = VadSegmenter(vadModel)
-        val segments = mutableListOf<RecognizedSegment>()
-        var totalChunks = 0
-        var rejectedChunks = 0
-        var doneSegments = 0
+        val vad: VadSegmenter = VadSegmenter(vadModel, sampleOffset = resumeFromSample)
+        val segments = seedSegments.toMutableList()
+        var totalChunks = seedTotalChunks
+        var rejectedChunks = seedRejectedChunks
+        var doneSegments = seedDoneSegments
+
+        /** 断点文件里已含的段数：攒够 [AudioFormats.ASR_CHECKPOINT_SEGMENTS] 个新段才再写一次盘 */
+        var savedSegments = seedDoneSegments
+
+        /** 最后一个已识别段的终点（绝对样本），断点的续跑位置 */
+        var lastUtteranceEndSample = resumeFromSample
+
         var wasCancelled = false
         var decodeSummary: PcmDecodeSummary? = null
 

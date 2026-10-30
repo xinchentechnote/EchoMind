@@ -21,6 +21,7 @@ import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 
@@ -28,7 +29,9 @@ import org.junit.Test
  * 回归：曾经 tab/query 存在两份状态里，点「收藏」后列表换了但 `state.tab` 仍是 All，
  * 于是 TabRow 高亮不动、空态文案也读错。这里钉住「状态与查询条件同源」。
  *
- * 目录管理（2026-10-28）：文件夹筛选与 tab/query 正交，计数角标来自全量行。
+ * 目录浏览（2026-10-28，用户口径「先见有内容的文件夹，逐层进去，不要直接平铺全部」）：
+ * 「全部」且无搜索词时 browser 非 null；根层只列有内容的文件夹；夹内按相对路径分层，
+ * 本机伪文件夹的书要先剥掉设备目录前缀。
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class ShelfViewModelTest {
@@ -92,14 +95,14 @@ class ShelfViewModelTest {
         private fun unsupported(): Nothing = throw UnsupportedOperationException()
     }
 
-    private fun row(id: String, folderId: String, title: String = "书$id") = ShelfRow(
-        id = id, uri = "content://x/$id", title = title, fileName = "$id.mp3",
+    private fun row(id: String, folderId: String, relativePath: String, title: String = "书$id") = ShelfRow(
+        id = id, uri = "content://x/$id", title = title, fileName = "$id.mp3", relativePath = relativePath,
         durationMs = 60_000, sizeBytes = 1, fileStatus = "PRESENT", transcriptionState = "NONE",
         isFavorite = false, lastPositionMs = 0, lastPlayedAtMs = 0, playbackSpeed = 1f, folderId = folderId,
     )
 
-    private fun folder(id: String, name: String) = ImportedFolderEntity(
-        id = id, treeUri = "tree://$id", displayName = name, grantedAtMs = 1,
+    private fun folder(id: String, name: String, treeUri: String = "tree://$id") = ImportedFolderEntity(
+        id = id, treeUri = treeUri, displayName = name, grantedAtMs = 1,
     )
 
     @Test
@@ -129,32 +132,87 @@ class ShelfViewModelTest {
     }
 
     @Test
-    fun `选中文件夹后只看该文件夹的书且计数来自全量`() = runTest {
+    fun `全部tab根层只列有内容的文件夹且计数正确`() = runTest {
         val repo = FakeRepo(
-            rows = listOf(row("a", "f1"), row("b", "f1"), row("c", "f2")),
-            folders = listOf(folder("f1", "第一卷"), folder("f2", "第二卷")),
+            rows = listOf(row("a", "f1", "x.mp3"), row("b", "f1", "y.mp3"), row("c", "f2", "z.mp3")),
+            folders = listOf(folder("f1", "甲夹"), folder("f2", "乙夹"), folder("f3", "空夹")),
         )
         val vm = ShelfViewModel(repo)
         repo.emit()
         advanceUntilIdle()
 
-        vm.onFolderSelected("f1")
-        advanceUntilIdle()
-
-        assertEquals(listOf("a", "b"), vm.state.value.rows.map { it.id })
-        // 计数角标来自全量行：选中 f1 后 f2 的计数不能归零
-        assertEquals(mapOf("f1" to 2, "f2" to 1), vm.state.value.folderCounts)
-
-        vm.onFolderSelected(null)
-        advanceUntilIdle()
+        val root = vm.state.value.browser
+        assertTrue(root is ShelfBrowser.Root)
+        // 空夹不出现（用户口径：展示**有内容**的文件夹）；按显示名排序
+        assertEquals(listOf("乙夹" to 1, "甲夹" to 2), (root as ShelfBrowser.Root).folders.map { it.displayName to it.count })
         assertEquals(3, vm.state.value.rows.size)
     }
 
     @Test
-    fun `按文件夹重扫给出单夹结果`() = runTest {
+    fun `进入文件夹后按内层相对路径分层且剥掉设备前缀`() = runTest {
         val repo = FakeRepo(
-            folders = listOf(folder("f1", "第一卷")),
-            )
+            rows = listOf(
+                row("a", "f1", "Music/有声书/上册/a.mp3"),
+                row("b", "f1", "Music/有声书/下册/b.mp3"),
+                row("c", "f1", "Music/有声书/direct.mp3"),
+            ),
+            folders = listOf(folder("f1", "有声书", treeUri = "mediastore://external_primary/Music/有声书")),
+        )
+        val vm = ShelfViewModel(repo)
+        repo.emit()
+        advanceUntilIdle()
+
+        vm.browseInto("f1")
+        advanceUntilIdle()
+
+        val inside = vm.state.value.browser as ShelfBrowser.Inside
+        assertEquals("有声书", inside.folderName)
+        assertEquals(listOf("上册" to 1, "下册" to 1), inside.folders.map { it.displayName to it.fileCount })
+        assertEquals(listOf("c"), inside.books.map { it.id })
+
+        vm.browseIntoSub("上册")
+        advanceUntilIdle()
+        val sub = vm.state.value.browser as ShelfBrowser.Inside
+        assertEquals("上册", sub.path)
+        assertEquals(listOf("a"), sub.books.map { it.id })
+
+        vm.browseUp()
+        advanceUntilIdle()
+        assertEquals("", (vm.state.value.browser as ShelfBrowser.Inside).path)
+
+        vm.browseUp()
+        advanceUntilIdle()
+        assertTrue(vm.state.value.browser is ShelfBrowser.Root)
+    }
+
+    @Test
+    fun `搜索时回平铺目录浏览被挂起`() = runTest {
+        val repo = FakeRepo(
+            rows = listOf(row("a", "f1", "x.mp3")),
+            folders = listOf(folder("f1", "甲夹")),
+        )
+        val vm = ShelfViewModel(repo)
+        repo.emit()
+        advanceUntilIdle()
+        vm.browseInto("f1")
+        advanceUntilIdle()
+        assertTrue(vm.state.value.browser is ShelfBrowser.Inside)
+
+        vm.onQueryChanged("书a")
+        advanceUntilIdle()
+        assertNull(vm.state.value.browser)
+        // 平铺行仍可用（搜索结果）
+        assertEquals(listOf("a"), vm.state.value.rows.map { it.id })
+
+        vm.onQueryChanged("")
+        advanceUntilIdle()
+        // 清掉搜索词回到原浏览位置
+        assertTrue(vm.state.value.browser is ShelfBrowser.Inside)
+    }
+
+    @Test
+    fun `按文件夹重扫给出单夹结果`() = runTest {
+        val repo = FakeRepo(folders = listOf(folder("f1", "甲夹")))
         repo.nextRescanOutcome = ImportOutcome(
             folderId = "f1", added = 2, changed = 1, vanished = 0, revived = 0,
             unchanged = 3, alreadyOnShelf = 0, truncated = false,
@@ -170,22 +228,19 @@ class ShelfViewModelTest {
     }
 
     @Test
-    fun `移除文件夹清掉选择并提示保留历史`() = runTest {
+    fun `移除文件夹给出保留历史的提示`() = runTest {
         val repo = FakeRepo(
-            rows = listOf(row("a", "f1")),
-            folders = listOf(folder("f1", "第一卷")),
+            rows = listOf(row("a", "f1", "x.mp3")),
+            folders = listOf(folder("f1", "甲夹")),
         )
         val vm = ShelfViewModel(repo)
         repo.emit()
-        advanceUntilIdle()
-        vm.onFolderSelected("f1")
         advanceUntilIdle()
 
         vm.removeFolder("f1")
         advanceUntilIdle()
 
         assertEquals(listOf("f1"), repo.removedFolders)
-        assertNull(vm.state.value.selectedFolderId)
-        assertEquals("已移除「第一卷」及其 1 本书（收听历史保留）", vm.state.value.message)
+        assertEquals("已移除「甲夹」及其 1 本书（收听历史保留）", vm.state.value.message)
     }
 }

@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.os.Build
+import android.view.WindowManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -36,6 +37,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -64,6 +66,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.xinchen.echomind.ui.common.formatDuration
 import com.xinchen.echomind.ui.common.formatListenDuration
+import com.xinchen.echomind.ui.common.findActivity
 import com.xinchen.echomind.ui.transcript.TranscriptDisplay
 
 /**
@@ -104,6 +107,21 @@ fun PlayerScreen(
             context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
             askNotificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    // 播放常亮（FR-311，2026-10-30）：停在播放页且真在播时屏幕不灭——边听边看字幕的页面
+    // 灭屏就没用了。判据是 isPlaying 而不是「页面在前」：暂停/播完就该让屏幕照常休眠；
+    // 离开页面时 onDispose 摘掉 flag，别的页面不受影响。FLAG_KEEP_SCREEN_ON 只压这一扇 window，
+    // 不需要任何权限，系统设置里的自动休眠在离开后被原样恢复。
+    val activity = context.findActivity()
+    DisposableEffect(activity, playback.isPlaying) {
+        val window = activity?.window
+        if (playback.isPlaying && window != null) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        onDispose {
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
     }
 

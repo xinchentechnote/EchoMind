@@ -1,8 +1,8 @@
 package com.xinchen.echomind.ui.shelf
 
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -14,10 +14,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.AlertDialog
@@ -27,7 +25,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -53,7 +51,6 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xinchen.echomind.data.db.AudioBookEntity
-import com.xinchen.echomind.data.db.ImportedFolderEntity
 import com.xinchen.echomind.data.db.ShelfRow
 import com.xinchen.echomind.data.repo.ShelfTab
 import com.xinchen.echomind.ui.common.OpenPersistableDocumentTree
@@ -73,10 +70,13 @@ fun ShelfScreen(
     val state by viewModel.state.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
     var renaming by remember { mutableStateOf<ShelfRow?>(null) }
-    var removeTarget by remember { mutableStateOf<ImportedFolderEntity?>(null) }
+    var removeTarget by remember { mutableStateOf<ShelfBrowser.RootFolder?>(null) }
     val treePicker = rememberLauncherForActivityResult(OpenPersistableDocumentTree()) { uri ->
         if (uri != null) viewModel.importFolder(uri)
     }
+
+    // 目录浏览的返回键语义：夹内先上退一层，根层才退出页面（交给系统）
+    BackHandler(enabled = state.browser is ShelfBrowser.Inside) { viewModel.browseUp() }
 
     state.message?.let { message ->
         androidx.compose.runtime.LaunchedEffect(message) {
@@ -128,43 +128,55 @@ fun ShelfScreen(
                 }
             }
 
-            // 目录管理（2026-10-28）：SAF 与本机伪文件夹都在这里按目录查看/重扫/移除
-            if (state.folders.isNotEmpty()) {
-                FolderFilterRow(
-                    folders = state.folders,
-                    selectedFolderId = state.selectedFolderId,
-                    counts = state.folderCounts,
-                    onSelect = viewModel::onFolderSelected,
-                    onRescanFolder = { viewModel.rescanFolder(it) },
-                    onRemoveFolder = { id -> removeTarget = state.folders.firstOrNull { it.id == id } },
-                )
-            }
-
-            val lastPlayed = state.lastPlayed
-            if (lastPlayed != null && state.query.isEmpty() && state.tab == ShelfTab.All && state.selectedFolderId == null) {
-                ContinueCard(lastPlayed = lastPlayed, onClick = { onOpenPlayer(lastPlayed.id) })
-            }
-
-            if (state.rows.isEmpty()) {
-                EmptyShelf(
+            val browser = state.browser
+            when {
+                // 目录浏览（用户口径 2026-10-28）：「全部」且无搜索词时先见有内容的文件夹，逐层进去
+                browser is ShelfBrowser.Root && browser.folders.isEmpty() -> EmptyShelf(
                     hasFolders = state.folders.isNotEmpty(),
                     tab = state.tab,
                     hasQuery = state.query.isNotEmpty(),
-                    hasFolderFilter = state.selectedFolderId != null,
                     onImport = { treePicker.launch(null) },
                 )
-            } else {
-                LazyColumn(modifier = Modifier.fillMaxSize()) {
-                    items(state.rows, key = { it.id }) { row ->
-                        ShelfRowItem(
-                            row = row,
-                            onClick = { onOpenPlayer(row.id) },
-                            onToggleFavorite = { viewModel.toggleFavorite(row.id, !row.isFavorite) },
-                            onRename = { renaming = row },
-                            onRemove = { viewModel.removeBook(row.id) },
-                            onTranscribe = { onTranscribe(row.id) },
-                            onTranscribeNow = { viewModel.transcribeNow(row.id) },
-                        )
+
+                browser != null -> FolderBrowser(
+                    browser = browser,
+                    onOpenFolderUnit = viewModel::browseInto,
+                    onOpenSub = viewModel::browseIntoSub,
+                    onUp = viewModel::browseUp,
+                    onRescanFolder = viewModel::rescanFolder,
+                    onRemoveFolder = { removeTarget = it },
+                    onOpenPlayer = onOpenPlayer,
+                    onToggleFavorite = { row, favorite -> viewModel.toggleFavorite(row.id, favorite) },
+                    onRename = { renaming = it },
+                    onRemoveBook = { viewModel.removeBook(it) },
+                    onTranscribePage = onTranscribe,
+                    onTranscribeNow = { viewModel.transcribeNow(it) },
+                )
+
+                state.rows.isEmpty() -> EmptyShelf(
+                    hasFolders = state.folders.isNotEmpty(),
+                    tab = state.tab,
+                    hasQuery = state.query.isNotEmpty(),
+                    onImport = { treePicker.launch(null) },
+                )
+
+                else -> {
+                    val lastPlayed = state.lastPlayed
+                    if (lastPlayed != null && state.query.isEmpty() && state.tab == ShelfTab.All) {
+                        ContinueCard(lastPlayed = lastPlayed, onClick = { onOpenPlayer(lastPlayed.id) })
+                    }
+                    LazyColumn(modifier = Modifier.fillMaxSize()) {
+                        items(state.rows, key = { it.id }) { row ->
+                            ShelfRowItem(
+                                row = row,
+                                onClick = { onOpenPlayer(row.id) },
+                                onToggleFavorite = { viewModel.toggleFavorite(row.id, !row.isFavorite) },
+                                onRename = { renaming = row },
+                                onRemove = { viewModel.removeBook(row.id) },
+                                onTranscribe = { onTranscribe(row.id) },
+                                onTranscribeNow = { viewModel.transcribeNow(row.id) },
+                            )
+                        }
                     }
                 }
             }
@@ -190,19 +202,18 @@ fun ShelfScreen(
     }
 
     removeTarget?.let { folder ->
-        val count = state.folderCounts[folder.id] ?: 0
         AlertDialog(
             onDismissRequest = { removeTarget = null },
             title = { Text("移除文件夹") },
             text = {
                 Text(
-                    "将从书架移除「${folder.displayName}」及其 $count 本书；" +
+                    "将从书架移除「${folder.displayName}」及其 ${folder.count} 本书；" +
                         "它们的收听历史（统计会话）会保留，重新导入同一文件夹也不会找回播放进度。",
                 )
             },
             confirmButton = {
                 TextButton(onClick = {
-                    viewModel.removeFolder(folder.id)
+                    viewModel.removeFolder(folder.folderId)
                     removeTarget = null
                 }) { Text("移除") }
             },
@@ -212,47 +223,118 @@ fun ShelfScreen(
 }
 
 /**
- * 目录筛选行（2026-10-28）：「全部」+ 每个已导入文件夹一枚 chip（SAF 文件夹与本机伪文件夹同列）。
- * 选中某个文件夹后行尾出现 ⋮：重扫此文件夹 / 移除该文件夹记录。
+ * 目录浏览（VidNest 的层级浏览方式）：根层列有内容的文件夹单元（SAF 与本机伪文件夹同列），
+ * 进入后按夹内相对路径逐层下钻；书行复用平铺的全部操作。
  */
 @Composable
-private fun FolderFilterRow(
-    folders: List<ImportedFolderEntity>,
-    selectedFolderId: String?,
-    counts: Map<String, Int>,
-    onSelect: (String?) -> Unit,
+private fun FolderBrowser(
+    browser: ShelfBrowser,
+    onOpenFolderUnit: (String) -> Unit,
+    onOpenSub: (String) -> Unit,
+    onUp: () -> Unit,
     onRescanFolder: (String) -> Unit,
-    onRemoveFolder: (String) -> Unit,
+    onRemoveFolder: (ShelfBrowser.RootFolder) -> Unit,
+    onOpenPlayer: (String) -> Unit,
+    onToggleFavorite: (ShelfRow, Boolean) -> Unit,
+    onRename: (ShelfRow) -> Unit,
+    onRemoveBook: (String) -> Unit,
+    onTranscribePage: (String) -> Unit,
+    onTranscribeNow: (String) -> Unit,
+) {
+    when (browser) {
+        is ShelfBrowser.Root -> LazyColumn(modifier = Modifier.fillMaxSize()) {
+            items(browser.folders, key = { it.folderId }) { folder ->
+                FolderUnitRow(
+                    folder = folder,
+                    onOpen = { onOpenFolderUnit(folder.folderId) },
+                    onRescan = { onRescanFolder(folder.folderId) },
+                    onRemove = { onRemoveFolder(folder) },
+                )
+            }
+        }
+
+        is ShelfBrowser.Inside -> LazyColumn(modifier = Modifier.fillMaxSize()) {
+            item("up") {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(onClick = onUp)
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                ) {
+                    Text(
+                        "← 返回上一级",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+            }
+            if (browser.folders.isNotEmpty()) {
+                item("folders-header") { SectionLabel("文件夹") }
+                items(browser.folders, key = { it.path }) { sub ->
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onOpenSub(sub.path) }
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                    ) {
+                        Text(sub.displayName, style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            "${sub.fileCount} 首",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    HorizontalDivider()
+                }
+            }
+            if (browser.books.isNotEmpty()) {
+                item("books-header") { SectionLabel("音频") }
+                items(browser.books, key = { it.id }) { row ->
+                    ShelfRowItem(
+                        row = row,
+                        onClick = { onOpenPlayer(row.id) },
+                        onToggleFavorite = { onToggleFavorite(row, !row.isFavorite) },
+                        onRename = { onRename(row) },
+                        onRemove = { onRemoveBook(row.id) },
+                        onTranscribe = { onTranscribePage(row.id) },
+                        onTranscribeNow = { onTranscribeNow(row.id) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** 根层的文件夹单元行：书数 + ⋮（重扫此文件夹 / 移除该文件夹记录） */
+@Composable
+private fun FolderUnitRow(
+    folder: ShelfBrowser.RootFolder,
+    onOpen: () -> Unit,
+    onRescan: () -> Unit,
+    onRemove: () -> Unit,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .horizontalScroll(rememberScrollState())
-            .padding(horizontal = 12.dp, vertical = 4.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        FilterChip(
-            selected = selectedFolderId == null,
-            onClick = { onSelect(null) },
-            label = { Text("全部") },
-        )
-        folders.forEach { folder ->
-            FilterChip(
-                selected = selectedFolderId == folder.id,
-                onClick = { onSelect(if (selectedFolderId == folder.id) null else folder.id) },
-                label = {
-                    Text(
-                        chipLabel(folder, counts[folder.id] ?: 0),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.widthIn(max = 180.dp),
-                    )
-                },
-            )
-        }
-        if (selectedFolderId != null) {
+    Column {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onOpen)
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    folder.displayName,
+                    style = MaterialTheme.typography.bodyLarge,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    "${folder.count} 首",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             Box {
                 IconButton(onClick = { menuOpen = true }) {
                     Icon(Icons.Filled.MoreVert, contentDescription = "文件夹管理")
@@ -262,27 +344,31 @@ private fun FolderFilterRow(
                         text = { Text("重扫此文件夹") },
                         onClick = {
                             menuOpen = false
-                            onRescanFolder(selectedFolderId)
+                            onRescan()
                         },
                     )
                     DropdownMenuItem(
                         text = { Text("移除该文件夹记录…") },
                         onClick = {
                             menuOpen = false
-                            onRemoveFolder(selectedFolderId)
+                            onRemove()
                         },
                     )
                 }
             }
         }
+        HorizontalDivider()
     }
 }
 
-/** chip 文案：显示名取最后一段（本机伪文件夹形如 内部存储/Music/我的_有声书），带书数；授权失效要标出来 */
-private fun chipLabel(folder: ImportedFolderEntity, count: Int): String {
-    val name = folder.displayName.substringAfterLast('/')
-    val suffix = if (folder.permissionState == ImportedFolderEntity.PermissionState.Revoked) "（失效）" else ""
-    return "$name · $count$suffix"
+@Composable
+private fun SectionLabel(text: String) {
+    Text(
+        text,
+        style = MaterialTheme.typography.labelLarge,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+    )
 }
 
 @Composable
@@ -406,15 +492,14 @@ private fun transcriptionLabel(state: String): String = when (state) {
 }
 
 @Composable
-private fun EmptyShelf(hasFolders: Boolean, tab: ShelfTab, hasQuery: Boolean, hasFolderFilter: Boolean, onImport: () -> Unit) {
+private fun EmptyShelf(hasFolders: Boolean, tab: ShelfTab, hasQuery: Boolean, onImport: () -> Unit) {
     // 「没有匹配」和「这个 tab 本来就空」是两件事：混成一句会让收藏页看起来像搜索坏了
     val (title, hint) = when {
-        hasFolderFilter -> "这个文件夹还没有书" to "换个目录 chip，或从「本机」/「导入」添加音频"
-        !hasFolders -> "书架还是空的" to "选择一个包含音频文件的文件夹开始导入（支持 MP3 / M4A / FLAC / WAV / WMA）"
+        !hasFolders -> "书架还是空的" to "从「本机」扫描，或选择一个文件夹导入（支持 MP3 / M4A / FLAC / WAV / WMA）"
         hasQuery -> "没有匹配的音频" to "试试换个关键词，或重新扫描文件夹"
         tab == ShelfTab.Favorites -> "还没有收藏" to "点行上的 ☆ 把常听的书收进来"
         tab == ShelfTab.Recent -> "还没有播放记录" to "随便播一首，这里就会出现最近收听"
-        else -> "书架里还没有音频" to "重新扫描文件夹，或导入其他文件夹"
+        else -> "书架里还没有音频" to "重新扫描文件夹，或从「本机」添加音频"
     }
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {

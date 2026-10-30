@@ -10,6 +10,8 @@ data class ShelfRow(
     val uri: String,
     val title: String,
     val fileName: String,
+    /** 文件夹内相对路径：SAF 书相对树根，本机书是卷内全路径（目录浏览器按它分层） */
+    val relativePath: String,
     val durationMs: Long,
     val sizeBytes: Long,
     val fileStatus: String,
@@ -18,12 +20,13 @@ data class ShelfRow(
     val lastPositionMs: Long,
     val lastPlayedAtMs: Long,
     val playbackSpeed: Float,
-    /** 所属文件夹：书架的目录筛选（2026-10-28）与同署名书的区分都靠它 */
+    /** 所属文件夹：书架的目录浏览（2026-10-28）靠它分组 */
     val folderId: String,
 )
 
 private const val SHELF_PROJECTION = """
     b.id AS id, b.uri AS uri, b.title AS title, b.file_name AS fileName,
+    b.relative_path AS relativePath,
     b.duration_ms AS durationMs, b.size_bytes AS sizeBytes,
     b.file_status AS fileStatus, b.transcription_state AS transcriptionState,
     b.is_favorite AS isFavorite, b.folder_id AS folderId,

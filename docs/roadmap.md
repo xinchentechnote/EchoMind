@@ -11,7 +11,7 @@
 | 1 | 需求与设计文档 | **DONE** | `requirements.md` / `architecture.md` / `database-design.md` / `playback-design.md` / `asr-design.md` / 本文件 |
 | 2 | 可运行工程骨架 | **DONE** | `assembleDebug` 成功（APK 16.1 MB）；`kspDebugKotlin` 生成 Room Impl；安装到 `emulator-5554` 并启动，截图确认导航与主题渲染 |
 | 3 | 文件夹导入 + 书架 | **PARTIAL** | `assembleDebug` + 31 项 JVM 单测 + 20 项仪器化测试全绿；`emulator-5554` 真实 SAF 导入 6 首、连续重扫不重复建记录、移走→MISSING、原样移回→PRESENT、手改标题不被覆盖、force-stop 后书架不丢，DB 查询与截图为证（`testing.md` §4）。缺口见下「Phase 3 遗留」 |
-| 4 | Media3 播放 + 播放记忆与统计 | **PARTIAL** | `assembleDebug` + 59 项 JVM 单测 + 41 项仪器化测试全绿（2026-10-15）；`emulator-5554` 实测：前台中媒体通知、通知栏控制、媒体键、瞬时焦点丢失暂停且不自动续播、自动切歌逐首分账、崩溃恢复标 `CRASHED`、重算==增量、统计页与 DB 对账一致。缺口见下「Phase 4 遗留」 |
+| 4 | Media3 播放 + 播放记忆与统计 | **PARTIAL** | `assembleDebug` + 59 项 JVM 单测 + 41 项仪器化测试全绿（2026-10-15）；`emulator-5554` 实测：前台中媒体通知、通知栏控制、媒体键、瞬时焦点丢失暂停（~~且不自动续播~~ → **2026-10-30 口径反转为挂断自动续播**，见下「2026-10-30 追加：断点/常亮/自动续播」）、自动切歌逐首分账、崩溃恢复标 `CRASHED`、重算==增量、统计页与 DB 对账一致。缺口见下「Phase 4 遗留」 |
 | 5 | 字幕基础设施与七句窗口 | **PARTIAL** | `assembleDebug` + 83 项 JVM 单测 + 48 项仪器化测试全绿（2026-10-15）；`emulator-5554` 实测：v2 建表、七句窗口 3+1+3、末句不补位、当前句高亮、点句跳 `start_ms`（DB 复核 12000/15000/24000）、拖动与倍速后跟手、切歌后换成另一套字幕、测试字幕常驻标注「非 ASR 产物」。缺口见下「Phase 5 遗留」 |
 | 6 | 本地 ASR（sherpa-onnx） | **PARTIAL**（**管线端到端与用户端到端都已通，缺口在标定与自动化测试**） | 已实装并在 `emulator-5554` 上真跑过：模型清单/下载/校验（35 JVM + 4 仪器化）、PCM 解码（4 仪器化，148 s 真素材）、VAD 分段（6 仪器化，RTF 0.017~0.020）、SherpaOnnx 推理（9 仪器化，装载 3.1~4.9 s，识别 RTF 0.083~0.143 —— 模拟器两轮差 1.6 倍）、逐字时间换算（14 JVM）、**任务表与状态机（schema v3：`transcript_job` + `subtitle_segment.job_id` 外键整表重建；5 条迁移仪器化 + 19 条仓储仪器化）**、**切句与时间清洗（`SentenceSplitter`，25 JVM + 1 条「解码→VAD→识别→切句」设备用例：60 s 歌唱素材 58 字 → 9 句）**、**编排接线（`TranscriptCoordinator` 9 条仪器化端到端：整首歌 24 段 → 24 块 → 丢弃 0 → **35 句入库**；`TranscriptQuality` 9 JVM；`work/TranscriptWorker` + `TranscriptWorkScheduler` 已写并已挂进 `AppGraph`）**、**转录页 UI（`ui/transcript/`：任务列表 + 确认卡片 + 取消/重试 + 8 个失败分支的可执行文案，`TranscriptDisplay` 13 JVM + `TranscriptForegroundServiceTypeTest` 2 仪器化；从界面点出来的转录让用户那份 `echomind.db` 第一次出现 35 行 `source=ASR` 字幕）**。JVM **216** / 仪器化 **106** 全绿。**缺口**：~~①没有任何界面能发起转录~~ → ①**已解（2026-10-15，Phase 6d）**：转录页是 `schedule()` 的生产调用方，真库里 35 行 `source=ASR` 字幕 + 7 行 `transcript_job`，`那些花儿` 变 `READY`、播放页七句窗口读的就是它；②`work/` 两个类的**主体逻辑仍无用例**（端到端用例直接调协调器；新增那 2 条只断言合并后清单里的前台服务类型与权限），前台通知/`APPEND` 排队/`FAILED(UNKNOWN)` 兜底/撤销只有代码 + 人工点出来的设备证据；~~③**跨书并发会开出第二个引擎**（D36）~~ → ③**已修（2026-10-15）**：全机只允许一行 `RUNNING`（`markRunning` 的 SQL 闸门，有用例且证过伪）+ 全局单一唯一名 `APPEND`（无用例，但界面上同屏「转录中 + 排队中」看得见），AGENTS.md §3 那条现在成立；④切句的三个阈值（500ms/×2/700ms）**未标定**且只在歌唱素材上验过；⑤`OUT_OF_MEMORY` 分支只有代码；~~⑥重复入队缺仓储层去重~~ → **⑥已修（16ee324 就已落地，2026-10-15 复核时发现文档漏改）**：`enqueue` 里有 `activeOf` 守卫，同一本书已有 QUEUED/RUNNING 任务时返回 `AlreadyActive`（同一行，不新建），READY + 已有 ASR 字幕被 `AlreadyTranscribed` 拦、force 放行——两条都有仓储仪器化用例（`重复入队返回同一个活动任务而不是排两个队` / `已就绪的书再入队被拦住而force放行`），口径见下技术债表；⑦「播放 + 转录同时跑不卡顿」（FR-509）与转录期间主线程无阻塞没测。~~模型是 `adb push` 搬进设备的，App 自己下载 243 MB 那条路还没验过~~ → **已验（2026-10-15，Phase 6e）**：删掉设备上的 `model.int8.onnx` 后从设置页点「继续下载」，App 自己从 hf-mirror 取回 243,371,218 B（~130 s）、校验通过才改名、来源记录落盘，宿主机独立复算 SHA-256 与官方值一致。**同日 6f 该路径整体退出产品**（用户决策：模型内置 APK、去 INTERNET，见第 6f 项与 D39）。见下「Phase 6 待办」 |
 | 7 | UI 完整化与端到端验收 | **TODO** | — |
@@ -26,7 +26,18 @@
 - `data/repo/DeviceAudioFolders`（伪 URI 约定）+ `MediaAudioAccess` 接缝（与 `TreeGrantStore` 对称）；`AudioRepositoryImpl.importScanned` 把 SAF 与 MediaStore 两条导入路的差量管线合成一份；`importDeviceFile` 的 `restrictToUri` 防止单文件导入把同夹其他书误标 MISSING。
 - `TranscriptionTarget.needsMediaPermission` + 协调器在解码前检查媒体权限（失败给「去授权限」而不是「解码失败」）。
 - `ui/device/`：`DeviceAudioViewModel`（选卷→下钻状态机、权限门状态机）+ `DeviceAudioScreen`（文件夹/音频两段列表、整夹导入按钮、已在书架角标、BackHandler 逐层上退、从设置授权回来自动续扫）。
-- **书架按目录管理（2026-10-28 追加，FR-115）**：`ShelfRow` 增 `folder_id` 投影；书架 tab 下目录筛选行（「全部」+ 各文件夹 chip，带书数与失效标注，与搜索/tab 正交）；选中后 ⋮ 菜单「重扫此文件夹」（`rescanFolder` 复用 `rescanOne` 的 SAF/媒体权限/伪文件夹分支）/「移除该文件夹记录」（确认框 → 级联删书，收听历史保留）；`ShelfViewModelTest` 5 条 + 仪器化 2 条 + 设备走查（`testing.md` §4 2026-10-28）。
+- **书架按目录管理（2026-10-28 追加，FR-115；同日第二版）**：`ShelfRow` 增 `relative_path`/`folder_id` 投影。「全部」tab 且无搜索词时呈 **VidNest 式目录浏览**：根层列有内容的文件夹单元（空夹不出现，带书数，⋮ 重扫此文件夹/移除该文件夹记录——`rescanFolder` 复用 `rescanOne` 的 SAF/媒体权限/伪文件夹分支，移除级联删书、收听历史保留），逐层下钻夹内相对路径（新增纯 Kotlin `RelativePathIndex`；本机伪文件夹的书剥掉设备目录前缀再分层）；搜索词/最近播放/收藏回平铺，清词回到原浏览位置；返回键逐层上退。~~第一版做成平铺+筛选 chips，被用户否掉重做~~。`ShelfViewModelTest` 7 条 + `RelativePathIndexTest` 4 条 + 仪器化 2 条 + 设备走查（`testing.md` §4 2026-10-28）。
+
+## 2026-10-30 追加：转录断点（FR-512）+ 播放常亮（FR-311）+ 中断自动续播（FR-305 口径反转）
+
+三项用户口径，全部在 `drill36`（API 36 模拟器）实测（证据见 `testing.md` §4 2026-10-30）：
+
+- **转录断点（FR-512，D49，`asr-design.md` §5.2）**：识别中按 10 段节奏把已识别段 + 续跑位置落盘（`domain/transcript/TranscriptCheckpoint` 二进制编解码 + `asr/TranscriptCheckpointStore`，`.part` 原子改名），重试从最后一个完整段继续。身份守卫：文件变过（uri/`fileLastModifiedMs`）或换模型重试即作废从头识别；成功收口必删。自动选模型有可用断点时沿用断点记录的最终模型（跳过 226 MB 探测）。**如实记录的边界**：silero VAD 的 LSTM 状态序列化不了，断点边界之后的重新识别与一遍跑完有 ±几十 ms/个别分句差异——断点契约只承诺「断点里的句子逐字保留 + 音频尾部覆盖完整」。
+- **播放常亮（FR-311）**：`PlayerScreen` 按 `isPlaying` 对 Activity window 挂/摘 `FLAG_KEEP_SCREEN_ON`，暂停/离开页面恢复系统休眠。
+- **中断自动续播（FR-305 口径反转）**：瞬时焦点抢占（来电等）暂停后，焦点恢复自动按冻结位置重开一场并续播（`onPlaybackSuppressionReasonChanged`）；永久丢失与耳机拔出仍不自动续播。
+- **快速回到播放页（FR-312，同日第二批用户反馈）**：播放页是独立路由，切底部标签会被 pop 掉、回不去。新增 `ui/player/NowPlayingBar`：队列里有书且不在播放页时常驻在 `NavigationBar` 之上（书名 + 位置/时长 + 播放/暂停键），只读 `PlaybackController.state`；点条 `navigate(player/{audioId})`，点键 `togglePlayPause()`。暂停图标自绘两根竖条（icons-core 无 `Pause`，不引 extended）。drill36 实测：转录/统计页出现小条 → 点条回播放页且小条消失 → 统计页点 ⏸/▶ 真暂停/真恢复。
+- 测试与计数：JVM **329**（新增 `ResumeGateTest` 4 + `TranscriptCheckpointCodecTest` 6 + `TranscriptDisplayTest` 断点文案 1；`TranscriptionTarget` 加 `fileLastModifiedMs` 字段）全绿；仪器化 `TranscriptCoordinatorTest` **15 条全绿**（新增 `中断后重试从断点续跑结果与一遍跑完逐句一致`、`换模型的断点被作废从头识别`，真模型三遍/两遍跑）。
+
 
 ## Phase 2 已完成的具体内容
 

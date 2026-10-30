@@ -62,6 +62,13 @@ object AudioFormats {
      */
     const val ASR_MAX_CONCURRENT_JOBS: Int = 3
 
+    /**
+     * 转录断点（FR-512，2026-10-30）的落盘节奏：每识别完这么多语音段写一次断点文件。
+     * 每段 ≤ 20 s 音频、识别 RTF 实测 ~0.1，10 段意味着进程被杀后最多重烧约 20 s 的识别；
+     * 再密只是纯写盘开销（断点里有全部已识别段的逐字时间，一小时书在几百 KB 量级）。
+     */
+    const val ASR_CHECKPOINT_SEGMENTS: Int = 10
+
     // ── 切句参数（唯一出处；`docs/asr-design.md` §6 的四条规则引用的就是下面这几个值）──
 
     /** 单句上限（FR-602 的「默认 60 字」）。超了才走兜底切分，见 `SentenceSplitter`。 */

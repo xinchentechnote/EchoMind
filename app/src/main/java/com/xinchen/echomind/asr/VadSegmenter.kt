@@ -30,6 +30,12 @@ class VadUtterance(val startSample: Long, val samples: FloatArray) {
 class VadSegmenter(
     modelFile: File,
     private val sampleRate: Int = AudioFormats.ASR_SAMPLE_RATE,
+    /**
+     * 本实例吃到的第一样本在**整条音频时间线**上的绝对位置（FR-512 续跑：断点前的不喂，
+     * 从断点起喂）。sherpa 报的 `segment.start` 只从「它自己被喂过多少」数起，从断点续跑时
+     * 内部计数从 0 重新开始，不加这个偏移，续跑切出的所有段时间都会整体前移。
+     */
+    private val sampleOffset: Long = 0,
 ) {
 
     /** 攒不满一窗的尾巴。silero v5 只吃 512 样本的窗，实测喂别的长度不会推进状态。 */
@@ -117,8 +123,8 @@ class VadSegmenter(
         val out = mutableListOf<VadUtterance>()
         while (!vad.empty()) {
             val segment = vad.front()
-            // start 是样本下标（实测已证），samples 是这段的音频
-            out += VadUtterance(startSample = segment.start.toLong(), samples = segment.samples)
+            // start 是样本下标（实测已证），samples 是这段的音频；sampleOffset 把它抬回整条时间线
+            out += VadUtterance(startSample = sampleOffset + segment.start.toLong(), samples = segment.samples)
             vad.pop()
         }
         return out

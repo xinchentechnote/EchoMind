@@ -213,8 +213,12 @@ class Media3PlaybackController(
     /**
      * 焦点被瞬时抢占（来电、导航播报）走的是这里，而不是 [onPlayWhenReadyChanged] 的 FOCUS_LOSS：
      * Media3 对 `AUDIOFOCUS_LOSS_TRANSIENT` 只置 suppressionReason，焦点一回来它自己把
-     * playWhenReady 恢复成 true（实测：来电铃声响着，队列还在往后播）。
-     * 所以这里做两件事——结算本场会话（§4），并在焦点回来时立刻按下去，兑现 FR-305 的「不自动续播」。
+     * playWhenReady 恢复成 true。所以这里做两件事——结算本场会话（§4），并在焦点回来时
+     * **自动续播**（FR-305 的 2026-10-30 口径：被电话等中断，挂断后接着听；会话结算了就按
+     * 当前位置重开一场，统计不因续播断档）。
+     *
+     * 只续「瞬时抢占」这一种：永久失去焦点（别的播放 App 开播）走 FOCUS_LOSS 分支不回来；
+     * 耳机拔出（BECOMING_NOISY）走的是 playWhenReady 分支——外放突然出声是事故，绝不自动续。
      */
     override fun onPlaybackSuppressionReasonChanged(reason: Int) {
         if (reason != Player.PLAYBACK_SUPPRESSION_REASON_NONE) {
@@ -224,7 +228,13 @@ class Media3PlaybackController(
             player.pause()
         } else if (waitingForUserToResume) {
             waitingForUserToResume = false
-            player.pause()
+            // 焦点回来了：本场会话在中断时已结算，先按原位重开一场再续播，这段收听才有人记账
+            currentItem()?.let { item ->
+                if (tracker.activeAudioId == null) {
+                    startSession(item, player.currentPosition.coerceAtLeast(0))
+                }
+            }
+            player.play()
         } else {
             updatePlayStop()
         }

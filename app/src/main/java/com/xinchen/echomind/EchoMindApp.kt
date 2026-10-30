@@ -6,6 +6,7 @@ import androidx.room.Room
 import com.xinchen.echomind.asr.ModelCatalog
 import com.xinchen.echomind.asr.ModelManager
 import com.xinchen.echomind.asr.SharedAsrEngines
+import com.xinchen.echomind.asr.TranscriptCheckpointStore
 import com.xinchen.echomind.asr.TranscriptCoordinator
 import com.xinchen.echomind.asr.WmaTranscoder
 import com.xinchen.echomind.core.time.AndroidTimeSource
@@ -151,6 +152,8 @@ class EchoMindApp : Application() {
                 },
                 engines = sharedEngines,
                 mediaAudio = AndroidMediaAudioAccess(this),
+                // FR-512：转录断点落盘——被杀/取消后重试从最后一个完整语音段继续，不再从头烧整本书
+                checkpoints = TranscriptCheckpointStore(File(filesDir, "transcript_checkpoints")),
             ),
             transcriptWork = TranscriptWorkScheduler(this, transcriptRepository),
             liveTranscriptStore = liveTranscriptStore,

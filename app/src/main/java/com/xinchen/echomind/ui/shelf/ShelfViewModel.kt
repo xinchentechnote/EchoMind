@@ -12,20 +12,46 @@ import com.xinchen.echomind.asr.ModelCatalog
 import com.xinchen.echomind.data.db.ImportedFolderEntity
 import com.xinchen.echomind.data.db.ShelfRow
 import com.xinchen.echomind.data.repo.AudioRepository
+import com.xinchen.echomind.data.repo.ImportOutcome
 import com.xinchen.echomind.data.repo.ShelfTab
+import com.xinchen.echomind.data.repo.DeviceAudioFolders
+import com.xinchen.echomind.domain.importing.DeviceAudioEntry
 import com.xinchen.echomind.domain.importing.PermissionRevokedException
+import com.xinchen.echomind.domain.importing.RelativePathIndex
 import com.xinchen.echomind.domain.model.EnqueueOutcome
 import com.xinchen.echomind.ui.transcript.TranscriptDisplay
 import com.xinchen.echomind.ui.transcript.TranscriptOutcomeCopy
-import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+
+/** 书架目录浏览（2026-10-28，VidNest 式逐层下钻）。null = 平铺（搜索词或非「全部」tab）。 */
+sealed interface ShelfBrowser {
+
+    /** 文件夹单元（一个已导入文件夹 = 一个可进入的根） */
+    data class RootFolder(val folderId: String, val displayName: String, val count: Int)
+
+    /** 根层：只列**有内容**的文件夹（书数 0 的不出现） */
+    data class Root(val folders: List<RootFolder>) : ShelfBrowser
+
+    /**
+     * 文件夹内：按夹内相对路径分层。
+     * [path] 相对夹根（"" = 夹根）；本机伪文件夹的书路径带设备目录前缀，展示前已剥掉。
+     */
+    data class Inside(
+        val folderId: String,
+        val folderName: String,
+        val path: String,
+        val folders: List<RelativePathIndex.FolderNode>,
+        val books: List<ShelfRow>,
+    ) : ShelfBrowser
+}
 
 data class ShelfUiState(
     val rows: List<ShelfRow> = emptyList(),
@@ -35,10 +61,8 @@ data class ShelfUiState(
     val lastPlayed: ShelfRow? = null,
     val folders: List<ImportedFolderEntity> = emptyList(),
     val message: String? = null,
-    /** 目录管理（2026-10-28）：null = 全部；非空 = 只看这个文件夹的书 */
-    val selectedFolderId: String? = null,
-    /** 每个文件夹在书架上的书数（目录 chip 角标与移除确认用） */
-    val folderCounts: Map<String, Int> = emptyMap(),
+    /** 非 null = 目录浏览视图（「全部」tab 且无搜索词）；平铺行 [rows] 此时不用 */
+    val browser: ShelfBrowser? = null,
 )
 
 class ShelfViewModel(
@@ -53,71 +77,74 @@ class ShelfViewModel(
     private val _state = MutableStateFlow(ShelfUiState())
     val state: StateFlow<ShelfUiState> = _state.asStateFlow()
 
-    /** 未经过文件夹筛选的全量行；筛选在 combine 里做，tab/query 照旧走 SQL */
     private val allRows = MutableStateFlow<List<ShelfRow>>(emptyList())
+    private val foldersFlow = MutableStateFlow<List<ImportedFolderEntity>>(emptyList())
+
+    /** 浏览位置：null folderId = 根层（列文件夹） */
+    private val browse = MutableStateFlow(BrowsePosition())
+
+    data class BrowsePosition(val folderId: String? = null, val path: String = "")
 
     init {
-        // tab/query 只存在 _state 里：再开一份私有 MutableStateFlow 就会出现
-        // 「列表跟着 tab 变了、高亮却读旧值」的分裂状态
         viewModelScope.launch {
             _state.map { it.tab to it.query }.distinctUntilChanged()
                 .flatMapLatest { (t, q) -> repository.shelf(t, q) }
                 .collect { rows -> allRows.value = rows }
         }
         viewModelScope.launch {
-            // 文件夹筛选与 tab/query 正交：目录维度在任何 tab 下都成立
-            combine(allRows, _state.map { it.selectedFolderId }.distinctUntilChanged()) { rows, folderId ->
-                if (folderId == null) rows else rows.filter { it.folderId == folderId }
-            }.collect { filtered ->
-                _state.update {
-                    it.copy(
-                        rows = filtered,
-                        // 计数永远来自全量行：选中某个文件夹后其他 chip 的角标不能归零
-                        folderCounts = allRows.value.groupingBy { row -> row.folderId }.eachCount(),
-                    )
-                }
-            }
+            repository.folders().collect { foldersFlow.value = it }
         }
         viewModelScope.launch {
             repository.lastPlayed().distinctUntilChanged()
                 .collect { last -> _state.update { it.copy(lastPlayed = last) } }
         }
         viewModelScope.launch {
-            repository.folders().collect { folders -> _state.update { it.copy(folders = folders) } }
-        }
-    }
-
-    fun onTabSelected(selected: ShelfTab) {
-        _state.update { it.copy(tab = selected) }
-    }
-
-    /** 目录筛选：null = 全部；移除的文件夹被选中时 UI 会先调这个归位 */
-    fun onFolderSelected(folderId: String?) {
-        _state.update { it.copy(selectedFolderId = folderId) }
-    }
-
-    /** 只重扫选中的文件夹（SAF 与本机伪文件夹都走仓储同一段分支） */
-    fun rescanFolder(folderId: String) = runBusy {
-        val outcome = repository.rescanFolder(folderId)
-        if (outcome.permissionRevoked) {
-            "文件夹授权已失效，请重新授权"
-        } else {
-            buildString {
-                append("文件夹已重扫：新增 ${outcome.added}，更新 ${outcome.changed}，消失 ${outcome.vanished}")
-                if (outcome.revived > 0) append("，${outcome.revived} 首文件已回来")
-                if (outcome.alreadyOnShelf > 0) append("，已在书架 ${outcome.alreadyOnShelf}")
-                if (outcome.preparingWma > 0) append("，${outcome.preparingWma} 首 WMA 正在后台准备")
+            combine(
+                allRows,
+                foldersFlow,
+                browse,
+                _state.map { it.tab to it.query }.distinctUntilChanged(),
+            ) { rows, folders, pos, (tab, query) ->
+                buildBrowser(rows, folders, pos, tab, query) to rows
+            }.collect { (browser, rows) ->
+                // rows 喂平铺视图（搜索结果 / 最近播放 / 收藏）；browser 只在「全部 + 无搜索词」非空
+                _state.update { it.copy(browser = browser, rows = rows) }
             }
         }
     }
 
-    /** 移除整个文件夹的书架记录（级联删播放记忆；listening_session 历史保留，NFR-04） */
-    fun removeFolder(folderId: String) = runBusy {
-        val folder = _state.value.folders.firstOrNull { it.id == folderId }
-        val count = allRows.value.count { it.folderId == folderId }
-        repository.removeFolder(folderId)
-        if (_state.value.selectedFolderId == folderId) onFolderSelected(null)
-        "已移除「${folder?.displayName ?: "该文件夹"}」及其 $count 本书（收听历史保留）"
+    /**
+     * 「全部」tab 且无搜索词 = 目录浏览（用户口径 2026-10-28：先见有内容的文件夹，逐层进去，
+     * 不要一上来平铺全部）；其余情况回平铺。正被浏览的文件夹被移除时落回空根层。
+     */
+    private fun buildBrowser(
+        rows: List<ShelfRow>,
+        folders: List<ImportedFolderEntity>,
+        pos: BrowsePosition,
+        tab: ShelfTab,
+        query: String,
+    ): ShelfBrowser? {
+        if (tab != ShelfTab.All || query.isNotEmpty()) return null
+        if (pos.folderId == null) {
+            return ShelfBrowser.Root(
+                folders.mapNotNull { folder ->
+                    val count = rows.count { it.folderId == folder.id }
+                    if (count == 0) null else ShelfBrowser.RootFolder(folder.id, folder.displayName, count)
+                }.sortedBy { it.displayName.lowercase() },
+            )
+        }
+        val folder = folders.firstOrNull { it.id == pos.folderId }
+            ?: return ShelfBrowser.Root(emptyList())
+        // 本机伪文件夹的书 relative_path 带设备目录前缀（Music/我的_有声书/…），
+        // 夹内分层前先剥掉；SAF 书本来就相对树根，剥前缀为空
+        val strip = DeviceAudioFolders.parse(folder.treeUri)?.second?.let { "$it/" } ?: ""
+        val entries = rows.filter { it.folderId == pos.folderId }.map { it.relativePath.removePrefix(strip) to it }
+        val listing = RelativePathIndex(entries).childrenOf(pos.path)
+        return ShelfBrowser.Inside(pos.folderId, folder.displayName, pos.path, listing.folders, listing.items)
+    }
+
+    fun onTabSelected(selected: ShelfTab) {
+        _state.update { it.copy(tab = selected) }
     }
 
     fun onQueryChanged(text: String) {
@@ -126,6 +153,25 @@ class ShelfViewModel(
 
     fun onMessageShown() {
         _state.update { it.copy(message = null) }
+    }
+
+    fun browseInto(folderId: String) {
+        browse.value = BrowsePosition(folderId, "")
+    }
+
+    fun browseIntoSub(path: String) {
+        browse.update { it.copy(path = path) }
+    }
+
+    /** 返回键的语义：夹内先上退一层，根层才交给导航退出 */
+    fun browseUp() {
+        browse.update { pos ->
+            when {
+                pos.folderId == null -> pos
+                pos.path.isEmpty() -> BrowsePosition(null, "")
+                else -> BrowsePosition(pos.folderId, pos.path.substringBeforeLast('/', ""))
+            }
+        }
     }
 
     fun importFolder(treeUri: Uri) = runBusy {
@@ -158,6 +204,30 @@ class ShelfViewModel(
             if (revoked > 0) append("，$revoked 个文件夹授权已失效，请重新授权")
             if (preparingWma > 0) append("，$preparingWma 首 WMA 正在后台准备")
         }
+    }
+
+    /** 只重扫一个文件夹（目录浏览器里文件夹行的 ⋮）；SAF 与本机伪文件夹走仓储同一段分支 */
+    fun rescanFolder(folderId: String) = runBusy {
+        val outcome = repository.rescanFolder(folderId)
+        if (outcome.permissionRevoked) {
+            "文件夹授权已失效，请重新授权"
+        } else {
+            buildString {
+                append("文件夹已重扫：新增 ${outcome.added}，更新 ${outcome.changed}，消失 ${outcome.vanished}")
+                if (outcome.revived > 0) append("，${outcome.revived} 首文件已回来")
+                if (outcome.alreadyOnShelf > 0) append("，已在书架 ${outcome.alreadyOnShelf}")
+                if (outcome.preparingWma > 0) append("，${outcome.preparingWma} 首 WMA 正在后台准备")
+            }
+        }
+    }
+
+    /** 移除整个文件夹的书架记录（级联删播放记忆；listening_session 历史保留，NFR-04） */
+    fun removeFolder(folderId: String) = runBusy {
+        val folder = foldersFlow.value.firstOrNull { it.id == folderId }
+        val count = allRows.value.count { it.folderId == folderId }
+        repository.removeFolder(folderId)
+        if (browse.value.folderId == folderId) browse.value = BrowsePosition()
+        "已移除「${folder?.displayName ?: "该文件夹"}」及其 $count 本书（收听历史保留）"
     }
 
     fun rename(audioId: String, title: String) = runBusy {

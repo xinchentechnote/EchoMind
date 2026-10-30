@@ -64,6 +64,7 @@ source ~/android-dev/env.sh     # 否则 GRADLE_USER_HOME 退回 ~/.gradle，且
 - **测音频内容必须自己数零字节**（Phase 6 实测）：书架那批「《三体》」素材帧体 99% 是 `0x00`，也就是静音。它能通过所有「长度类」断言（时长、进度、切歌、样本数），所以只要断言里出现 `peak`/`rms`，就必须同时准备**一份真音频**和**一份静音对照**。素材放 `getExternalFilesDir("asr-fixtures")`：读写自己的 external 目录不需要运行时权限，`adb push` 就能放。
 - **模型暖机可以不用搬 243 MB 了**（2026-10-28 实测，D39 模型内置之后）：`adb install -r` + 启动一次 App，`ModelManager.ensureProvisioned` 约 40 s 把 Paraformer/VAD 从 assets 拷进 `filesDir/models/`（验收：`run-as … find files/models -name '*.onnx'` 出两个文件）。只有 SenseVoice 不在 assets 里，仍要从 `app/libs/models/sense-voice-zh-en-ja-ko-yue/` 按 §2b 的 run-as 拷进 `files/models/sense-voice-zh-en-ja-ko-yue-int8/`。暖机必须与 `connectedDebugAndroidTest` **在同一条命令里**连着做——gradle 跑完就会卸载 App，中间任何一步落了单，下一轮就是 21 条「缺少模型/素材」的红。
 - **adb push 进 `/sdcard` 的音频会被 MediaStore 标 `is_pending=1`**（2026-10-28 本机音频实测）：App 查询不可见（owner=shell 才可见），`content query` 能看到但 `MediaStoreAudioSource` 查不到，表现是「明明推了 9 个文件只扫出 5 个」。清法：`adb shell content call --uri content://media/ --method scan_volume --arg external_primary`，跑完 pending 全部归零。真实用户经文件管理器/MTP 拷贝不受影响。
+- **装设备前必须确认 `assembleDebug` 真的重新打包过**（2026-10-28 书架目录浏览实测）：改完源码只跑 `testDebugUnitTest`（单测修绿）就 `adb install -r` 旧 APK，设备行为与源码对不上，凭空多查一轮「为什么界面和代码不一致」。单测绿 ≠ 包是新的；命令里带上 `:app:assembleDebug` 或看 APK 的 mtime 晚于最后一个源码改动。
 
 ## 3. 测试分层策略
 
@@ -963,29 +964,45 @@ ffmpeg 编码形态）。另外复核发现上一轮的 LAME mp3 支路从未真
   安装后数据库走 v3→v4 迁移）。release 资产：`EchoMind-v0.1.4-debug.apk`、`libwma-arm64-v8a-e12081cb.so`
   （1,329,656 B，SHA-256 `e12081cb…ad15513b5`，CI 取回用）。
 
-### 书架按目录管理（目录筛选 + 按夹重扫/移除，2026-10-28）
+### 书架按目录管理（VidNest 式目录浏览 + 按夹重扫/移除，2026-10-28，同日第二版）
 
-**功能口径**（FR-115）：书架 tab 下目录筛选行（「全部」+ 每个已导入文件夹一枚 chip；SAF 与本机伪文件夹同列；
-chip 文案 = 显示名末段 · 书数，授权失效追加「（失效）」）；筛选与搜索/tab 正交；选中目录后行尾 ⋮ 给
-「重扫此文件夹 / 移除该文件夹记录」（确认框写明级联删书、统计会话保留）；「继续上次收听」卡只在无目录筛选时出现。
+**功能口径**（FR-115，用户口径：**「展示有内容的文件夹，可以逐层进去查看」，不要一上来平铺全部**——
+第一版做成了「平铺 + 目录筛选 chips」，当天被否掉重做）：「全部」tab 且无搜索词时呈目录浏览——
+根层列出**有内容**的文件夹单元（SAF 与本机伪文件夹同列，带书数，空夹不出现，⋮ 给「重扫此文件夹 /
+移除该文件夹记录」），进入后按**夹内相对路径**逐层下钻（本机伪文件夹的书先剥掉设备目录前缀再分层，
+SAF 书本来就相对树根）；书行复用平铺的全部操作（播放/收藏/重命名/移除/转录）；搜索词或切到
+最近播放/收藏时回平铺，清掉搜索词回到原浏览位置；返回键先逐层上退、根层才退出页面。
 
 **测试数字**（`drill36` AVD，API 36）：
 
-- JVM：**312 / 0**。`ShelfViewModelTest` 重写为 5 条（原 2 条保留）：选中文件夹只看该书且**计数角标来自全量行**
-  （选中 f1 后 f2 的计数不归零）、按夹重扫回显单夹结果、移除后选中态归位并提示保留历史。
+- JVM：**318 / 0**。新增 `RelativePathIndexTest` 4 条（子树递归计数、全路径下钻、直属文件不算子文件夹、
+  相似前缀 `ab` 不串进 `a` 层、排序）；`ShelfViewModelTest` 重写为 7 条：根层只列有内容的文件夹、
+  剥设备前缀后的夹内分层与下钻、上退链、搜索挂起/清词回到原位置、按夹重扫回显、移除提示。
 - 仪器化：**+2 条**（`am instrument` 免卸载补跑 OK）：SAF `rescanFolder只重扫指定的文件夹`（另一夹不动；
   不存在的 id 抛 `NoSuchElementException`）与伪文件夹 `rescanFolder对伪文件夹走同一段分支`。
 
-**真实 UI 走查**（截图 `/tmp/21~28-*.png`，dump 均含 `</hierarchy>`）：
+**真实 UI 走查**（截图 `/tmp/30~39-*.png`，dump 均含 `</hierarchy>`；现场 = 导入整个 `Music` 伪文件夹：
+8 本直属+子夹书，另有一个 `Podcasts` 伪文件夹 1 本）：
 
-1. 书架 tab 下出现「全部 / Podcasts · 1 / 我的_有声书 · 2」chip 行；平铺列表 3 本。
-2. 点「我的_有声书 · 2」→ 列表只剩该夹 2 本，chip 选中态正确。
-3. ⋮ → 「重扫此文件夹」→ snackbar「文件夹已重扫：新增 0，更新 0，消失 0」（刚导入无变化，符合预期）。
-4. ⋮ → 「移除该文件夹记录…」→ 确认框显示全名「内部存储/Music/我的_有声书」+ 2 本书 + 历史保留说明 →
-   点「移除」→ chip 只剩 Podcasts、选中态归位「全部」、列表只剩 ep1；`run-as sqlite3` 复核
-   `imported_folder` 只剩 Podcasts 伪文件夹、`audio_book` count=1（级联删除正确）。
+1. 根层：「内部存储/Music · 8 首」「内部存储/Music/Podcasts · 1 首」两个文件夹单元（ep1 因 FR-106
+   留在先导入的 Podcasts 夹，Music 计数为 8——归属规则正确的旁证）。
+2. 进 `Music`：`← 返回上一级` + 文件夹段「我的_有声书 · 2 首」+ 音频段 6 本直属（0415/0418/0420/0421/
+   testsong/如何培养，滚动可见全部）。
+3. 进 `我的_有声书`：只有「三体」「黑暗森林」两本，行上收藏/转录操作齐备；点书行正常进播放页
+   （0420 有 29 句历史字幕，0:16 起播）。
+4. 返回键逐层上退：子夹 → Music 内层 → 根层 → 退出页面，每层 dump 核对。
+5. 搜索 `ep`：回平铺搜索结果（目录浏览挂起）；管理动作（按夹重扫 snackbar、移除确认框 + 级联删除
+   DB 对账）沿用第一版已验证的链路（`rescanFolder`/`removeFolder` 未改语义）。
 
-**诚实边界**：①「授权失效」chip 的「（失效）」后缀只有代码路径与 VM 单测，没有在设备上真撤销权限造出失效态；
+**实测踩掉的两个坑（都只在设备上才暴露）**：
+
+- **只跑 `testDebugUnitTest` 不重打 APK**：中间一版 `RelativePathIndex`（直属文件被算成子文件夹）
+  在 JVM 修好之前打过一次包，之后只重跑了单测就装到设备上——设备行为与源码对不上，白查一轮。
+  教训进 §2b：**装设备前必须确认 `assembleDebug` 真的重新打包过**。
+- **冷启动后立刻 `input tap` 会落空**：Room 首查未回来时浏览区还是空态，点击无事发生，
+  dump 看起来像「点了没反应」。脚本化走查每步给足 2~3 s。
+
+**诚实边界**：①「重扫此文件夹」对 SAF 失效文件夹的 REVOKED 分支只有仪器化，没有真撤销授权的 UI 现场；
 ②移除文件夹级联删播放记忆由外键 CASCADE 保证（既有仪器化覆盖），本轮只对账了书数。
 
 ### 本机音频扫描（MediaStore + 按文件夹浏览导入，2026-10-27 ~ 10-28）
@@ -1078,6 +1095,60 @@ v0.1.2 被结束时可能留下的非空半截 m4a。
   `490c2075ac24c0c598068fda30c4e194f007e61dfb3ab63eb9578fa4ee234d52`，debug 证书 SHA-256
   `b4f304ace4b3e211e31886f6a6d4b94147dfad7d650f9304b2b57f767871e3d6`。
 
+### 转录断点续跑（FR-512）+ 播放常亮（FR-311）+ 来电挂断自动续播（FR-305 口径反转，2026-10-30）
+
+构建与计数：`assembleDebug` 成功；`testDebugUnitTest` **329 项全绿**（新增 `ResumeGateTest` 4、`TranscriptCheckpointCodecTest` 6、
+`TranscriptDisplayTest` 断点文案 1）；仪器化只跑 `TranscriptCoordinatorTest`（`-Pandroid.testInstrumentationRunnerArguments.class=…`）
+**15 条全绿**（新增 2 条断点用例，真模型在 `drill36` 上跑；其余 13 条旧用例顺带回归通过）。`connectedDebugAndroidTest` 每轮跑完会
+**卸载 App**（filesDir 模型 + external 夹具全没），本轮复现顺序固定为：`installDebug` → 启动 App 等 ~30 s（assets 模型就位）→
+push `test-data/fixtures/real148.{mp3,wma}` 到 `Android/data/com.xinchen.echomind/files/asr-fixtures/`（注意是 **external** filesDir，
+`DeviceAsrFixtures.fixture` 用 `getExternalFilesDir`；run-as 那条 `files/` 路径是内部目录，推错位置就是 8 条「缺少音频素材」的红）→
+再跑 gradle。
+
+**FR-512 断点（两层证据）**：
+
+- 设备 UI 端到端（用户真实路径）：书架「转录」按钮入队一本未转录的 34 分钟真实书解 WMA（`如何培养孩子的社会能力`）→
+  转录进行中轮询 `run-as com.xinchen.echomind ls files/transcript_checkpoints/`，文件一出现立刻 `am force-stop`（模拟进程被杀，
+  此时已识别 350 段、断点在 1,166,438 ms ≈ 56%）→ 重启 App：`recoverInterrupted()` 把行翻成 `FAILED(INTERRUPTED)`，
+  转录页卡片显示「中止前已识别 346 段」与新文案「点重试会从上次断点继续，已识别的段不重跑；断点已失效（文件变过或换模型）时才从头识别」
+  → 点「重试」→ logcat `从断点续跑：如何培养孩子的社会能力 已有 350 段，从 1166438 ms（样本 18663008）继续`，卡片进度直接
+  「识别中 56% · 已识别 350 段」（不是 0%）→ 跑完 `转录成功：句子 359，段 611` → 卡片「已完成 · 共 611 段全部识别」，
+  `files/transcript_checkpoints/` 变空（成功收口必删）。断点节奏：logcat「断点已落盘」按 10 段一条（段 10/20/…/610）。
+- 仪器化（真模型，`TranscriptCoordinatorTest`）：`中断后重试从断点续跑结果与一遍跑完逐句一致`——同一素材跑三遍
+  （基线一遍到底 → 识别到第 6 段置取消位，断言断点文件在、行仍 RUNNING → `recoverInterrupted` + `retry` 续跑），
+  断言续跑**首次进度上报就带 ≥6 段**（播种生效，不是从头跑）、断点里的句子（`SentenceSplitter.split(checkpoint.segments)`）
+  **逐字**出现在成品字幕里、末句终点不比基线早 2 s、成功后断点文件删除。`换模型的断点被作废从头识别`——把断点的模型身份
+  改成清单里没有的权重再重试：首次进度从个位数爬起（作废生效）、结果与基线**逐句一致**（从头识别）、断点文件删除。
+  **诚实边界（本轮实测抓到的）**：第一版断言「续跑结果与基线全列表逐句相等」，实际 148 s 素材在 6 段处断点续跑后是
+  27 句/39 段 vs 基线 29 句/41 段——**断点覆盖区间之前的句子逐字一致，边界之后 ±34 ms 起漂移、个别「嗯」被合并/拆分**。
+  根因：sherpa 的 silero VAD 是有状态流式模型，LSTM 状态序列化不了（无 API），续跑是零状态重听；窗栅格已对齐（resumeSample
+  取段终点对齐 512 窗），剩下的差异来自状态而非对齐。断言因此改成上面两条诚实契约，设计口径写入 `asr-design.md` §5.2。
+
+**FR-311 播放常亮**：`adb shell settings put system screen_off_timeout 15000` → 播放页播放中等 30 s →
+`dumpsys power` 仍 `mWakefulness=Awake`（系统 15 s 早该灭屏）；负例——点暂停后 22 s → `mWakefulness=Asleep`。
+测完 `screen_off_timeout` 恢复 2147483647。实现是 `PlayerScreen` 的 `DisposableEffect(isPlaying)` 挂/摘
+`FLAG_KEEP_SCREEN_ON`（`ui/common/findActivity` 解包 ContextWrapper 拿 Activity window）。
+
+**FR-305 自动续播**：播放页播放中（按钮「暂停」）→ `adb emu gsm call 13800138000` → `dumpsys audio` 出现
+`loss: LOSS_TRANSIENT -- notified: true`，按钮变「播放」（暂停态）、剩余时间冻结在 -0:55；铃声持续 5 s 位置不动
+（真暂停，不是 Media3 自己压着）→ `adb emu gsm cancel 13800138000` → **无任何用户操作**，4 s 后按钮变回「暂停」（在播）、
+位置走到 -0:51——自动续播。口径反转前后对照：2026-10-15 的「13s 不续播」实测记录保留在 §4 Phase 4，行为变化由
+`onPlaybackSuppressionReasonChanged` 的恢复分支（重开会话 + `player.play()`）兑现，耳机拔出（BECOMING_NOISY）与
+永久焦点丢失仍不自动续播。
+
+**FR-312 快速回到播放页（同日第二批，用户反馈「切到别的页面没办法快速回到播放页」）**：`assembleDebug` + JVM 329 全绿
+（纯 Compose UI，无新 JVM 用例）；drill36 实测：播放页播放中 → 点「转录」标签 → 底部标签上方出现小条
+`0418陪孩子终身成长 / 0:35 / 2:29 · 正在播放 / ⏸`（文字随 500 ms tick 走）→ 点小条 → 回到播放页（上一首/暂停/下一首/单曲循环/停止
+全在），**播放页上小条不渲染**（dump 里 `正在播放|已暂停` 0 处）→ 点「统计」→ 小条在 → 点小条上的 ⏸ → `1:38 / 2:29 · 已暂停`、
+按钮变 ▶，3 s 后仍 1:38（真暂停）→ 点 ▶ → `1:41 / 2:29 · 正在播放`。截图 `/tmp/echomind_nowplaying_bar.png`。
+**本轮踩到的两个 adb 坑（已写进 §2b 的精神里，这里记一笔）**：①常亮负例把屏幕测成 `Asleep` 后没 `KEYCODE_WAKEUP`，
+之后 `uiautomator dump` 全部 `null root node`；②只 `rm` 了本地 `/tmp/ui.xml`、没删设备上的 `/sdcard/window_dump.xml`，
+失败的 dump 拉回的是旧文件——连着三次「界面没变」都是假象。正确做法：`adb shell rm -f /sdcard/window_dump.xml` →
+dump → 校验 `</hierarchy>`（AGENTS.md §1 原话）。
+另：`connectedDebugAndroidTest` 卸载 App 后书架/统计/字幕全没了（Android 的自动备份在这台 AVD 上没有把数据带回来），
+本轮通过「本机」页 `导入` 把 9 本书重新导入（同 uri → 同 audioId），**收听历史不可恢复**。
+
+
 ## 5. 待补的自动化测试清单（按阶段）
 
 | Phase | 用例 |
@@ -1101,7 +1172,9 @@ v0.1.2 被结束时可能留下的非空半截 m4a。
 
 ### 6b. 已在模拟器实测、不再列为「只能真机」的项
 
-- [x] 来电抢占焦点 → 暂停并结算会话、恢复不自动播放（FR-305）：`adb emu gsm call/cancel` + `dumpsys audio` + 位置三点采样，见 §4 Phase 4。
+- [x] 来电抢占焦点 → 暂停并结算会话（FR-305）：`adb emu gsm call/cancel` + `dumpsys audio` + 位置三点采样，见 §4 Phase 4。~~恢复不自动播放~~ → **2026-10-30 口径反转：挂断自动续播**，实测见 §4「2026-10-30」节；耳机拔出仍不自动续播（受保护广播，只能真机）。
+- [x] 播放页播放中屏幕常亮、暂停后恢复系统休眠（FR-311，2026-10-30）：`screen_off_timeout=15s` 下 Awake/Asleep 双向实测。
+- [x] 转录断点：中途杀进程 → 重试从断点百分比特续跑、成品里断点句子逐字保留、成功收口断点删除（FR-512，2026-10-30，用户路径 + 仪器化双层证据）。
 - [x] 后台播放不被静音、通知栏可控制（FR-304）：`dumpsys notification` 显示前台通知，通知的暂停/播放按钮实测有效。
 - [x] 七句窗口跟随播放/拖动/倍速/切歌，点句跳到该句 `start_ms`（FR-701/702/705/706）：`uiautomator dump` 行数与文本 + 截图 + `run-as sqlite3` 读 `playback_state.last_position_ms` 复核，见 §4 Phase 5。
 - [x] 冷启动续播位置与退出前差 ≤10s（FR-309）：真 `am force-stop` + 冷启动实测，差 3394 ms，见 §4 Phase 5。

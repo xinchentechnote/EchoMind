@@ -158,4 +158,10 @@ data class TranscriptionTarget(
      * 协调器要在解码前检查它，权限被撤销时给出可操作的失败原因而不是笼统的「解码失败」。
      */
     val needsMediaPermission: Boolean = false,
+    /**
+     * 音频文件的上次修改时间（`audio_book.file_last_modified_ms`），转录断点的身份判据之一：
+     * 文件变过（FR-107「旧字幕不可信」的同一判据）断点作废。0 = 未知（导入路径没读到），此时
+     * 只靠 uri 与模型身份判，断点照用——识别的是同一个 uri 指向的音频。
+     */
+    val fileLastModifiedMs: Long = 0,
 )
